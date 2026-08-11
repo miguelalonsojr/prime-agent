@@ -1009,7 +1009,7 @@ export class ModelRegistry {
 					(model) => model.provider !== "openai-codex" || cached.modelIds.has(model.id),
 				);
 			}
-			return availableModels.filter((model) => model.provider !== "openai-codex");
+			throw new Error("OpenAI Codex model discovery failed");
 		}
 	}
 

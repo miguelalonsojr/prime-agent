@@ -158,10 +158,32 @@ describe("ENG-4649 subagent model selection", () => {
 			});
 
 			now += 300_001;
-			await expect(harness.session.findRlmModels("parent", 8)).resolves.toEqual({ models: [] });
+			await expect(harness.session.findRlmModels("parent", 8)).rejects.toThrow(
+				"OpenAI Codex model discovery failed",
+			);
 			expect(fetchModels).toHaveBeenCalledTimes(2);
 		} finally {
 			dateNow.mockRestore();
+			vi.unstubAllGlobals();
+			harness.cleanup();
+		}
+	});
+
+	it("rejects explicit children when the account catalog cannot be read", async () => {
+		const codexProvider = "openai-codex";
+		const harness = await createHarness({
+			provider: codexProvider,
+			models: [{ id: "parent-model" }, { id: "child-model" }],
+		});
+		vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("offline")));
+		try {
+			harness.authStorage.setRuntimeApiKey(codexProvider, openAICodexToken("account-1"));
+			await expect(
+				harness.session.runRlmChild("reject when account catalog cannot be read", {
+					model: `${codexProvider}/child-model`,
+				}),
+			).rejects.toThrow("OpenAI Codex model discovery failed");
+		} finally {
 			vi.unstubAllGlobals();
 			harness.cleanup();
 		}
@@ -174,7 +196,9 @@ describe("ENG-4649 subagent model selection", () => {
 		vi.stubGlobal("fetch", fetchModels);
 		try {
 			harness.authStorage.setRuntimeApiKey(codexProvider, openAICodexToken("account-1"));
-			await expect(harness.session.findRlmModels("parent", 8)).resolves.toEqual({ models: [] });
+			await expect(harness.session.findRlmModels("parent", 8)).rejects.toThrow(
+				"OpenAI Codex model discovery failed",
+			);
 			harness.setResponses([fauxAssistantMessage("same parent answer")]);
 
 			const result = await harness.session.runRlmChild("keep the parent model", {
