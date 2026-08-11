@@ -20,6 +20,15 @@ Run from source:
 
 The script can be called from any directory and preserves the caller's working directory. Use that behavior to run a source checkout against a separate test project.
 
+To install the checkout's built bundle as a local command:
+
+```bash
+./scripts/install-local.sh
+prime-agent
+```
+
+The installer builds the bundle and writes `~/.local/bin/prime-agent`. Ensure `~/.local/bin` is on `PATH`. Use `./scripts/install-local.sh --force` to replace an existing `prime-agent` command. After source changes, run `npm run build` before running `prime-agent`.
+
 ## Product and Source Names
 
 Prime Agent is the product, public CLI, release artifact, and repository name. The monorepo still retains inherited `@earendil-works/pi-*` npm workspace names, a source-package `pi` bin entry, the `pi` package manifest key, and some `PI_*` compatibility environment variables. These names are source and compatibility details, not a signal that contributors should install or develop against pi-mono.
