@@ -55,6 +55,7 @@ export type RlmDeleteSubagentHandler = (target: string) => Promise<RlmDeleteSuba
 export type RlmFindModelsHandler = (query: string, limit: number) => RlmFindModelsResult | Promise<RlmFindModelsResult>;
 
 const RLM_SUBAGENT_SESSION_NAME_MAX_LENGTH = 64;
+const THINKING_LEVELS: ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 export const DEFAULT_RLM_MODEL_SEARCH_LIMIT = 8;
 export const MAX_RLM_MODEL_SEARCH_LIMIT = 20;
 
@@ -89,6 +90,23 @@ export function normalizeRequestedRlmSubagentModel(value: unknown): string | und
 		throw new Error("rlm.run model must not be empty");
 	}
 	return model;
+}
+
+export function normalizeRequestedRlmSubagentThinkingLevel(value: unknown): ThinkingLevel | undefined {
+	if (value === undefined) {
+		return undefined;
+	}
+	if (typeof value !== "string") {
+		throw new Error("rlm.run thinking must be a string");
+	}
+	const thinkingLevel = value.trim();
+	if (!thinkingLevel) {
+		throw new Error("rlm.run thinking must not be empty");
+	}
+	if (!THINKING_LEVELS.includes(thinkingLevel as ThinkingLevel)) {
+		throw new Error(`rlm.run thinking must be one of: ${THINKING_LEVELS.join(", ")}`);
+	}
+	return thinkingLevel as ThinkingLevel;
 }
 
 /** Create a readable, collision-resistant default name usable as an agent-message selector. */
