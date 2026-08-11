@@ -12,7 +12,7 @@ Let an RLM child use the thinking level configured for its installed role while 
 await rlm(task, name="reviewer", model="openai/gpt-5.6-terra", thinking="high")
 ```
 
-The accepted values are the existing Prime Agent thinking levels: `off`, `minimal`, `low`, `medium`, `high`, and `xhigh`. The keyword is optional.
+The accepted values are the existing Prime Agent thinking levels: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`. The keyword is optional.
 
 ## Child-session behavior
 
