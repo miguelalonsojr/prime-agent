@@ -38,7 +38,7 @@ fi
 
 temporary=$(mktemp "$destination.XXXXXX")
 trap 'rm -f "$temporary"' 0 HUP INT TERM
-launcher=$(printf '%s' "$repo_root/prime-agent.sh" | sed "s/'/'\\''/g")
+launcher=$(printf '%s' "$repo_root/prime-agent.sh" | sed "s/'/'\\\\''/g")
 {
 	printf '%s\n' '#!/bin/sh'
 	printf "exec '%s' --dist \"\$@\"\n" "$launcher"

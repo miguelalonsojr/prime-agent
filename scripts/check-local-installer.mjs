@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const installerPath = join(root, "scripts", "install-local.sh");
-const temporaryHomes = [];
+const temporaryDirectories = [];
 
 try {
 	const normal = runInIsolatedHome([]);
@@ -27,16 +27,23 @@ try {
 	assert.notEqual(directory.status, 0);
 	assert.equal(readFileSync(directory.buildLog, "utf8"), "");
 
+	const apostrophePath = runInApostropheCheckout();
+	assertCommand(apostrophePath.install, 0);
+	assertCommand(spawnSync("sh", ["-n", apostrophePath.commandPath], { encoding: "utf8" }), 0);
+	const forwarded = spawnSync("sh", [apostrophePath.commandPath, "first", "space value"], { encoding: "utf8" });
+	assertCommand(forwarded, 0);
+	assert.equal(forwarded.stdout, "<--dist>\n<first>\n<space value>\n");
+
 	console.log("Local installer check passed.");
 } finally {
-	for (const home of temporaryHomes) {
-		rmSync(home, { recursive: true, force: true });
+	for (const directory of temporaryDirectories) {
+		rmSync(directory, { recursive: true, force: true });
 	}
 }
 
 function runInIsolatedHome(arguments_, options = {}) {
 	const home = mkdtempSync(join(tmpdir(), "prime-agent-local-installer-"));
-	temporaryHomes.push(home);
+	temporaryDirectories.push(home);
 	const commandPath = join(home, ".local", "bin", "prime-agent");
 	const buildLog = join(home, "build.log");
 	const binDirectory = join(home, "bin");
@@ -52,14 +59,27 @@ function runInIsolatedHome(arguments_, options = {}) {
 		mkdirSync(commandPath, { recursive: true });
 	}
 
-	return runInHome(home, arguments_, { buildLog, commandPath, binDirectory });
+	return runInHome(home, arguments_, { buildLog, commandPath, binDirectory, installerPath: options.installerPath });
+}
+
+function runInApostropheCheckout() {
+	const checkoutParent = mkdtempSync(join(tmpdir(), "prime-agent-local-checkout-"));
+	temporaryDirectories.push(checkoutParent);
+	const checkout = join(checkoutParent, "checkout'quoted");
+	const checkoutInstaller = join(checkout, "scripts", "install-local.sh");
+	mkdirSync(dirname(checkoutInstaller), { recursive: true });
+	writeFileSync(checkoutInstaller, readFileSync(installerPath, "utf8"));
+	writeFileSync(join(checkout, "prime-agent.sh"), '#!/bin/sh\nprintf "<%s>\\n" "$@"\n', { mode: 0o755 });
+
+	const install = runInIsolatedHome([], { installerPath: checkoutInstaller });
+	return { commandPath: install.commandPath, install };
 }
 
 function runInHome(home, arguments_, paths = {}) {
 	const commandPath = paths.commandPath ?? join(home, ".local", "bin", "prime-agent");
 	const buildLog = paths.buildLog ?? join(home, "build.log");
 	const binDirectory = paths.binDirectory ?? join(home, "bin");
-	const result = spawnSync("sh", [installerPath, ...arguments_], {
+	const result = spawnSync("sh", [paths.installerPath ?? installerPath, ...arguments_], {
 		cwd: root,
 		env: {
 			BUILD_LOG: buildLog,
