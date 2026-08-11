@@ -6,13 +6,6 @@ import { createHarness } from "../harness.js";
 
 const provider = "faux-eng-4649";
 
-function openAICodexToken(accountId: string): string {
-	const payload = Buffer.from(
-		JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: accountId } }),
-	).toString("base64url");
-	return `header.${payload}.signature`;
-}
-
 describe("ENG-4649 subagent model selection", () => {
 	it("searches a bounded authenticated catalog without advertising it", async () => {
 		const harness = await createHarness({
@@ -71,46 +64,37 @@ describe("ENG-4649 subagent model selection", () => {
 		}
 	});
 
-	it("limits ChatGPT discovery and execution to the account model catalog", async () => {
+	it("uses manually available Codex models without account-catalog filtering", async () => {
 		const codexProvider = "openai-codex";
 		const harness = await createHarness({
 			provider: codexProvider,
-			models: [{ id: "parent-model" }, { id: "unsupported-model" }],
+			models: [{ id: "parent-model" }, { id: "child-model" }],
 		});
-		const fetchModels = vi.fn(
-			async () =>
-				new Response(JSON.stringify({ models: [{ slug: "parent-model" }] }), {
-					status: 200,
-					headers: { "content-type": "application/json" },
-				}),
-		);
+		const fetchModels = vi.fn();
 		vi.stubGlobal("fetch", fetchModels);
 		try {
-			harness.authStorage.setRuntimeApiKey(codexProvider, openAICodexToken("account-1"));
-			const discovered = await harness.session.findRlmModels("", 20);
-			expect(discovered.models.map((model) => model.selector)).toEqual([`${codexProvider}/parent-model`]);
-			expect(fetchModels).toHaveBeenCalledWith(
-				expect.stringMatching(/\/codex\/models\?client_version=/),
-				expect.objectContaining({
-					headers: expect.objectContaining({ "chatgpt-account-id": "account-1" }),
-				}),
-			);
+			harness.authStorage.setRuntimeApiKey(codexProvider, "codex-key");
 
+			const discovered = await harness.session.findRlmModels("", 20);
+			expect(discovered.models.map((model) => model.selector)).toEqual([
+				`${codexProvider}/child-model`,
+				`${codexProvider}/parent-model`,
+			]);
+
+			harness.setResponses([fauxAssistantMessage("child answer")]);
 			await expect(
-				harness.session.runRlmChild("reject unsupported account model", {
-					model: `${codexProvider}/unsupported-model`,
+				harness.session.runRlmChild("use manually available model", {
+					model: `${codexProvider}/child-model`,
 				}),
-			).rejects.toThrow(
-				`Requested subagent model "${codexProvider}/unsupported-model" is unavailable, unauthenticated, or expired`,
-			);
-			expect((await harness.session.listRlmSubagents()).subagents).toEqual([]);
+			).resolves.toMatchObject({ model: `${codexProvider}/child-model` });
+			expect(fetchModels).not.toHaveBeenCalled();
 		} finally {
 			vi.unstubAllGlobals();
 			harness.cleanup();
 		}
 	});
 
-	it("includes private Prime models authorized for the selected team", async () => {
+	it("includes private Prime models authorized by manual availability refresh", async () => {
 		const harness = await createHarness({ provider, models: [{ id: "parent-model" }] });
 		const fetchModels = vi.fn(
 			async () =>
@@ -126,148 +110,11 @@ describe("ENG-4649 subagent model selection", () => {
 				key: "prime-key",
 				primeTeam: { teamId: "engineering-team", name: "Prime Engineering" },
 			});
+			await harness.session.modelRegistry.refreshAvailableModels();
 
 			const discovered = await harness.session.findRlmModels("glm 5.2", 8);
 			expect(discovered.models.map((model) => model.selector)).toContain("prime-inference/internal/glm-5.2-fast");
 			expect(fetchModels).toHaveBeenCalledOnce();
-		} finally {
-			vi.unstubAllGlobals();
-			harness.cleanup();
-		}
-	});
-
-	it("does not reuse an expired ChatGPT model catalog after a refresh failure", async () => {
-		const codexProvider = "openai-codex";
-		const harness = await createHarness({ provider: codexProvider, models: [{ id: "parent-model" }] });
-		const fetchModels = vi
-			.fn()
-			.mockResolvedValueOnce(
-				new Response(JSON.stringify({ models: [{ slug: "parent-model" }] }), {
-					status: 200,
-					headers: { "content-type": "application/json" },
-				}),
-			)
-			.mockRejectedValueOnce(new Error("offline"));
-		vi.stubGlobal("fetch", fetchModels);
-		let now = Date.now();
-		const dateNow = vi.spyOn(Date, "now").mockImplementation(() => now);
-		try {
-			harness.authStorage.setRuntimeApiKey(codexProvider, openAICodexToken("account-1"));
-			await expect(harness.session.findRlmModels("parent", 8)).resolves.toMatchObject({
-				models: [{ selector: `${codexProvider}/parent-model` }],
-			});
-
-			now += 300_001;
-			await expect(harness.session.findRlmModels("parent", 8)).rejects.toThrow(
-				"OpenAI Codex model discovery failed",
-			);
-			expect(fetchModels).toHaveBeenCalledTimes(2);
-		} finally {
-			dateNow.mockRestore();
-			vi.unstubAllGlobals();
-			harness.cleanup();
-		}
-	});
-
-	it("uses a matching catalog cached by a concurrent lookup after discovery fails", async () => {
-		const codexProvider = "openai-codex";
-		const harness = await createHarness({ provider: codexProvider, models: [{ id: "parent-model" }] });
-		let rejectFirstLookup!: (error: Error) => void;
-		const firstLookup = new Promise<Response>((_resolve, reject) => {
-			rejectFirstLookup = reject;
-		});
-		const fetchModels = vi
-			.fn()
-			.mockReturnValueOnce(firstLookup)
-			.mockResolvedValueOnce(
-				new Response(JSON.stringify({ models: [{ slug: "parent-model" }] }), {
-					status: 200,
-					headers: { "content-type": "application/json" },
-				}),
-			);
-		vi.stubGlobal("fetch", fetchModels);
-		try {
-			harness.authStorage.setRuntimeApiKey(codexProvider, openAICodexToken("account-1"));
-			const firstDiscovery = harness.session.findRlmModels("parent", 8);
-			await vi.waitFor(() => expect(fetchModels).toHaveBeenCalledOnce());
-
-			await expect(harness.session.findRlmModels("parent", 8)).resolves.toMatchObject({
-				models: [{ selector: `${codexProvider}/parent-model` }],
-			});
-			rejectFirstLookup(new Error("offline"));
-			await expect(firstDiscovery).resolves.toMatchObject({
-				models: [{ selector: `${codexProvider}/parent-model` }],
-			});
-		} finally {
-			vi.unstubAllGlobals();
-			harness.cleanup();
-		}
-	});
-
-	it("rejects host catalog lookup failures without exposing credentials", async () => {
-		const codexProvider = "openai-codex";
-		const harness = await createHarness({ provider: codexProvider, models: [{ id: "parent-model" }] });
-		vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("secret-token")));
-		try {
-			harness.authStorage.setRuntimeApiKey(codexProvider, openAICodexToken("account-1"));
-			const handlers = (
-				harness.session as unknown as { _createKernelHostHandlers(): HostRequestHandlers }
-			)._createKernelHostHandlers();
-			const findModels = handlers["rlm.find_models"];
-			if (!findModels) throw new Error("Missing rlm.find_models host handler");
-
-			const error = await findModels({ query: "", limit: 8 }).then(
-				() => undefined,
-				(error: unknown) => error,
-			);
-			expect(error).toBeInstanceOf(Error);
-			expect((error as Error).message).toContain("OpenAI Codex model discovery failed");
-			expect((error as Error).message).not.toContain("secret-token");
-		} finally {
-			vi.unstubAllGlobals();
-			harness.cleanup();
-		}
-	});
-
-	it("rejects explicit children when the account catalog cannot be read", async () => {
-		const codexProvider = "openai-codex";
-		const harness = await createHarness({
-			provider: codexProvider,
-			models: [{ id: "parent-model" }, { id: "child-model" }],
-		});
-		vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("offline")));
-		try {
-			harness.authStorage.setRuntimeApiKey(codexProvider, openAICodexToken("account-1"));
-			await expect(
-				harness.session.runRlmChild("reject when account catalog cannot be read", {
-					model: `${codexProvider}/child-model`,
-				}),
-			).rejects.toThrow("OpenAI Codex model discovery failed");
-		} finally {
-			vi.unstubAllGlobals();
-			harness.cleanup();
-		}
-	});
-
-	it("does not warn when an unavailable selector is already the parent model", async () => {
-		const codexProvider = "openai-codex";
-		const harness = await createHarness({ provider: codexProvider, models: [{ id: "parent-model" }] });
-		const fetchModels = vi.fn().mockRejectedValue(new Error("offline"));
-		vi.stubGlobal("fetch", fetchModels);
-		try {
-			harness.authStorage.setRuntimeApiKey(codexProvider, openAICodexToken("account-1"));
-			await expect(harness.session.findRlmModels("parent", 8)).rejects.toThrow(
-				"OpenAI Codex model discovery failed",
-			);
-			harness.setResponses([fauxAssistantMessage("same parent answer")]);
-
-			const result = await harness.session.runRlmChild("keep the parent model", {
-				model: `${codexProvider}/parent-model`,
-			});
-			expect(result.model).toBe(`${codexProvider}/parent-model`);
-			await vi.waitFor(async () => {
-				expect((await harness.session.listRlmSubagents()).subagents[0]?.status).toBe("completed");
-			});
 		} finally {
 			vi.unstubAllGlobals();
 			harness.cleanup();
