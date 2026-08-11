@@ -169,6 +169,66 @@ describe("ENG-4649 subagent model selection", () => {
 		}
 	});
 
+	it("uses a matching catalog cached by a concurrent lookup after discovery fails", async () => {
+		const codexProvider = "openai-codex";
+		const harness = await createHarness({ provider: codexProvider, models: [{ id: "parent-model" }] });
+		let rejectFirstLookup!: (error: Error) => void;
+		const firstLookup = new Promise<Response>((_resolve, reject) => {
+			rejectFirstLookup = reject;
+		});
+		const fetchModels = vi
+			.fn()
+			.mockReturnValueOnce(firstLookup)
+			.mockResolvedValueOnce(
+				new Response(JSON.stringify({ models: [{ slug: "parent-model" }] }), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				}),
+			);
+		vi.stubGlobal("fetch", fetchModels);
+		try {
+			harness.authStorage.setRuntimeApiKey(codexProvider, openAICodexToken("account-1"));
+			const firstDiscovery = harness.session.findRlmModels("parent", 8);
+			await vi.waitFor(() => expect(fetchModels).toHaveBeenCalledOnce());
+
+			await expect(harness.session.findRlmModels("parent", 8)).resolves.toMatchObject({
+				models: [{ selector: `${codexProvider}/parent-model` }],
+			});
+			rejectFirstLookup(new Error("offline"));
+			await expect(firstDiscovery).resolves.toMatchObject({
+				models: [{ selector: `${codexProvider}/parent-model` }],
+			});
+		} finally {
+			vi.unstubAllGlobals();
+			harness.cleanup();
+		}
+	});
+
+	it("rejects host catalog lookup failures without exposing credentials", async () => {
+		const codexProvider = "openai-codex";
+		const harness = await createHarness({ provider: codexProvider, models: [{ id: "parent-model" }] });
+		vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("secret-token")));
+		try {
+			harness.authStorage.setRuntimeApiKey(codexProvider, openAICodexToken("account-1"));
+			const handlers = (
+				harness.session as unknown as { _createKernelHostHandlers(): HostRequestHandlers }
+			)._createKernelHostHandlers();
+			const findModels = handlers["rlm.find_models"];
+			if (!findModels) throw new Error("Missing rlm.find_models host handler");
+
+			const error = await findModels({ query: "", limit: 8 }).then(
+				() => undefined,
+				(error: unknown) => error,
+			);
+			expect(error).toBeInstanceOf(Error);
+			expect((error as Error).message).toContain("OpenAI Codex model discovery failed");
+			expect((error as Error).message).not.toContain("secret-token");
+		} finally {
+			vi.unstubAllGlobals();
+			harness.cleanup();
+		}
+	});
+
 	it("rejects explicit children when the account catalog cannot be read", async () => {
 		const codexProvider = "openai-codex";
 		const harness = await createHarness({

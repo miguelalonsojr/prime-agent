@@ -1004,9 +1004,10 @@ export class ModelRegistry {
 			this.openAICodexModelsCache = { authFingerprint, modelIds, refreshedAt: Date.now() };
 			return availableModels.filter((model) => model.provider !== "openai-codex" || modelIds.has(model.id));
 		} catch {
-			if (cached?.authFingerprint === authFingerprint && Date.now() - cached.refreshedAt < 300_000) {
+			const refreshedCache = this.openAICodexModelsCache;
+			if (refreshedCache?.authFingerprint === authFingerprint && Date.now() - refreshedCache.refreshedAt < 300_000) {
 				return availableModels.filter(
-					(model) => model.provider !== "openai-codex" || cached.modelIds.has(model.id),
+					(model) => model.provider !== "openai-codex" || refreshedCache.modelIds.has(model.id),
 				);
 			}
 			throw new Error("OpenAI Codex model discovery failed");
