@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { lstatSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -18,7 +18,21 @@ try {
 	const collision = runInIsolatedHome([], { existingCommand: "old command\n" });
 	assert.notEqual(collision.status, 0);
 	assert.equal(readFileSync(collision.commandPath, "utf8"), "old command\n");
+	assert.equal(readFileSync(collision.buildLog, "utf8"), "");
 	assertCommand(runInHome(collision.home, ["--force"]), 0);
+
+	const danglingLink = runInIsolatedHome([], { danglingCommand: "missing-target" });
+	assert.notEqual(danglingLink.status, 0);
+	assert.equal(readFileSync(danglingLink.buildLog, "utf8"), "");
+	assert.equal(lstatSync(danglingLink.commandPath).isSymbolicLink(), true);
+	const forcedDanglingLink = runInHome(danglingLink.home, ["--force"], {
+		buildLog: danglingLink.buildLog,
+		commandPath: danglingLink.commandPath,
+		binDirectory: danglingLink.binDirectory,
+	});
+	assertCommand(forcedDanglingLink, 0);
+	assert.equal(lstatSync(danglingLink.commandPath).isSymbolicLink(), false);
+	assert.match(readFileSync(danglingLink.commandPath, "utf8"), /prime-agent\.sh' --dist "\$@"/);
 
 	assert.notEqual(runInIsolatedHome(["--unknown"]).status, 0);
 	assert.match(runInIsolatedHome([]).stdout, /export PATH=/);
@@ -54,6 +68,10 @@ function runInIsolatedHome(arguments_, options = {}) {
 	if (options.existingCommand !== undefined) {
 		mkdirSync(dirname(commandPath), { recursive: true });
 		writeFileSync(commandPath, options.existingCommand);
+	}
+	if (options.danglingCommand !== undefined) {
+		mkdirSync(dirname(commandPath), { recursive: true });
+		symlinkSync(options.danglingCommand, commandPath);
 	}
 	if (options.destinationDirectory) {
 		mkdirSync(commandPath, { recursive: true });
