@@ -4,6 +4,7 @@
 
 - Added a local installer that exposes the checkout's built bundle as `prime-agent`.
 - Fixed RLM children rejecting models that are available in the manual model selector.
+- Fixed URLs not opening on click in fullscreen mode on terminals such as Ghostty; clicking a link in the transcript, dock, or overlays now opens it in the browser.
 
 ## [0.7.2] - 2026-08-11
 
