@@ -33,6 +33,7 @@ export const SESSION_SLASH_COMMAND_RESULT_CUSTOM_TYPE = "session_slash_command_r
 export const COMPACTION_OUTCOME_CUSTOM_TYPE = "compaction_outcome";
 export const RLM_CHILD_FAILURE_CUSTOM_TYPE = "rlm_child_failure";
 export const RLM_CHILD_TERMINAL_NOTICE_CUSTOM_TYPE = "rlm_child_terminal_notice";
+export const TERM_CWD_CHANGED_CUSTOM_TYPE = "term_cwd_changed";
 
 export interface SessionSlashCommandDetails {
 	command: SessionSlashCommand;

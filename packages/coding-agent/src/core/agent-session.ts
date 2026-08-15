@@ -187,6 +187,7 @@ import {
 	HEARTBEAT_PROMPT_PREVIEW_LABEL,
 	IPYTHON_STATE_RESTORED_CUSTOM_TYPE,
 	isSessionSlashCommandMessage,
+	TERM_CWD_CHANGED_CUSTOM_TYPE,
 } from "./messages.js";
 import type { ModelRegistry } from "./model-registry.js";
 import { throwIfPromptAdmissionCancelled } from "./prompt-admission.js";
@@ -10637,6 +10638,39 @@ export class AgentSession {
 	/** Last observed IPython kernel working directory, if a kernel has reported one. */
 	get kernelCwd(): string | undefined {
 		return this._kernelCwd;
+	}
+
+	/**
+	 * Change the IPython kernel's working directory (user-initiated, e.g. /term).
+	 * Records the directory as the boot cwd for future kernel (re)boots, applies
+	 * os.chdir on a live kernel, emits kernel_cwd_changed, and leaves a context
+	 * notice so the agent knows its working directory moved.
+	 */
+	async setKernelCwd(dir: string): Promise<void> {
+		const provisioner = this._ipythonKernelProvisioner;
+		if (!provisioner) {
+			throw new Error("This session has no IPython kernel");
+		}
+		const resolved = resolve(dir);
+		if (!existsSync(resolved)) {
+			throw new Error(`Directory does not exist: ${resolved}`);
+		}
+		provisioner.setCwd(resolved);
+		const applied = await provisioner.chdir(resolved);
+		const next = applied ?? resolved;
+		if (next !== this._kernelCwd) {
+			this._kernelCwd = next;
+			this._emit({ type: "kernel_cwd_changed", cwd: next });
+		}
+		void this.sendCustomMessage(
+			{
+				customType: TERM_CWD_CHANGED_CUSTOM_TYPE,
+				content: `Working directory changed to ${next} by the user via /term. Your IPython kernel now runs in this directory.`,
+				display: false,
+				details: { cwd: next },
+			},
+			{ deliverAs: "nextTurn" },
+		).catch(() => {});
 	}
 
 	/** Whether a bash command is currently running */
