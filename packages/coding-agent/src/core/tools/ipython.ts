@@ -292,6 +292,8 @@ export interface IpythonToolOptions {
 	 */
 	onRestore?: (result: RestoreResult) => void;
 	onLateSentAgentMessage?: (toolCallId: string, message: KernelSentAgentMessage) => void;
+	/** Called after each ipython cell fully settles (success, error, or abort). */
+	onKernelExecutionSettled?: () => void;
 	/** Shared provisioner owning the kernel lifecycle. When provided, the remaining options are ignored. */
 	provisioner?: IpythonKernelProvisioner;
 }
@@ -711,6 +713,7 @@ export function createIpythonToolDefinition(
 					options?.onLateSentAgentMessage,
 					ctx,
 				);
+				options?.onKernelExecutionSettled?.();
 
 				let text = r.stdout;
 				if (r.stderr) text += (text ? "\n" : "") + r.stderr;

@@ -386,6 +386,7 @@ export type AgentSessionEvent =
 			/** Echo of the caller-supplied run id, so clients correlate runs by identity. */
 			runId?: string;
 	  }
+	| { type: "kernel_cwd_changed"; cwd: string }
 	| { type: "refine_complete"; result: RefinementResult }
 	| { type: "refine_failed"; error: string };
 
@@ -968,6 +969,8 @@ const THINKING_LEVELS: ThinkingLevel[] = ["off", "minimal", "low", "medium", "hi
 
 /** Cap on the post-compaction kernel namespace probe so a wedged kernel can't stall recovery. */
 const KERNEL_STATE_LISTING_TIMEOUT_MS = 5000;
+/** Cap on the post-execution kernel cwd probe so a wedged kernel can't stall the next turn. */
+const KERNEL_CWD_PROBE_TIMEOUT_MS = 5000;
 const RLM_MAX_DEPTH_STATE_CUSTOM_TYPE = "rlm_max_depth_state";
 
 function noopRlmChildAbort(): void {}
@@ -1201,6 +1204,8 @@ export class AgentSession {
 	private _disposing = false;
 	private _disposeAsyncPromise?: Promise<void>;
 	private _ipythonKernelProvisioner?: IpythonKernelProvisioner;
+	/** Last cwd reported by the running kernel; undefined until a probe has succeeded. */
+	private _kernelCwd?: string;
 	/** Artifact dir backing the current provisioner's kernel snapshot, if any. */
 	private _ipythonKernelSnapshotDir?: string;
 	/** True once the runtime has been built once; later builds are in-process rebuilds (/reload). */
@@ -6963,6 +6968,28 @@ export class AgentSession {
 		return this.model ? (clampThinkingLevel(this.model, level) as ThinkingLevel) : "off";
 	}
 
+	/**
+	 * Probe the running kernel's working directory and announce it when it moved.
+	 * Silent when no kernel is running or the probe fails, so a wedged or dying
+	 * kernel never changes what the session reports.
+	 */
+	private async _refreshKernelCwd(): Promise<void> {
+		const provisioner = this._ipythonKernelProvisioner;
+		if (!provisioner?.hasRunningKernel) return;
+		const abort = new AbortController();
+		const timer = setTimeout(() => abort.abort(), KERNEL_CWD_PROBE_TIMEOUT_MS);
+		if (typeof timer === "object" && "unref" in timer) timer.unref();
+		let cwd: string | null;
+		try {
+			cwd = await provisioner.readCwd(abort.signal);
+		} finally {
+			clearTimeout(timer);
+		}
+		if (!cwd || cwd === this._kernelCwd) return;
+		this._kernelCwd = cwd;
+		this._emit({ type: "kernel_cwd_changed", cwd });
+	}
+
 	// Added to history (not a nextTurn message) so it also reaches the continue()-driven
 	// auto-compaction resume, which never injects nextTurn messages.
 	private async _notifyKernelStateAfterCompaction(): Promise<void> {
@@ -8672,6 +8699,9 @@ export class AgentSession {
 					shellPath: this.settingsManager.getShellPath(),
 					onLateSentAgentMessage: (toolCallId, message) =>
 						this._recordLateIpythonSentAgentMessage(toolCallId, message),
+					onKernelExecutionSettled: () => {
+						void this._refreshKernelCwd().catch(() => {});
+					},
 				},
 			});
 		}
@@ -10602,6 +10632,11 @@ export class AgentSession {
 			this._userBashAbortRequested = true;
 		}
 		this._bashAbortController?.abort();
+	}
+
+	/** Last observed IPython kernel working directory, if a kernel has reported one. */
+	get kernelCwd(): string | undefined {
+		return this._kernelCwd;
 	}
 
 	/** Whether a bash command is currently running */

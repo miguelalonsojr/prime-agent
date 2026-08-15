@@ -614,6 +614,7 @@ export type AgentConnectionSessionEvent =
 			/** Echo of the caller-supplied run id, so clients correlate runs by identity. */
 			runId?: string;
 	  }
+	| { type: "kernel_cwd_changed"; cwd: string }
 	| { type: "refine_complete"; result: RefinementResult }
 	| { type: "refine_failed"; error: string };
 
