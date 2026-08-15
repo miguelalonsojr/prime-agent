@@ -1324,7 +1324,7 @@ export class InteractiveMode {
 
 		return new CombinedAutocompleteProvider(
 			[...slashCommands, ...templateCommands, ...extensionCommands, ...skillCommandList],
-			this.getCurrentCwd(),
+			this.getDisplayCwd(),
 			this.fdPath,
 		);
 	}
@@ -2504,7 +2504,7 @@ export class InteractiveMode {
 		this.footer.setAutoCompactEnabled(
 			this.connectionState?.autoCompactionEnabled ?? this.settingsManager.getCompactionEnabled(),
 		);
-		this.footerDataProvider.setCwd(this.getCurrentCwd());
+		this.footerDataProvider.setCwd(this.getDisplayCwd());
 		this.hideThinkingBlock = this.settingsManager.getHideThinkingBlock();
 		this.ui.setShowHardwareCursor(this.settingsManager.getShowHardwareCursor());
 		this.ui.setClearOnShrink(this.settingsManager.getClearOnShrink());
@@ -2601,6 +2601,7 @@ export class InteractiveMode {
 	}
 
 	private applyConnectionStateSnapshot(state: AgentConnectionState): void {
+		const kernelCwdChanged = state.kernelCwd !== this.connectionState?.kernelCwd;
 		this.bindPromptStashSession(state.sessionId);
 		this.connectionState = state;
 		this.updateScopedHeartbeats();
@@ -2612,6 +2613,9 @@ export class InteractiveMode {
 		this.sessionRecap = state.recap;
 		this.renderRecap();
 		this.updateWorkingPulse();
+		if (kernelCwdChanged) {
+			this.syncDisplayedCwd();
+		}
 	}
 
 	private patchConnectionState(patch: Partial<AgentConnectionState>): void {
@@ -2704,11 +2708,27 @@ export class InteractiveMode {
 			case "bash_end":
 				this.patchConnectionState({ isBashRunning: false });
 				break;
+			case "kernel_cwd_changed":
+				this.patchConnectionState({ kernelCwd: event.cwd });
+				this.syncDisplayedCwd();
+				break;
 		}
 	}
 
 	private getCurrentCwd(): string {
 		return this.connectionState?.cwd ?? this.uiServices.getInitialCwd();
+	}
+
+	/** The cwd shown to the user: the kernel's cwd once known, else the session cwd. */
+	private getDisplayCwd(): string {
+		return this.connectionState?.kernelCwd ?? this.getCurrentCwd();
+	}
+
+	/** Re-point footer git watching and file autocomplete at the displayed cwd. */
+	private syncDisplayedCwd(): void {
+		this.footerDataProvider.setCwd(this.getDisplayCwd());
+		this.setupAutocompleteProvider();
+		this.ui.requestRender();
 	}
 
 	private getCurrentSessionName(): string | undefined {
