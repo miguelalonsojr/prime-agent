@@ -60,8 +60,9 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 14 carries the client's monotonic telemetry opt-out on attach and reattach.
 // Revision 15 adds the mutate_queued_message command and queue_message_mutation capability.
 // Revision 16 adds the "stopping" workerState and stops reporting disconnected workers as "ready".
-export const DAEMON_SCHEMA_REVISION = 16;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-16-1bcb9e7f1a49";
+// Revision 17 adds the set_kernel_cwd command and kernel_cwd_propagation capability.
+export const DAEMON_SCHEMA_REVISION = 17;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-17-cc29d71f1cd9";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -100,7 +101,11 @@ export type DaemonServerCapability =
 	| "transient_bash"
 	| "session_input_admission"
 	| "prompt_admission_cancellation"
-	| "queue_message_mutation";
+	| "queue_message_mutation"
+	// The daemon propagates kernel-side cwd changes (from IPython %cd / os.chdir)
+	// back to the client-owned footer and autocomplete. Clients must check
+	// before sending set_kernel_cwd.
+	| "kernel_cwd_propagation";
 
 export type DaemonReplayStatus = "complete" | "partial" | "unavailable";
 
@@ -139,6 +144,7 @@ export const DAEMON_DEFAULT_SERVER_CAPABILITIES: readonly DaemonServerCapability
 	"session_input_admission",
 	"prompt_admission_cancellation",
 	"queue_message_mutation",
+	"kernel_cwd_propagation",
 ];
 
 export interface DaemonRuntimeIdentity {
@@ -497,6 +503,12 @@ export type DaemonCommand =
 			transient?: boolean;
 			runId?: string;
 	  }
+	| {
+			id?: string;
+			type: "set_kernel_cwd";
+			activeSessionId: string;
+			dir: string;
+	  }
 	| { id?: string; type: "abort_bash"; activeSessionId: string }
 	| { id?: string; type: "cancel_rlm_child"; activeSessionId: string; childId: string }
 	| { id?: string; type: "delete_rlm_subagent"; activeSessionId: string; childId: string }
@@ -697,6 +709,7 @@ export const DAEMON_COMMAND_COMPATIBILITY = {
 	get_available_models: LEGACY_DAEMON_COMMAND,
 	get_queue: LEGACY_DAEMON_COMMAND,
 	mutate_queued_message: { minProtocol: 7, minSchemaRevision: 15, capability: "queue_message_mutation" },
+	set_kernel_cwd: { minProtocol: 7, minSchemaRevision: 17, capability: "kernel_cwd_propagation" },
 	clear_queue: LEGACY_DAEMON_COMMAND,
 	abort_and_clear_queue: LEGACY_DAEMON_COMMAND,
 	cron_list: LEGACY_DAEMON_COMMAND,

@@ -93,6 +93,15 @@ describe("daemon protocol helpers", () => {
 		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).toContain("queue_message_mutation");
 	});
 
+	it("capability- and schema-gates kernel cwd propagation at its introducing revision", () => {
+		expect(DAEMON_COMMAND_COMPATIBILITY.set_kernel_cwd).toEqual({
+			minProtocol: 7,
+			minSchemaRevision: 17,
+			capability: "kernel_cwd_propagation",
+		});
+		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).toContain("kernel_cwd_propagation");
+	});
+
 	it("schema-gates the RLM max depth commands at their introducing revision", () => {
 		expect(DAEMON_COMMAND_COMPATIBILITY.get_rlm_max_depth_status).toEqual({ minProtocol: 7, minSchemaRevision: 11 });
 		expect(DAEMON_COMMAND_COMPATIBILITY.set_rlm_max_depth).toEqual({ minProtocol: 7, minSchemaRevision: 11 });
