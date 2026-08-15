@@ -5,6 +5,8 @@
 - Added a local installer that exposes the checkout's built bundle as `prime-agent`.
 - Fixed RLM children rejecting models that are available in the manual model selector.
 - Fixed URLs not opening on click in fullscreen mode on terminals such as Ghostty; clicking a link in the transcript, dock, or overlays now opens it in the browser.
+- Added a footer line showing the agent's current working directory and git branch.
+- Added `/term` to open an interactive shell; changing directory there moves the agent's IPython working directory when the shell exits.
 
 ## [0.7.2] - 2026-08-11
 
