@@ -129,6 +129,7 @@ import {
 	captureOnboardingCompleted,
 	type TelemetryOnboardingOutcome,
 } from "../../core/telemetry.js";
+import { shortenPath } from "../../core/tools/render-utils.js";
 import { type TruncationResult, truncateTail } from "../../core/tools/truncate.js";
 import { PRIME_BUTTERFLY_LOGO } from "../../themes/prime-logo.js";
 import { getChangelogPath, parseChangelog } from "../../utils/changelog.js";
@@ -247,6 +248,7 @@ import {
 import type { ClientPromptStashStore, PromptStash, PromptStashState } from "./prompt-stash-state.js";
 import { QueueSelection } from "./queue-selection.js";
 import { formatResumeHint } from "./resume-hint.js";
+import { cwdPollingSupported, runShellSession, type ShellSessionResult } from "./shell-session.js";
 import {
 	getAvailableThemes,
 	getAvailableThemesWithPaths,
@@ -4779,6 +4781,11 @@ export class InteractiveMode {
 					this.editor.setText("");
 					return;
 				}
+				if (commandName === "term" && !commandArgs) {
+					this.editor.setText("");
+					await this.handleTermCommand(text);
+					return;
+				}
 				if (commandName === "heartbeat") {
 					await this.handleHeartbeatCommand(canonicalCommandText);
 					this.editor.setText("");
@@ -7370,6 +7377,70 @@ export class InteractiveMode {
 			}
 			// Force full re-render since external editor uses alternate screen
 			this.ui.requestRender(true);
+		}
+	}
+
+	private async handleTermCommand(commandText: string): Promise<void> {
+		if (process.platform === "win32") {
+			this.showWarning("/term is not supported on Windows.");
+			return;
+		}
+		if (this.hasInterruptibleWork()) {
+			this.showWarning("Wait for the current work to finish before opening a shell.");
+			return;
+		}
+		this.echoLocalCommand(commandText);
+		if (!cwdPollingSupported()) {
+			this.showWarning("cd propagation is not available on this platform; the shell will still open.");
+		}
+		const displayCwd = this.getDisplayCwd();
+		const startCwd = fs.existsSync(displayCwd) ? displayCwd : this.getCurrentCwd();
+		const shell = process.env.SHELL || "/bin/sh";
+
+		// stdio is inherited and the shell shares our process group: Ctrl+C inside
+		// the shell must not kill prime-agent, so ignore SIGINT until the shell exits.
+		const ignoreSigint = () => {};
+		process.on("SIGINT", ignoreSigint);
+		await this.ui.terminal.drainInput(1000).catch(() => undefined);
+		this.ui.stop();
+
+		let result: ShellSessionResult | undefined;
+		let shellError: unknown;
+		try {
+			result = await runShellSession({ shell, cwd: startCwd });
+		} catch (error) {
+			shellError = error;
+		} finally {
+			process.removeListener("SIGINT", ignoreSigint);
+			this.ui.start();
+			if (this.fullscreenEnabled) {
+				this.applyFullscreen(true);
+			}
+			// The shell repainted the terminal; force a full re-render.
+			this.ui.requestRender(true);
+		}
+
+		if (shellError) {
+			this.showError(
+				`Failed to start ${shell}: ${shellError instanceof Error ? shellError.message : String(shellError)}`,
+			);
+			return;
+		}
+		const nextCwd = result?.lastObservedCwd;
+		if (!nextCwd || nextCwd === startCwd) {
+			return;
+		}
+		if (!fs.existsSync(nextCwd)) {
+			this.showWarning(`The shell ended in ${nextCwd}, which no longer exists; keeping ${shortenPath(startCwd)}.`);
+			return;
+		}
+		try {
+			await this.agentConnection.setKernelCwd(nextCwd);
+			this.showStatus(`Working directory changed to ${shortenPath(nextCwd)}`);
+		} catch (error) {
+			this.showWarning(
+				`The shell moved to ${shortenPath(nextCwd)}, but it could not be propagated: ${error instanceof Error ? error.message : String(error)}`,
+			);
 		}
 	}
 
