@@ -377,18 +377,22 @@ export class IpythonKernelProvisioner {
 		this.cwd = dir;
 	}
 
-	/** Last-known kernel process cwd via a hidden probe. Null when no kernel is running. */
+	/** Last-known kernel process cwd via a hidden probe. Null when no kernel is running or the probe fails. */
 	async readCwd(signal?: AbortSignal): Promise<string | null> {
 		const manager = this.startedManager ?? (await this.managerPromise?.catch(() => undefined));
 		if (!manager) return null;
-		const result = await manager.execute('__import__("builtins").print(__import__("os").getcwd())', {
-			internal: true,
-			maxOutputChars: 4096,
-			signal,
-		});
-		if (result.status !== "ok") return null;
-		const line = result.stdout.trim().split("\n").pop() ?? "";
-		return line || null;
+		try {
+			const result = await manager.execute('__import__("builtins").print(__import__("os").getcwd())', {
+				internal: true,
+				maxOutputChars: 4096,
+				signal,
+			});
+			if (result.status !== "ok") return null;
+			const line = result.stdout.trim().split("\n").pop() ?? "";
+			return line || null;
+		} catch {
+			return null;
+		}
 	}
 
 	/**
@@ -400,7 +404,12 @@ export class IpythonKernelProvisioner {
 		const manager = this.startedManager ?? (await this.managerPromise?.catch(() => undefined));
 		if (!manager) return null;
 		const code = `__import__("os").chdir(${JSON.stringify(dir)}); __import__("builtins").print(__import__("os").getcwd())`;
-		const result = await manager.execute(code, { internal: true, maxOutputChars: 4096, signal });
+		let result: ExecuteResult;
+		try {
+			result = await manager.execute(code, { internal: true, maxOutputChars: 4096, signal });
+		} catch {
+			return null;
+		}
 		if (result.status !== "ok") {
 			throw new Error(result.error?.evalue ?? `could not change kernel directory to ${dir}`);
 		}
