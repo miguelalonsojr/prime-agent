@@ -74,6 +74,11 @@ export class FooterDataProvider {
 		return this.cachedBranch;
 	}
 
+	/** The cwd the footer currently displays (kernel cwd once known, else session cwd). */
+	getCwd(): string {
+		return this.cwd;
+	}
+
 	/** Extension status texts set via ctx.ui.setStatus() */
 	getExtensionStatuses(): ReadonlyMap<string, string> {
 		return this.extensionStatuses;
@@ -307,5 +312,5 @@ export class FooterDataProvider {
 /** Read-only view for extensions - excludes setExtensionStatus, setAvailableProviderCount and dispose */
 export type ReadonlyFooterDataProvider = Pick<
 	FooterDataProvider,
-	"getGitBranch" | "getExtensionStatuses" | "getAvailableProviderCount" | "onBranchChange"
+	"getCwd" | "getGitBranch" | "getExtensionStatuses" | "getAvailableProviderCount" | "onBranchChange"
 >;

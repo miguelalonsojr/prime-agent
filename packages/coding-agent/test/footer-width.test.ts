@@ -6,6 +6,7 @@ import { initTheme } from "../src/modes/interactive/theme/theme.js";
 
 function createFooterData(providerCount: number): ReadonlyFooterDataProvider {
 	const provider = {
+		getCwd: () => "/work/repo",
 		getGitBranch: () => "main",
 		getExtensionStatuses: () => new Map<string, string>(),
 		getAvailableProviderCount: () => providerCount,
