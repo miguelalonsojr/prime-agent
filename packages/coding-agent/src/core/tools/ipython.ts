@@ -335,7 +335,7 @@ export class IpythonKernelProvisioner {
 	private readonly disposeController = new AbortController();
 
 	constructor(
-		private readonly cwd: string,
+		private cwd: string,
 		private readonly options?: Omit<IpythonToolOptions, "provisioner">,
 	) {
 		if (options?.kernelManagerRef) {
@@ -367,6 +367,45 @@ export class IpythonKernelProvisioner {
 	async listNamespaceNames(signal?: AbortSignal): Promise<string[] | null> {
 		const m = this.startedManager ?? (await this.managerPromise?.catch(() => undefined));
 		return (await m?.listNamespaceNames(signal)) ?? null;
+	}
+
+	/**
+	 * Update the working directory used when a kernel (re)boots. Has no effect
+	 * on an already-running kernel; use chdir() for that.
+	 */
+	setCwd(dir: string): void {
+		this.cwd = dir;
+	}
+
+	/** Last-known kernel process cwd via a hidden probe. Null when no kernel is running. */
+	async readCwd(signal?: AbortSignal): Promise<string | null> {
+		const manager = this.startedManager ?? (await this.managerPromise?.catch(() => undefined));
+		if (!manager) return null;
+		const result = await manager.execute('__import__("builtins").print(__import__("os").getcwd())', {
+			internal: true,
+			maxOutputChars: 4096,
+			signal,
+		});
+		if (result.status !== "ok") return null;
+		const line = result.stdout.trim().split("\n").pop() ?? "";
+		return line || null;
+	}
+
+	/**
+	 * Change the live kernel's working directory. Returns the resulting cwd,
+	 * or null when no kernel is running. Throws when the kernel rejects the
+	 * change (e.g. the directory does not exist).
+	 */
+	async chdir(dir: string, signal?: AbortSignal): Promise<string | null> {
+		const manager = this.startedManager ?? (await this.managerPromise?.catch(() => undefined));
+		if (!manager) return null;
+		const code = `__import__("os").chdir(${JSON.stringify(dir)}); __import__("builtins").print(__import__("os").getcwd())`;
+		const result = await manager.execute(code, { internal: true, maxOutputChars: 4096, signal });
+		if (result.status !== "ok") {
+			throw new Error(result.error?.evalue ?? `could not change kernel directory to ${dir}`);
+		}
+		const line = result.stdout.trim().split("\n").pop() ?? "";
+		return line || dir;
 	}
 
 	/** Dispose the kernel owned by this provisioner, including one still starting up. */
