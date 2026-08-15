@@ -4058,6 +4058,12 @@ export class AgentDaemon {
 				);
 			}
 
+			case "set_kernel_cwd": {
+				const state = this.getSessionState(command.activeSessionId);
+				await state.runtime.session.setKernelCwd(command.dir);
+				return success(command.id, "set_kernel_cwd");
+			}
+
 			case "abort_bash": {
 				const state = this.getSessionState(command.activeSessionId);
 				state.runtime.session.abortBash();

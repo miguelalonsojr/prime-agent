@@ -8368,6 +8368,33 @@ describe("daemon mode helpers", () => {
 		expect(setRlmMaxDepth).toHaveBeenCalledWith(3, { global: true });
 	});
 
+	it("delegates set_kernel_cwd to the active session", async () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
+			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
+			createRuntime: async () => {
+				throw new Error("unexpected runtime creation");
+			},
+		});
+		const setKernelCwd = vi.fn(async () => {});
+		const state = makeState("active-1") as ActiveSessionState;
+		(state.runtime as { session: unknown }).session = { setKernelCwd };
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
+		};
+		internals.sessions.set(state.activeSessionId, state);
+
+		await expect(
+			internals.handleCommand(makeClient("client-1", state.activeSessionId), {
+				id: "command-1",
+				type: "set_kernel_cwd",
+				activeSessionId: state.activeSessionId,
+				dir: "/tmp/elsewhere",
+			}),
+		).resolves.toMatchObject({ id: "command-1", command: "set_kernel_cwd", success: true });
+		expect(setKernelCwd).toHaveBeenCalledWith("/tmp/elsewhere");
+	});
+
 	it.each([
 		{
 			name: "defers busy heartbeat cron jobs instead of queueing a follow-up",
