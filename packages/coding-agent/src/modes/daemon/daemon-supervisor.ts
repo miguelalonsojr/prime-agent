@@ -152,7 +152,7 @@ const CHILD_PASSIVATION_PER_WORKER_CAP = 2;
 const SUPERVISOR_CONFIG_FILE_NAME = "supervisor-config";
 const WORKER_STARTUP_GATE_FD = 3;
 
-const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
+export const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"ack_result",
 	"list",
 	"list_saved_sessions",
@@ -200,6 +200,7 @@ const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"get_available_models",
 	"get_queue",
 	"mutate_queued_message",
+	"set_kernel_cwd",
 	"clear_queue",
 	"abort_and_clear_queue",
 	"cron_list",
