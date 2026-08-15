@@ -716,7 +716,8 @@ export interface AgentConnection {
 
 	/**
 	 * Change the IPython kernel's working directory (user-initiated via /term).
-	 * Emits a kernel_cwd_changed session event on success.
+	 * Emits a kernel_cwd_changed session event on success. Capability-gated on
+	 * daemon connections; throws when the daemon lacks kernel_cwd_propagation.
 	 */
 	setKernelCwd(dir: string): Promise<void>;
 

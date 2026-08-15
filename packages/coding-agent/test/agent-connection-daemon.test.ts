@@ -379,6 +379,8 @@ class FakeDaemonClient {
 					};
 				}
 				return { type: "response", command: command.type, success: true };
+			case "set_kernel_cwd":
+				return { type: "response", command: command.type, success: true };
 			case "abort_bash":
 				if (this.abortBashUnknownCommand) {
 					return {
@@ -957,6 +959,18 @@ describe("DaemonAgentConnection", () => {
 			(command): command is Extract<DaemonCommand, { type: "execute_bash" }> => command.type === "execute_bash",
 		);
 		expect(sent).toMatchObject({ command: "ls", excludeFromContext: true, transient: true, runId: "side-run-1" });
+	});
+
+	it("sends set_kernel_cwd through the daemon client", async () => {
+		const daemonClient = new FakeDaemonClient();
+		daemonClient.serverCapabilities.add("kernel_cwd_propagation");
+		const connection = new DaemonAgentConnection(asDaemonClient(daemonClient), "active-original");
+
+		await connection.setKernelCwd("/tmp/elsewhere");
+		const sent = daemonClient.requests.find(
+			(command): command is Extract<DaemonCommand, { type: "set_kernel_cwd" }> => command.type === "set_kernel_cwd",
+		);
+		expect(sent).toMatchObject({ activeSessionId: "active-original", dir: "/tmp/elsewhere" });
 	});
 
 	it("degrades an unavailable heartbeat catalog without sending an unsupported command", async () => {

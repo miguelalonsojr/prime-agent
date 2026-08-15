@@ -248,6 +248,55 @@ describe("DaemonClient", () => {
 		await expect(request).rejects.toThrow("closed before the operation completed");
 	});
 
+	it("does not send set_kernel_cwd to an old daemon without the capability", async () => {
+		const client = new DaemonClient("/tmp/prime-agent.sock");
+		const connect = client.connect();
+		const socket = netMock.sockets[0]!;
+		socket.emit("connect");
+		await connect;
+		emitHello(socket, DAEMON_PROTOCOL_VERSION, []);
+
+		await expect(
+			client.request({ type: "set_kernel_cwd", activeSessionId: "active-1", dir: "/tmp/elsewhere" }),
+		).rejects.toThrow("does not support kernel_cwd_propagation");
+		expect(socket.writes).toEqual([]);
+		client.close();
+	});
+
+	it("does not send set_kernel_cwd to a capable daemon on an older schema revision", async () => {
+		const client = new DaemonClient("/tmp/prime-agent.sock");
+		const connect = client.connect();
+		const socket = netMock.sockets[0]!;
+		socket.emit("connect");
+		await connect;
+		emitHello(
+			socket,
+			DAEMON_PROTOCOL_VERSION,
+			["kernel_cwd_propagation"],
+			DAEMON_COMMAND_COMPATIBILITY.set_kernel_cwd.minSchemaRevision - 1,
+		);
+
+		await expect(
+			client.request({ type: "set_kernel_cwd", activeSessionId: "active-1", dir: "/tmp/elsewhere" }),
+		).rejects.toThrow("does not support kernel_cwd_propagation");
+		expect(socket.writes).toEqual([]);
+		client.close();
+	});
+
+	it("sends set_kernel_cwd to a daemon advertising kernel_cwd_propagation", async () => {
+		const client = new DaemonClient("/tmp/prime-agent.sock");
+		const connect = client.connect();
+		const socket = netMock.sockets[0]!;
+		socket.emit("connect");
+		await connect;
+		emitHello(socket, DAEMON_PROTOCOL_VERSION, ["kernel_cwd_propagation"], DAEMON_SCHEMA_REVISION);
+
+		const request = client.request({ type: "set_kernel_cwd", activeSessionId: "active-1", dir: "/tmp/elsewhere" });
+		await vi.waitFor(() => expect(socket.writes).toHaveLength(1));
+		client.close();
+		await expect(request).rejects.toThrow("closed before the operation completed");
+	});
+
 	it("rejects an old daemon before requesting session state", async () => {
 		const client = new DaemonClient("/tmp/prime-agent.sock");
 		const connect = client.connect();
