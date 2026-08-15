@@ -324,6 +324,8 @@ export interface AgentConnectionModelCycleResult {
 export interface AgentConnectionState {
 	activeSessionId?: string;
 	cwd: string;
+	/** Last observed IPython kernel working directory; unset until the kernel reports one. */
+	kernelCwd?: string;
 	model?: AgentConnectionModel;
 	thinkingLevel: ThinkingLevel;
 	serviceTier: ServiceTier;
@@ -711,6 +713,12 @@ export interface AgentConnection {
 	executeBash(command: string, options?: AgentConnectionExecuteBashOptions): Promise<void>;
 	executeBashAndWait(command: string): Promise<BashResult>;
 	abortBash(): Promise<void>;
+
+	/**
+	 * Change the IPython kernel's working directory (user-initiated via /term).
+	 * Emits a kernel_cwd_changed session event on success.
+	 */
+	setKernelCwd(dir: string): Promise<void>;
 
 	setModel(provider: string, modelId: string): Promise<AgentConnectionModel>;
 	cycleModel(direction?: "forward" | "backward"): Promise<AgentConnectionModelCycleResult | undefined>;

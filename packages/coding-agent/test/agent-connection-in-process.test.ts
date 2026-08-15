@@ -97,6 +97,7 @@ function createFakeSession(id: string, messages: AgentMessage[]): FakeSessionCon
 		sessionFile: `/tmp/${id}.jsonl`,
 		sessionId: id,
 		sessionName: `${id} name`,
+		kernelCwd: `/tmp/kernel/${id}`,
 		autoCompactionEnabled: true,
 		messages,
 		getSessionActionSnapshot: () => ({ queuedCount: 0, steering: [], followUps: [] }),
@@ -251,6 +252,17 @@ describe("InProcessAgentConnection", () => {
 		});
 	});
 
+	it("changes the kernel working directory through the session", async () => {
+		const session = createFakeSession("kernel-cwd", []);
+		const setKernelCwd = vi.fn(async (_dir: string) => {});
+		Object.assign(session.session, { setKernelCwd });
+		const connection = new InProcessAgentConnection(asRuntime(new FakeRuntime(session.session)));
+
+		await connection.setKernelCwd("/tmp/somewhere");
+
+		expect(setKernelCwd).toHaveBeenCalledWith("/tmp/somewhere");
+	});
+
 	it("builds initial snapshots from the current runtime", async () => {
 		const messages = [userMessage("snapshot context", 1)];
 		const session = createFakeSession("snapshot", messages);
@@ -262,6 +274,7 @@ describe("InProcessAgentConnection", () => {
 		expect(snapshot).toMatchObject({
 			state: {
 				cwd: "/tmp/snapshot",
+				kernelCwd: "/tmp/kernel/snapshot",
 				sessionId: "snapshot",
 				messageCount: 1,
 				leafId: "snapshot-leaf",

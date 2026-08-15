@@ -407,6 +407,10 @@ export class InProcessAgentConnection implements AgentConnection {
 		this.session.abortBash();
 	}
 
+	async setKernelCwd(dir: string): Promise<void> {
+		await this.session.setKernelCwd(dir);
+	}
+
 	async setModel(provider: string, modelId: string): Promise<AgentConnectionModel> {
 		const availableModels = await this.session.modelRegistry.refreshAvailableModels();
 		const model = availableModels.find((candidate) => {

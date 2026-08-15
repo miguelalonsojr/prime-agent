@@ -985,6 +985,13 @@ export class DaemonAgentConnection implements AgentConnection {
 		}
 	}
 
+	async setKernelCwd(_dir: string): Promise<void> {
+		// TODO(Task 6): replace with the set_kernel_cwd daemon command once the protocol variant lands (Task 5).
+		throw new Error(
+			"the daemon is running an older build without kernel cwd propagation; restart the daemon and try again",
+		);
+	}
+
 	async setModel(provider: string, modelId: string): Promise<AgentConnectionModel> {
 		return this.requestData<AgentConnectionModel>({
 			type: "set_model",
