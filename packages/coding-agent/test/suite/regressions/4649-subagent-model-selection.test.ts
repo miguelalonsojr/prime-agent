@@ -110,7 +110,6 @@ describe("ENG-4649 subagent model selection", () => {
 				key: "prime-key",
 				primeTeam: { teamId: "engineering-team", name: "Prime Engineering" },
 			});
-			await harness.session.modelRegistry.refreshAvailableModels();
 
 			const discovered = await harness.session.findRlmModels("glm 5.2", 8);
 			expect(discovered.models.map((model) => model.selector)).toContain("prime-inference/internal/glm-5.2-fast");

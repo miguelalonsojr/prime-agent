@@ -6,6 +6,7 @@
 - Fixed new top-level daemon sessions inheriting an RLM child depth from the supervisor process.
 - Added a local installer that exposes the checkout's built bundle as `prime-agent`.
 - Fixed RLM children rejecting models that are available in the manual model selector.
+- Fixed `rlm` model discovery and subagent spawns skipping the private Prime Inference authorization refresh, which hid team-private models from `find_models` and rejected them at spawn.
 - Added a footer line showing the agent's current working directory and git branch.
 - Added `/term` to open an interactive shell; changing directory there moves the agent's IPython working directory when the shell exits.
 

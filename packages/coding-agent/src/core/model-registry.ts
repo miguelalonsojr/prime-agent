@@ -807,7 +807,7 @@ export class ModelRegistry {
 		return this.getAvailable();
 	}
 
-	private async refreshPrivatePrimeInferenceAuthorization(
+	async refreshPrivatePrimeInferenceAuthorization(
 		previousPrivateModelIds = new Set(this.authorizedPrivatePrimeInferenceModelIds),
 		previousTeamId = this.authorizedPrivatePrimeInferenceTeamId,
 	): Promise<void> {

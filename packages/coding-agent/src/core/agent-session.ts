@@ -9751,6 +9751,7 @@ export class AgentSession {
 	}
 
 	private async _authenticatedRlmModels(): Promise<Model<Api>[]> {
+		await this._modelRegistry.refreshPrivatePrimeInferenceAuthorization();
 		return this._modelRegistry.getAvailable().filter((model) => {
 			const status = this._modelRegistry.getProviderAuthStatus(model.provider);
 			return status.source !== "stale" && status.label !== "expired";
