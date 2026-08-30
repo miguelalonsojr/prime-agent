@@ -75,9 +75,9 @@ The SQLite implementation remains behind the session catalog interface. Session 
 
 The intended wire change is backward-compatible and capability-gated.
 
-The transport branch changes `DAEMON_SCHEMA_REVISION` from 23 to 25. Revision 24 adds `cached_session_list`. Revision 25 adds `direct_peer_transport`.
+The fork and upstream assign different meanings to schema revision 23. The approved conflict resolution creates composite revision 24 with a new schema ID. Revision 24 preserves the fork protocol history and adds upstream supervisor agent-roster queries. The catalog change becomes revision 25 with `cached_session_list`. Direct peer transport becomes revision 26 with `direct_peer_transport`.
 
-A `list` command with `refresh: false` requires schema revision 24 and `cached_session_list`. Direct transport discovery commands require schema revision 25 and `direct_peer_transport`. A client must not send these forms unless the server advertises the required schema and capability.
+A `list` command with `refresh: false` requires schema revision 25 and `cached_session_list`. Direct transport discovery commands require schema revision 26 and `direct_peer_transport`. A client must not send these forms unless the server advertises the required schema and capability.
 
 Older clients continue through supervisor routing and the existing list behavior. New clients connected to older daemons use the same fallback. Optional metadata must not prevent attachment, session startup, agents-view rendering, or recovery.
 
