@@ -1,7 +1,7 @@
 import type { ChildProcess, SpawnOptions } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import type { Socket } from "node:net";
+import { createServer, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
@@ -24,6 +24,7 @@ import {
 	DAEMON_WORKER_STARTUP_GATE_COMMIT,
 	DAEMON_WORKER_SUPERVISOR_SOCKET_ENV,
 	type DaemonWorkerFrameHeader,
+	type DaemonWorkerPeerGrant,
 } from "../src/modes/daemon/daemon-worker-protocol.js";
 import { MutationDrainLatch } from "../src/modes/daemon/mutation-drain-latch.js";
 import { WorkerRecoveryJournal } from "../src/modes/daemon/worker-recovery-journal.js";
@@ -507,6 +508,366 @@ describe("daemon worker supervisor monitoring", () => {
 		releaseOldAssertion();
 		await staleCommand;
 		expect(handleWorkerCommand).not.toHaveBeenCalled();
+	});
+
+	it("registers and consumes a one-use direct peer grant without creating a supervisor claim", async () => {
+		const grant: DaemonWorkerPeerGrant = {
+			grantId: "grant-1",
+			token: "peer-token",
+			expiresAt: new Date(Date.now() + 10_000).toISOString(),
+			purpose: "session_client",
+			workerId: "worker-1",
+			workerInstanceId: "instance-1",
+			rootActiveSessionId: "root-1",
+			activeSessionId: "root-1",
+			issuerGeneration: "supervisor-1",
+		};
+		const handleCommand = vi.fn(async () => undefined);
+		const daemon = Object.assign(Object.create(AgentDaemon.prototype), {
+			handleCommand,
+			options: {
+				worker: {
+					authenticationToken: "supervisor-token",
+					workerId: "worker-1",
+					workerInstanceId: "instance-1",
+				},
+			},
+			promptAdmissions: new Map(),
+			peerAdmissionsFenced: false,
+			peerGrants: new Map([[grant.grantId, grant]]),
+			peerClaims: new Map(),
+			supervisorClaims: new Map(),
+		}) as unknown as {
+			peerGrants: Map<string, DaemonWorkerPeerGrant>;
+			peerClaims: Map<DaemonSocketClient, DaemonWorkerPeerGrant>;
+			supervisorClaims: Map<DaemonSocketClient, object>;
+			handleLine(client: DaemonSocketClient, line: string): Promise<void>;
+		};
+		const makeClient = () =>
+			({
+				id: "peer",
+				authenticated: false,
+				transport: "private-framed",
+				socket: { destroyed: false, write: vi.fn(() => true), end: vi.fn() },
+				attachedActiveSessionIds: new Set(),
+				detachInput: vi.fn(),
+				supportsExtensionUi: false,
+				capabilities: new Set(),
+			}) as unknown as DaemonSocketClient;
+		const first = makeClient();
+
+		await daemon.handleLine(
+			first,
+			JSON.stringify({
+				type: "peer_auth",
+				grantId: grant.grantId,
+				token: grant.token,
+				workerInstanceId: grant.workerInstanceId,
+				purpose: grant.purpose,
+			}),
+		);
+
+		expect(first.authenticationRole).toBe("session_client");
+		expect(daemon.peerClaims.get(first)).toEqual(grant);
+		expect(daemon.supervisorClaims.has(first)).toBe(false);
+		expect(daemon.peerGrants.has(grant.grantId)).toBe(false);
+
+		await daemon.handleLine(
+			first,
+			JSON.stringify({ id: "wrong-scope", type: "get_state", activeSessionId: "other-session" }),
+		);
+		expect(handleCommand).not.toHaveBeenCalled();
+
+		const replay = makeClient();
+		await daemon.handleLine(
+			replay,
+			JSON.stringify({
+				type: "peer_auth",
+				grantId: grant.grantId,
+				token: grant.token,
+				workerInstanceId: grant.workerInstanceId,
+				purpose: grant.purpose,
+			}),
+		);
+		expect(replay.socket.end).toHaveBeenCalledOnce();
+		expect(daemon.peerClaims.has(replay)).toBe(false);
+	});
+
+	it("admits at most one pipelined delivery and holds it in the worker mutation drain", async () => {
+		const delivery = createDeferred<object>();
+		const sendAgentSessionMessage = vi.fn(async () => delivery.promise);
+		const mutationDrain = { begin: vi.fn(), end: vi.fn() };
+		const client = {
+			id: "peer",
+			authenticated: true,
+			authenticationRole: "worker_peer",
+			transport: "private-framed",
+			socket: { destroyed: false, write: vi.fn(() => true), end: vi.fn() },
+			attachedActiveSessionIds: new Set(),
+			detachInput: vi.fn(),
+			supportsExtensionUi: false,
+			capabilities: new Set(),
+		} as unknown as DaemonSocketClient;
+		const grant: DaemonWorkerPeerGrant = {
+			grantId: "grant-1",
+			token: "peer-token",
+			expiresAt: new Date(Date.now() + 10_000).toISOString(),
+			purpose: "agent_message",
+			workerId: "worker-1",
+			workerInstanceId: "instance-1",
+			rootActiveSessionId: "root-1",
+			activeSessionId: "target-1",
+			targetSessionId: "target-session",
+			issuerGeneration: "supervisor-1",
+			sender: { activeSessionId: "source-1", sessionId: "source-session", clientId: "worker:source" },
+		};
+		const daemon = Object.assign(Object.create(AgentDaemon.prototype), {
+			options: { worker: { workerId: "worker-1", workerInstanceId: "instance-1" } },
+			promptAdmissions: new Map(),
+			peerAdmissionsFenced: false,
+			peerClaims: new Map([[client, grant]]),
+			supervisorClaims: new Map(),
+			sessions: new Map([["target-1", { runtime: { session: { sessionId: "target-session" } } }]]),
+			mutationDrain,
+			sendAgentSessionMessage,
+		}) as unknown as {
+			handleLine(client: DaemonSocketClient, line: string): Promise<void>;
+		};
+
+		const first = daemon.handleLine(
+			client,
+			JSON.stringify({ id: "delivery-1", type: "peer_deliver_message", message: "hello" }),
+		);
+		await daemon.handleLine(
+			client,
+			JSON.stringify({ id: "delivery-2", type: "peer_deliver_message", message: "duplicate" }),
+		);
+		expect(sendAgentSessionMessage).toHaveBeenCalledOnce();
+		expect(mutationDrain.begin).toHaveBeenCalledOnce();
+		expect(mutationDrain.end).not.toHaveBeenCalled();
+		delivery.resolve({ deliveryStatus: "queued" });
+		await first;
+		expect(mutationDrain.end).toHaveBeenCalledOnce();
+	});
+
+	it("revokes pending grants and established peer claims when worker lifecycle is fenced", () => {
+		const peer = {
+			socket: { end: vi.fn() },
+		} as unknown as DaemonSocketClient;
+		const daemon = Object.assign(Object.create(AgentDaemon.prototype), {
+			peerAdmissionsFenced: false,
+			peerGrants: new Map([["grant-1", {}]]),
+			peerClaims: new Map([[peer, {}]]),
+		}) as unknown as {
+			peerAdmissionsFenced: boolean;
+			peerGrants: Map<string, object>;
+			peerClaims: Map<DaemonSocketClient, object>;
+			fencePeerTransports(): void;
+		};
+
+		daemon.fencePeerTransports();
+
+		expect(daemon.peerAdmissionsFenced).toBe(true);
+		expect(daemon.peerGrants.size).toBe(0);
+		expect(daemon.peerClaims.size).toBe(0);
+		expect(peer.socket.end).toHaveBeenCalledOnce();
+	});
+
+	it("unfences peer admission when update preparation rolls back", () => {
+		const transactionId = Symbol("update");
+		const daemon = Object.assign(Object.create(AgentDaemon.prototype), {
+			updateRestart: {
+				id: transactionId,
+				phase: "prepared",
+				abort: new AbortController(),
+				deferredClientEnv: [],
+			},
+			peerAdmissionsFenced: true,
+			updateRestartQueuePauses: new Map(),
+			cronScheduler: { start: vi.fn() },
+			shuttingDown: false,
+		}) as unknown as {
+			updateRestart?: object;
+			peerAdmissionsFenced: boolean;
+			cancelPreparedUpdateRestart(transactionId: symbol): void;
+		};
+
+		daemon.cancelPreparedUpdateRestart(transactionId);
+
+		expect(daemon.updateRestart).toBeUndefined();
+		expect(daemon.peerAdmissionsFenced).toBe(false);
+	});
+
+	it("accepts peer grant registration only from the matching supervisor and worker incarnation", async () => {
+		const grant: DaemonWorkerPeerGrant = {
+			grantId: "grant-1",
+			token: "peer-token",
+			expiresAt: new Date(Date.now() + 10_000).toISOString(),
+			purpose: "agent_message",
+			workerId: "worker-1",
+			workerInstanceId: "instance-1",
+			rootActiveSessionId: "root-1",
+			activeSessionId: "target-1",
+			targetSessionId: "target-session",
+			issuerGeneration: "supervisor-1",
+			sender: { activeSessionId: "source-1", sessionId: "source-session", clientId: "worker:source" },
+		};
+		const client = {
+			id: "supervisor",
+			transport: "private-framed",
+			socket: { destroyed: false, write: vi.fn(() => true), end: vi.fn() },
+			attachedActiveSessionIds: new Set(),
+			detachInput: vi.fn(),
+			supportsExtensionUi: false,
+			capabilities: new Set(),
+		} as unknown as DaemonSocketClient;
+		const daemon = Object.assign(Object.create(AgentDaemon.prototype), {
+			options: { worker: { workerId: "worker-1", workerInstanceId: "instance-1" } },
+			workerRootActiveSessionId: "root-1",
+			peerAdmissionsFenced: false,
+			peerGrants: new Map(),
+			sessions: new Map([["target-1", { runtime: { session: { sessionId: "target-session" } } }]]),
+			supervisorClaims: new Map([
+				[client, { claim: { supervisorGeneration: "supervisor-1" }, ownerFingerprint: "owner" }],
+			]),
+		}) as unknown as {
+			peerGrants: Map<string, DaemonWorkerPeerGrant>;
+			handleWorkerCommand(client: DaemonSocketClient, command: object): Promise<void>;
+		};
+
+		await daemon.handleWorkerCommand(client, { type: "worker_register_peer_transport", grant });
+		expect(daemon.peerGrants.get(grant.grantId)).toEqual(grant);
+
+		const staleGrant = { ...grant, grantId: "stale", workerInstanceId: "instance-old" };
+		await daemon.handleWorkerCommand(client, { type: "worker_register_peer_transport", grant: staleGrant });
+		expect(daemon.peerGrants.has(staleGrant.grantId)).toBe(false);
+	});
+
+	it("registers a ticket whose endpoint identity matches the current worker process", async () => {
+		const directory = mkdtempSync(join(tmpdir(), "prime-peer-ticket-"));
+		const socketPath = join(directory, "worker.sock");
+		const server = createServer();
+		await new Promise<void>((resolveListen) => server.listen(socketPath, resolveListen));
+		try {
+			const summary = { id: "target-1", activeSessionId: "target-1" } as unknown as SessionSummary;
+			const requestWorker = vi.fn(async (_command: unknown) => success(undefined, "attach"));
+			const worker = {
+				descriptor: {
+					workerId: "worker-1",
+					workerInstanceId: "instance-1",
+					pid: process.pid,
+					processStartId: getProcessStartId(process.pid),
+					socketPath,
+					rootActiveSessionId: "target-1",
+				},
+			};
+			const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+				generation: "supervisor-1",
+				assertCurrentOwnership: vi.fn(async () => undefined),
+				refreshWorkerSummaries: vi.fn(async () => undefined),
+				requireAvailableWorkerClient: vi.fn(() => ({ requestWorker })),
+				findSummaryInWorker: vi.fn(() => summary),
+				processIdentity: vi.fn(() => "current"),
+			}) as unknown as {
+				issuePeerTransport(
+					worker: object,
+					summary: SessionSummary,
+					purpose: "session_client",
+				): Promise<{
+					workerId: string;
+					workerInstanceId: string;
+					workerProcessStartId: string;
+					socketIdentity?: { dev: number; ino: number };
+				}>;
+			};
+
+			const ticket = await supervisor.issuePeerTransport(worker, summary, "session_client");
+
+			expect(ticket).toMatchObject({
+				workerId: "worker-1",
+				workerInstanceId: "instance-1",
+				workerProcessStartId: worker.descriptor.processStartId,
+			});
+			expect(ticket.socketIdentity).toEqual(
+				expect.objectContaining({ dev: expect.any(Number), ino: expect.any(Number) }),
+			);
+			expect(requestWorker).toHaveBeenCalledOnce();
+			expect(requestWorker.mock.calls[0]?.[0]).toMatchObject({
+				type: "worker_register_peer_transport",
+				grant: {
+					workerId: ticket.workerId,
+					workerInstanceId: ticket.workerInstanceId,
+					purpose: "session_client",
+				},
+			});
+		} finally {
+			await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
+			rmSync(directory, { recursive: true, force: true });
+		}
+	});
+
+	it("counts worker-side direct attachments when evaluating idle eviction", () => {
+		const activeSessionId = "target-1";
+		const summary = {
+			id: activeSessionId,
+			activeSessionId,
+			attachedClients: 1,
+			directAttachedClients: 1,
+			isStreaming: false,
+			unfinishedActionCount: 0,
+			sessionActions: { active: false, queuedCount: 0 },
+		} as unknown as SessionSummary;
+		const worker = {
+			descriptor: { lifecycle: "ready" },
+			client: {},
+			summaries: new Map([[activeSessionId, summary]]),
+		};
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			clients: new Set(),
+			updateRestartPhase: undefined,
+			isWorkerStopping: vi.fn(() => false),
+		}) as unknown as {
+			workerEvictionSnapshot(worker: object): { sessions: Array<{ attachedClients: number }> };
+		};
+
+		expect(supervisor.workerEvictionSnapshot(worker).sessions[0]?.attachedClients).toBe(1);
+		delete summary.directAttachedClients;
+		expect(supervisor.workerEvictionSnapshot(worker).sessions[0]?.attachedClients).toBe(0);
+	});
+
+	it.each([
+		{ name: "process identity", processStartId: undefined, socketPath: "/tmp/missing-peer-worker.sock" },
+		{
+			name: "socket identity",
+			processStartId: getProcessStartId(process.pid),
+			socketPath: "/tmp/missing-peer-worker.sock",
+		},
+	] as const)("fails closed when direct transport lacks exact $name", async (scenario) => {
+		const summary = { id: "target-1", activeSessionId: "target-1" } as unknown as SessionSummary;
+		const worker = {
+			descriptor: {
+				workerId: "worker-1",
+				workerInstanceId: "instance-1",
+				pid: process.pid,
+				processStartId: scenario.processStartId,
+				socketPath: scenario.socketPath,
+				rootActiveSessionId: "target-1",
+			},
+		};
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			generation: "supervisor-1",
+			assertCurrentOwnership: vi.fn(async () => undefined),
+			refreshWorkerSummaries: vi.fn(async () => undefined),
+			requireAvailableWorkerClient: vi.fn(() => ({ requestWorker: vi.fn() })),
+			findSummaryInWorker: vi.fn(() => summary),
+			processIdentity: vi.fn(() => "current"),
+		}) as unknown as {
+			issuePeerTransport(worker: object, summary: SessionSummary, purpose: "session_client"): Promise<unknown>;
+		};
+
+		await expect(supervisor.issuePeerTransport(worker, summary, "session_client")).rejects.toThrow(
+			`Direct transport requires an exact worker ${scenario.name}`,
+		);
 	});
 
 	it.each([

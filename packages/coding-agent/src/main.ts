@@ -78,6 +78,8 @@ import { deserializeDaemonError } from "./modes/daemon/daemon-errors.js";
 import { collectDaemonClientEnv, collectDaemonLaunchEnv } from "./modes/daemon/daemon-protocol.js";
 import {
 	DAEMON_WORKER_ACTIVE_SESSION_ID_ENV,
+	daemonWorkerId,
+	daemonWorkerInstanceId,
 	isDaemonWorkerProcess,
 	requireDaemonWorkerAuthenticationToken,
 	waitForDaemonWorkerStartupGate,
@@ -1330,6 +1332,8 @@ export async function main(args: string[], options?: MainOptions) {
 				createRuntime,
 				worker: {
 					authenticationToken: requireDaemonWorkerAuthenticationToken(),
+					workerId: daemonWorkerId(),
+					workerInstanceId: daemonWorkerInstanceId(),
 					restoreActiveSessionId: process.env[DAEMON_WORKER_ACTIVE_SESSION_ID_ENV],
 				},
 			});

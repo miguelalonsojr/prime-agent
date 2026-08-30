@@ -70,8 +70,9 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 23 scopes ACP MCP replacement and cleanup to a connection owner.
 // Revision 24 lets workers query the supervisor agent roster on demand.
 // Revision 25 lets Agents View request cached worker summaries without global refresh traffic.
-export const DAEMON_SCHEMA_REVISION = 25;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-25-fb93f18a9866";
+// Revision 26 adds capability-gated direct peer transport discovery.
+export const DAEMON_SCHEMA_REVISION = 26;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-26-796d1e756b52";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -121,7 +122,8 @@ export type DaemonServerCapability =
 	| "session_input_pause"
 	| "owned_prompt_cancellation"
 	| "acp_mcp_servers"
-	| "cached_session_list";
+	| "cached_session_list"
+	| "direct_peer_transport";
 
 export type DaemonReplayStatus = "complete" | "partial" | "unavailable";
 
@@ -168,6 +170,7 @@ export const DAEMON_DEFAULT_SERVER_CAPABILITIES: readonly DaemonServerCapability
 	"session_input_pause",
 	"acp_mcp_servers",
 	"cached_session_list",
+	"direct_peer_transport",
 ];
 
 export interface DaemonRuntimeIdentity {
@@ -175,6 +178,24 @@ export interface DaemonRuntimeIdentity {
 	executablePath: string;
 	entrypointPath?: string;
 	launcherPath?: string;
+}
+
+export type DaemonPeerTransportPurpose = "session_client" | "agent_message";
+
+/** Short-lived, one-use capability for a direct connection to one worker process. */
+export interface DaemonPeerTransportTicket {
+	purpose: DaemonPeerTransportPurpose;
+	socketPath: string;
+	socketIdentity: { dev: number; ino: number };
+	workerId: string;
+	workerInstanceId: string;
+	rootActiveSessionId: string;
+	activeSessionId: string;
+	workerPid: number;
+	workerProcessStartId: string;
+	grantId: string;
+	token: string;
+	expiresAt: string;
 }
 
 export type DaemonResumeCursor =
@@ -390,6 +411,15 @@ export type DaemonCommand =
 	  }
 	| DaemonSavedSessionListCommand
 	| { id?: string; type: "list_agent_peers"; workerToken: string }
+	| { id?: string; type: "get_direct_worker_transport"; activeSessionId: string }
+	| {
+			id?: string;
+			type: "get_agent_message_transport";
+			workerToken: string;
+			workerInstanceId: string;
+			fromActiveSessionId: string;
+			targetActiveSessionId: string;
+	  }
 	| ({
 			id?: string;
 			type: "create";
@@ -737,12 +767,19 @@ const CACHED_SESSION_LIST_COMMAND = {
 	minSchemaRevision: 25,
 	capability: "cached_session_list",
 } as const;
+const DIRECT_PEER_TRANSPORT_COMMAND = {
+	minProtocol: 7,
+	minSchemaRevision: 26,
+	capability: "direct_peer_transport",
+} as const;
 
 export const DAEMON_COMMAND_COMPATIBILITY = {
 	ack_result: LEGACY_DAEMON_COMMAND,
 	list: LEGACY_DAEMON_COMMAND,
 	list_saved_sessions: LEGACY_DAEMON_COMMAND,
 	list_agent_peers: AGENT_PEER_LIST_COMMAND,
+	get_direct_worker_transport: DIRECT_PEER_TRANSPORT_COMMAND,
+	get_agent_message_transport: DIRECT_PEER_TRANSPORT_COMMAND,
 	create: LEGACY_DAEMON_COMMAND,
 	attach: LEGACY_DAEMON_COMMAND,
 	reattach: LEGACY_DAEMON_COMMAND,
@@ -1137,6 +1174,8 @@ const READ_ONLY_DAEMON_COMMANDS: ReadonlySet<DaemonCommand["type"]> = new Set([
 	"list",
 	"list_saved_sessions",
 	"list_agent_peers",
+	"get_direct_worker_transport",
+	"get_agent_message_transport",
 	"attach",
 	"reattach",
 	"agent_messages_status",

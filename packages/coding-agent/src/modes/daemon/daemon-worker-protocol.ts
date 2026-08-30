@@ -4,10 +4,17 @@ import type { IdleEvictionMinutes } from "../../core/session-action-store.js";
 
 export { SESSION_LEASE_OWNER_ID_ENV, SESSION_LEASES_ENABLED_ENV } from "../../core/session-lease.js";
 
-import type { DaemonClientCapability, DaemonCommand, DaemonOutbound } from "./daemon-protocol.js";
+import type {
+	DaemonClientCapability,
+	DaemonCommand,
+	DaemonOutbound,
+	DaemonPeerTransportPurpose,
+} from "./daemon-protocol.js";
 
 export const DAEMON_WORKER_ROLE_ENV = "PRIME_AGENT_INTERNAL_DAEMON_WORKER";
 export const DAEMON_WORKER_TOKEN_ENV = "PRIME_AGENT_INTERNAL_DAEMON_WORKER_TOKEN";
+export const DAEMON_WORKER_ID_ENV = "PRIME_AGENT_INTERNAL_DAEMON_WORKER_ID";
+export const DAEMON_WORKER_INSTANCE_ID_ENV = "PRIME_AGENT_INTERNAL_DAEMON_WORKER_INSTANCE_ID";
 export const DAEMON_WORKER_ACTIVE_SESSION_ID_ENV = "PRIME_AGENT_INTERNAL_DAEMON_WORKER_ACTIVE_SESSION_ID";
 export const DAEMON_WORKER_SUPERVISOR_SOCKET_ENV = "PRIME_AGENT_INTERNAL_DAEMON_SUPERVISOR_SOCKET";
 export const DAEMON_WORKER_RECOVERY_JOURNAL_ENV = "PRIME_AGENT_INTERNAL_DAEMON_WORKER_RECOVERY_JOURNAL";
@@ -48,11 +55,55 @@ export function durableDaemonCreateCommand(command: DaemonCreateCommand): Durabl
 	};
 }
 
+export type DaemonWorkerPeerGrant =
+	| {
+			grantId: string;
+			token: string;
+			expiresAt: string;
+			purpose: "session_client";
+			workerId: string;
+			workerInstanceId: string;
+			rootActiveSessionId: string;
+			activeSessionId: string;
+			issuerGeneration: string;
+	  }
+	| {
+			grantId: string;
+			token: string;
+			expiresAt: string;
+			purpose: "agent_message";
+			workerId: string;
+			workerInstanceId: string;
+			rootActiveSessionId: string;
+			activeSessionId: string;
+			targetSessionId: string;
+			issuerGeneration: string;
+			sender: AgentSessionMessageSender;
+	  };
+
+export type DaemonPeerCommand =
+	| {
+			id?: string;
+			type: "peer_auth";
+			grantId: string;
+			token: string;
+			workerInstanceId: string;
+			purpose: DaemonPeerTransportPurpose;
+	  }
+	| { id?: string; type: "peer_deliver_message"; message: string };
+
+export type DaemonPeerCommandBody = DaemonPeerCommand extends infer TCommand
+	? TCommand extends { id?: string }
+		? Omit<TCommand, "id">
+		: never
+	: never;
+
 export type DaemonWorkerCommand =
 	| {
 			id?: string;
 			type: "worker_auth";
 			token: string;
+			workerInstanceId?: string;
 			supervisorGeneration: string;
 			supervisorPid: number;
 			supervisorProcessStartId?: string;
@@ -66,6 +117,11 @@ export type DaemonWorkerCommand =
 			supportsExtensionUi?: boolean;
 	  }
 	| { id?: string; type: "worker_unsubscribe"; activeSessionId: string }
+	| {
+			id?: string;
+			type: "worker_register_peer_transport";
+			grant: DaemonWorkerPeerGrant;
+	  }
 	| { id?: string; type: "worker_archive_and_shutdown" }
 	| {
 			id?: string;
@@ -92,6 +148,86 @@ export type DaemonWorkerCommandBody = DaemonWorkerCommand extends infer TCommand
 		: never
 	: never;
 
+const DIRECT_SESSION_COMMANDS: ReadonlySet<DaemonCommand["type"]> = new Set([
+	"attach",
+	"detach",
+	"prompt",
+	"cancel_prompt_admission",
+	"prompt_and_wait",
+	"steer",
+	"follow_up",
+	"restore_next_turn",
+	"restore_actions",
+	"append_custom_message",
+	"resume_queue",
+	"abort",
+	"start_side_question",
+	"abort_side_question",
+	"execute_bash",
+	"execute_bash_and_wait",
+	"abort_bash",
+	"cancel_rlm_child",
+	"delete_rlm_subagent",
+	"wait_for_idle",
+	"wait_for_headless_completion",
+	"get_session_header",
+	"get_state",
+	"get_connection_state",
+	"get_messages",
+	"get_rlm_children",
+	"get_session_stats",
+	"get_context_tree",
+	"get_commands",
+	"get_resource_snapshot",
+	"replace_acp_mcp_servers",
+	"get_model_catalog",
+	"get_available_models",
+	"get_queue",
+	"mutate_queued_message",
+	"clear_queue",
+	"abort_and_clear_queue",
+	"acquire_session_input_pause",
+	"release_session_input_pause",
+	"set_model",
+	"cycle_model",
+	"set_scoped_models",
+	"set_thinking_level",
+	"cycle_thinking_level",
+	"set_service_tier",
+	"set_transport",
+	"set_steering_mode",
+	"set_follow_up_mode",
+	"set_auto_compaction",
+	"set_auto_retry",
+	"compact",
+	"refine",
+	"abort_compaction",
+	"abort_branch_summary",
+	"abort_retry",
+	"reload",
+	"new_session",
+	"switch_session",
+	"fork",
+	"navigate_tree",
+	"import_jsonl",
+	"export_html",
+	"export_jsonl",
+	"get_rlm_max_depth_status",
+	"set_rlm_max_depth",
+	"get_session_context",
+	"get_session_tree",
+	"get_user_messages_for_forking",
+	"get_last_assistant_text",
+	"get_system_prompt",
+	"get_tool_definition",
+	"set_session_entry_label",
+	"extension_ui_response",
+]);
+
+export function isDirectSessionCommand(command: Pick<DaemonCommand, "type">): boolean {
+	return DIRECT_SESSION_COMMANDS.has(command.type);
+}
+
 export interface DaemonWorkerDescriptor {
 	version: 1 | 2;
 	workerId: string;
@@ -102,6 +238,8 @@ export interface DaemonWorkerDescriptor {
 	orphanProcessJournalPath?: string;
 	supervisorSocketPath: string;
 	authenticationToken: string;
+	/** Fresh random identity for this exact worker process incarnation. */
+	workerInstanceId?: string;
 	rootActiveSessionId: string;
 	/** Stable protocol client that owns this worker. Omitted for resident sessions. */
 	ownerClientId?: string;
@@ -146,6 +284,7 @@ export function durableDaemonWorkerDescriptor(descriptor: DaemonWorkerDescriptor
 			: {}),
 		supervisorSocketPath: descriptor.supervisorSocketPath,
 		authenticationToken: descriptor.authenticationToken,
+		...(descriptor.workerInstanceId !== undefined ? { workerInstanceId: descriptor.workerInstanceId } : {}),
 		rootActiveSessionId: descriptor.rootActiveSessionId,
 		...(descriptor.ownerClientId !== undefined ? { ownerClientId: descriptor.ownerClientId } : {}),
 		...(descriptor.rootSessionId !== undefined ? { rootSessionId: descriptor.rootSessionId } : {}),
@@ -195,6 +334,14 @@ export function requireDaemonWorkerAuthenticationToken(environment: NodeJS.Proce
 		throw new Error("Daemon session worker is missing its authentication token");
 	}
 	return token;
+}
+
+export function daemonWorkerId(environment: NodeJS.ProcessEnv = process.env): string | undefined {
+	return environment[DAEMON_WORKER_ID_ENV] || undefined;
+}
+
+export function daemonWorkerInstanceId(environment: NodeJS.ProcessEnv = process.env): string | undefined {
+	return environment[DAEMON_WORKER_INSTANCE_ID_ENV] || undefined;
 }
 
 export function isDaemonWorkerFrameHeader(value: unknown): value is DaemonWorkerFrameHeader {

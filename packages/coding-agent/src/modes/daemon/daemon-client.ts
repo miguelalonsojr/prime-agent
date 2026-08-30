@@ -22,7 +22,7 @@ import {
 import type { DaemonWorkerCommand, DaemonWorkerCommandBody } from "./daemon-worker-protocol.js";
 
 type DistributiveOmit<T, K extends keyof T> = T extends unknown ? Omit<T, K> : never;
-type DaemonCommandBody = DistributiveOmit<DaemonCommand, "id">;
+export type DaemonCommandBody = DistributiveOmit<DaemonCommand, "id">;
 
 type DaemonWireCommandBody = DaemonCommandBody | DaemonWorkerCommandBody;
 
@@ -97,6 +97,26 @@ export interface DaemonClientReconnectOptions {
 	recoverDaemon: () => Promise<void>;
 	timeoutMs?: number;
 	onStatus?: (status: DaemonClientReconnectStatus) => void;
+}
+
+export interface DaemonTransportClient {
+	readonly hello: DaemonHello | undefined;
+	readonly isConnected: boolean;
+	supportsServerCapability(capability: DaemonServerCapability): boolean;
+	waitForHello(timeoutMs?: number): Promise<DaemonHello>;
+	connect(timeoutMs?: number): Promise<void>;
+	reconnect(timeoutMs?: number): Promise<void>;
+	disconnectForReconnect(reason: DaemonClosingReason): void;
+	resetTransportForReconnect(): void;
+	onMessage(listener: DaemonClientMessageListener): () => void;
+	onClose(listener: DaemonClientCloseListener): () => void;
+	enableRequestRecovery(): void;
+	request(
+		command: DaemonCommandBody,
+		timeoutMs?: number,
+		options?: DaemonClientRequestOptions,
+	): Promise<DaemonResponse>;
+	close(): void;
 }
 
 const DEFAULT_RECONNECT_TIMEOUT_MS = 60_000;

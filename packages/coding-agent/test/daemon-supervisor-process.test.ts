@@ -15,7 +15,9 @@ import {
 import { readSessionInfo, SessionManager } from "../src/core/session-manager.js";
 import { DaemonAgentConnection } from "../src/modes/agent-connection/daemon-agent-connection.js";
 import { DaemonClient, getDaemonSocketCloseReason } from "../src/modes/daemon/daemon-client.js";
+import type { DaemonPeerTransportTicket } from "../src/modes/daemon/daemon-protocol.js";
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
+import { DaemonWorkerClient } from "../src/modes/daemon/daemon-worker-client.js";
 import type { DaemonWorkerDescriptor } from "../src/modes/daemon/daemon-worker-protocol.js";
 
 const cliPath = resolve(__dirname, "../src/cli.ts");
@@ -121,14 +123,14 @@ function readDaemonLogs(agentDir: string): string {
 	}
 }
 
-function readWorkerDescriptor(agentDir: string): DaemonWorkerDescriptor {
+function readWorkerDescriptor(agentDir: string, rootActiveSessionId?: string): DaemonWorkerDescriptor {
 	const workersRoot = join(agentDir, "daemon-workers");
 	for (const directory of readdirSync(workersRoot)) {
 		const descriptorDirectory = join(workersRoot, directory);
 		for (const name of readdirSync(descriptorDirectory)) {
-			if (name.endsWith(".json")) {
-				return JSON.parse(readFileSync(join(descriptorDirectory, name), "utf8")) as DaemonWorkerDescriptor;
-			}
+			if (!name.endsWith(".json")) continue;
+			const descriptor = JSON.parse(readFileSync(join(descriptorDirectory, name), "utf8")) as DaemonWorkerDescriptor;
+			if (!rootActiveSessionId || descriptor.rootActiveSessionId === rootActiveSessionId) return descriptor;
 		}
 	}
 	throw new Error("Worker descriptor was not persisted");
@@ -615,13 +617,67 @@ describe("daemon supervisor resident workers", () => {
 				name,
 				config: { cwd: projectDir, agentDir, sessionDir, noTools: true, noExtensions: true },
 			});
-			expect(response.success).toBe(true);
+			expect(response.success, JSON.stringify(response)).toBe(true);
 			return requireSummary(response.success ? response.data : undefined);
 		};
 		const source = await createRoot("source-root");
 		const target = await createRoot("target-root");
 		expect(source.workerPid).not.toBe(target.workerPid);
 		await startBlockingBash(client, target.activeSessionId ?? target.id, join(root, "target-root-blocker.ready"));
+
+		const sourceActiveSessionId = source.activeSessionId ?? source.id;
+		const sourceDescriptor = readWorkerDescriptor(agentDir, sourceActiveSessionId);
+		const peerListResponse = await client.request({
+			type: "list_agent_peers",
+			workerToken: sourceDescriptor.authenticationToken,
+		});
+		expect(peerListResponse.success).toBe(true);
+		const serializedPeerList = JSON.stringify(peerListResponse);
+		expect(serializedPeerList).not.toContain(sourceDescriptor.authenticationToken);
+		expect(serializedPeerList).not.toContain("socketPath");
+		expect(serializedPeerList).not.toContain("grantId");
+		const staleSourceResponse = await client.request({
+			type: "get_agent_message_transport",
+			workerToken: sourceDescriptor.authenticationToken,
+			workerInstanceId: "stale-worker-instance",
+			fromActiveSessionId: sourceActiveSessionId,
+			targetActiveSessionId: target.activeSessionId ?? target.id,
+		});
+		expect(staleSourceResponse).toMatchObject({ success: false, error: "Worker authentication failed" });
+		const ticketResponse = await client.request({
+			type: "get_agent_message_transport",
+			workerToken: sourceDescriptor.authenticationToken,
+			workerInstanceId: sourceDescriptor.workerInstanceId ?? "",
+			fromActiveSessionId: sourceActiveSessionId,
+			targetActiveSessionId: target.activeSessionId ?? target.id,
+		});
+		expect(ticketResponse.success, JSON.stringify(ticketResponse)).toBe(true);
+		if (!ticketResponse.success) throw new Error(ticketResponse.error);
+		const ticket = ticketResponse.data as DaemonPeerTransportTicket;
+		const peer = new DaemonWorkerClient(ticket.socketPath);
+		await peer.connect(1000);
+		await peer.waitForHello(1000);
+		await peer.authenticatePeer(ticket, 1000);
+		const directDelivery = await peer.requestPeer(
+			{ type: "peer_deliver_message", message: "hello over direct worker transport" },
+			5000,
+		);
+		expect(directDelivery).toMatchObject({
+			success: true,
+			data: {
+				source: "agent_message",
+				target: { activeSessionId: target.activeSessionId ?? target.id },
+				message: "hello over direct worker transport",
+				deliveryStatus: "queued",
+			},
+		});
+		peer.close();
+
+		const replay = new DaemonWorkerClient(ticket.socketPath);
+		await replay.connect(1000);
+		await replay.waitForHello(1000);
+		await expect(replay.authenticatePeer(ticket, 1000)).rejects.toThrow();
+		replay.close();
 
 		const response = await client.request({
 			type: "send_message",
@@ -640,6 +696,16 @@ describe("daemon supervisor resident workers", () => {
 				deliveryStatus: "queued",
 			},
 		});
+		if (!target.sessionFile) throw new Error("Target root did not expose its session file");
+		const routedConnection = await DaemonAgentConnection.attach(client, sourceActiveSessionId, {
+			recoverDaemon: async () => {},
+		});
+		await expect(routedConnection.switchSession(target.sessionFile)).resolves.toEqual({ cancelled: false });
+		await expect(routedConnection.getState()).resolves.toMatchObject({
+			activeSessionId: target.activeSessionId ?? target.id,
+			sessionId: target.sessionId,
+		});
+		await routedConnection.dispose();
 		const shutdown = await client.request({ type: "shutdown" }, 10_000);
 		expect(shutdown.success).toBe(true);
 		client.close();
@@ -1368,10 +1434,14 @@ describe("daemon supervisor resident workers", () => {
 		}
 		workerPids.add(createdSummary.workerPid);
 
+		let releaseControlPlaneRecovery = () => {};
+		const controlPlaneRecoveryGate = new Promise<void>((resolveRecovery) => {
+			releaseControlPlaneRecovery = resolveRecovery;
+		});
 		const connection = await DaemonAgentConnection.attach(
 			client,
 			createdSummary.activeSessionId ?? createdSummary.id,
-			{ recoverDaemon: async () => {} },
+			{ recoverDaemon: async () => controlPlaneRecoveryGate },
 		);
 		const connectionEvents: string[] = [];
 		const replacementMessageCounts: number[] = [];
@@ -1400,10 +1470,21 @@ describe("daemon supervisor resident workers", () => {
 			await new Promise((resolveDelay) => setTimeout(resolveDelay, 10));
 		}
 		expect(replacementMessageCounts.at(-1)).toBe(2);
+		const directInputPause = await connection.acquireSessionInputPause("supervisor-replacement");
 
 		firstSupervisor.kill("SIGTERM");
 		await waitForExit(firstSupervisor);
 		children.delete(firstSupervisor);
+		const directSurvivalDeadline = Date.now() + 5000;
+		while (!connectionEvents.includes("connection_status:reconnecting") && Date.now() < directSurvivalDeadline) {
+			await new Promise((resolveDelay) => setTimeout(resolveDelay, 10));
+		}
+		await expect(connection.getState()).resolves.toMatchObject({
+			activeSessionId: createdSummary.activeSessionId,
+			sessionId: createdSummary.sessionId,
+		});
+		await expect(directInputPause.release()).resolves.toBeUndefined();
+		releaseControlPlaneRecovery();
 
 		const reconnectDeadline = Date.now() + 15_000;
 		while (!connectionEvents.includes("connection_status:connected") && Date.now() < reconnectDeadline) {
@@ -1431,6 +1512,12 @@ describe("daemon supervisor resident workers", () => {
 		});
 
 		const descriptor = readWorkerDescriptor(agentDir);
+		const staleTicketResponse = await client.request({
+			type: "get_direct_worker_transport",
+			activeSessionId,
+		});
+		if (!staleTicketResponse.success) throw new Error(staleTicketResponse.error);
+		const staleTicket = staleTicketResponse.data as DaemonPeerTransportTicket;
 		await startBlockingBash(client, activeSessionId, join(root, "orphan-blocker.ready"));
 		if (!descriptor.orphanProcessJournalPath) {
 			throw new Error("Resident worker did not persist its orphan-process journal path");
@@ -1484,6 +1571,20 @@ describe("daemon supervisor resident workers", () => {
 		const recovered = requireSummary(reopened.data);
 		if (!recovered.workerPid) throw new Error("Recovered worker did not expose its pid");
 		workerPids.add(recovered.workerPid);
+		const recoveredDescriptor = readWorkerDescriptor(agentDir, recovered.activeSessionId ?? recovered.id);
+		expect(recoveredDescriptor.workerInstanceId).not.toBe(staleTicket.workerInstanceId);
+		const stalePeer = new DaemonWorkerClient(staleTicket.socketPath);
+		let staleTicketRejected = false;
+		try {
+			await stalePeer.connect(1000);
+			await stalePeer.waitForHello(1000);
+			await stalePeer.authenticatePeer(staleTicket, 1000);
+		} catch {
+			staleTicketRejected = true;
+		} finally {
+			stalePeer.close();
+		}
+		expect(staleTicketRejected).toBe(true);
 		const recoveredConnection = await DaemonAgentConnection.attach(
 			client,
 			recovered.activeSessionId ?? recovered.id,

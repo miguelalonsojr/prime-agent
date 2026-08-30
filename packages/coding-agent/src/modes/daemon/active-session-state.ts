@@ -19,7 +19,9 @@ export interface DaemonSocketClient {
 	catchupRetryTimer?: NodeJS.Timeout;
 	backpressured?: boolean;
 	authenticated?: boolean;
+	authenticationRole?: "supervisor" | "session_client" | "worker_peer";
 	transport?: "jsonl" | "private-framed";
+	supportsCompactAssistantDelta?: boolean;
 	snapshotStreaming?: boolean;
 	snapshotActiveSessionIds?: Set<string>;
 	snapshotActiveSessionCounts?: Map<string, number>;

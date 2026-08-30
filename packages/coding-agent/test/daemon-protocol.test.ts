@@ -16,6 +16,7 @@ import {
 	DAEMON_SCHEMA_REVISION,
 	type DaemonCommand,
 	type DaemonOutbound,
+	type DaemonPeerTransportTicket,
 	getDaemonCommandCompatibilities,
 	isDaemonCommandEnvelope,
 	isDaemonMutatingCommand,
@@ -38,6 +39,7 @@ describe("daemon protocol helpers", () => {
 			orphanProcessJournalPath: "/state/orphans.jsonl",
 			supervisorSocketPath: "/tmp/supervisor.sock",
 			authenticationToken: "local-worker-token",
+			workerInstanceId: "worker-instance-1",
 			rootActiveSessionId: "active",
 			sessionFile: "/sessions/root.jsonl",
 			createdAt: "2026-01-01T00:00:00.000Z",
@@ -67,6 +69,7 @@ describe("daemon protocol helpers", () => {
 		expect(durable.createCommand).toEqual({ type: "create", sessionPath: "/sessions/root.jsonl" });
 		expect(durable).toMatchObject({
 			workerId: "worker",
+			workerInstanceId: "worker-instance-1",
 			sessionFile: "/sessions/root.jsonl",
 			sessionDir: "/legacy/sessions",
 			telemetryDisabled: true,
@@ -77,8 +80,8 @@ describe("daemon protocol helpers", () => {
 	it("keeps the advertised schema identity synchronized with the full protocol source", () => {
 		const source = readFileSync(resolve(__dirname, "../src/modes/daemon/daemon-protocol.ts"), "utf8");
 		const normalizedSource = source.replace(
-			/DAEMON_SCHEMA_ID = "protocol-7-schema-25-[^"]+"/,
-			'DAEMON_SCHEMA_ID = "protocol-7-schema-25-SCHEMA"',
+			/DAEMON_SCHEMA_ID = "protocol-7-schema-26-[^"]+"/,
+			'DAEMON_SCHEMA_ID = "protocol-7-schema-26-SCHEMA"',
 		);
 		const digest = createHash("sha256").update(normalizedSource).digest("hex").slice(0, 12);
 		expect(DAEMON_SCHEMA_ID).toBe(`protocol-${DAEMON_PROTOCOL_VERSION}-schema-${DAEMON_SCHEMA_REVISION}-${digest}`);
@@ -134,6 +137,46 @@ describe("daemon protocol helpers", () => {
 		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).toContain("cached_session_list");
 	});
 
+	it("capability-gates direct TUI and worker peer discovery", () => {
+		expect(DAEMON_COMMAND_COMPATIBILITY.get_direct_worker_transport).toEqual({
+			minProtocol: 7,
+			minSchemaRevision: 26,
+			capability: "direct_peer_transport",
+		});
+		expect(DAEMON_COMMAND_COMPATIBILITY.get_agent_message_transport).toEqual(
+			DAEMON_COMMAND_COMPATIBILITY.get_direct_worker_transport,
+		);
+		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).toContain("direct_peer_transport");
+		expect(isDaemonMutatingCommand({ type: "get_direct_worker_transport" })).toBe(false);
+		expect(isDaemonMutatingCommand({ type: "get_agent_message_transport" })).toBe(false);
+	});
+
+	it("keeps direct transport credentials scoped to the ticket shape", () => {
+		const ticket = {
+			purpose: "agent_message",
+			socketPath: "/tmp/worker.sock",
+			socketIdentity: { dev: 1, ino: 2 },
+			workerId: "worker-1",
+			workerInstanceId: "instance-1",
+			rootActiveSessionId: "root-1",
+			activeSessionId: "target-1",
+			workerPid: 123,
+			workerProcessStartId: "start-1",
+			grantId: "grant-1",
+			token: "peer-token",
+			expiresAt: "2026-01-01T00:00:10.000Z",
+		} as const satisfies DaemonPeerTransportTicket;
+
+		expect(ticket).not.toHaveProperty("authenticationToken");
+		expect(ticket).not.toHaveProperty("supervisorGeneration");
+		expect(ticket).toMatchObject({
+			purpose: "agent_message",
+			workerId: "worker-1",
+			workerInstanceId: "instance-1",
+			activeSessionId: "target-1",
+		});
+	});
+
 	it("capability-gates the optional model catalog surface", () => {
 		expect(DAEMON_COMMAND_COMPATIBILITY.get_model_catalog).toEqual({
 			minProtocol: 7,
@@ -160,8 +203,8 @@ describe("daemon protocol helpers", () => {
 		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).toContain("kernel_cwd_propagation");
 	});
 
-	it("preserves revision 24 for supervisor agent-roster queries at schema revision 25", () => {
-		expect(DAEMON_SCHEMA_REVISION).toBe(25);
+	it("preserves revisions 24 and 25 at schema revision 26", () => {
+		expect(DAEMON_SCHEMA_REVISION).toBe(26);
 		expect(getDaemonCommandCompatibilities({ type: "list_agent_peers", workerToken: "worker" })).toContainEqual({
 			minProtocol: 7,
 			minSchemaRevision: 24,

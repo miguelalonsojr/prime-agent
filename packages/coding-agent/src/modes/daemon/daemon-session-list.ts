@@ -55,6 +55,8 @@ export interface SessionSummary {
 	/** True while the agent is streaming with tool calls pending; drives the "running tools" label. */
 	isRunningTools?: boolean;
 	attachedClients: number;
+	/** Direct session clients only; excludes the worker's permanent supervisor subscription. */
+	directAttachedClients?: number;
 	messageCount: number;
 	unfinishedActionCount?: number;
 	sessionActions: SessionActionSnapshot;

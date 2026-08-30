@@ -17,6 +17,7 @@ import {
 import {
 	type AgentFamilyCatalogEntry,
 	type AgentSessionMessageAgentSummary,
+	type AgentSessionMessageSender,
 	assertAgentFamilyReach,
 	assertAgentSessionNameAvailable,
 	formatAgentSessionNameUnavailable,
@@ -76,6 +77,8 @@ import {
 	type DaemonClosingReason,
 	type DaemonCommand,
 	type DaemonOutbound,
+	type DaemonPeerTransportPurpose,
+	type DaemonPeerTransportTicket,
 	type DaemonResponse,
 	type DaemonUpdateRestartManifest,
 	failure,
@@ -113,6 +116,8 @@ import {
 import { DaemonWorkerClient } from "./daemon-worker-client.js";
 import {
 	DAEMON_WORKER_ACTIVE_SESSION_ID_ENV,
+	DAEMON_WORKER_ID_ENV,
+	DAEMON_WORKER_INSTANCE_ID_ENV,
 	DAEMON_WORKER_RECOVERY_JOURNAL_ENV,
 	DAEMON_WORKER_ROLE_ENV,
 	DAEMON_WORKER_STARTUP_GATE_COMMIT,
@@ -123,6 +128,7 @@ import {
 	type DaemonWorkerDescriptor,
 	type DaemonWorkerFrameHeader,
 	type DaemonWorkerLifecycle,
+	type DaemonWorkerPeerGrant,
 	durableDaemonCreateCommand,
 	durableDaemonWorkerDescriptor,
 	SESSION_LEASE_OWNER_ID_ENV,
@@ -163,6 +169,7 @@ const IDLE_EVICTION_MIN_SWEEP_INTERVAL_MS = 60_000;
 const IDLE_EVICTION_DRAIN_TIMEOUT_MS = 5_000;
 const CHILD_PASSIVATION_PER_WORKER_CAP = 2;
 const WORKER_SUMMARY_REFRESH_INTERVAL_MS = 1000;
+const PEER_TRANSPORT_GRANT_TTL_MS = 10_000;
 const SUPERVISOR_CONFIG_FILE_NAME = "supervisor-config";
 const WORKER_STARTUP_GATE_FD = 3;
 
@@ -170,6 +177,8 @@ export const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"ack_result",
 	"list",
 	"list_agent_peers",
+	"get_direct_worker_transport",
+	"get_agent_message_transport",
 	"list_saved_sessions",
 	"create",
 	"attach",
@@ -478,6 +487,7 @@ function isDaemonWorkerDescriptor(value: unknown, socketPath: string): value is 
 		(descriptor.ownerClientId === undefined || typeof descriptor.ownerClientId === "string") &&
 		typeof descriptor.socketPath === "string" &&
 		typeof descriptor.authenticationToken === "string" &&
+		(descriptor.workerInstanceId === undefined || typeof descriptor.workerInstanceId === "string") &&
 		typeof descriptor.rootActiveSessionId === "string" &&
 		typeof descriptor.createdAt === "string" &&
 		typeof descriptor.updatedAt === "string" &&
@@ -828,9 +838,9 @@ export class DaemonSupervisor {
 					// Use the canonical busy projection: a parent remains active for
 					// residency purposes while any of its RLM descendants is running.
 					isSessionActive: isSessionSummaryBusy(summary),
-					attachedClients: [...this.clients].filter((client) =>
-						client.attachedActiveSessionIds.has(activeSessionId),
-					).length,
+					attachedClients:
+						(summary.directAttachedClients ?? 0) +
+						[...this.clients].filter((client) => client.attachedActiveSessionIds.has(activeSessionId)).length,
 					hasRegisteredHeartbeat: summary.hasRegisteredHeartbeat === true,
 					hasRegisteredCronJob: summary.hasRegisteredCronJob === true,
 					lastActivityAt: Date.parse(summary.lastActivityAt ?? ""),
@@ -1568,6 +1578,37 @@ export class DaemonSupervisor {
 						return root ? [this.agentPeerSummary(root)] : [];
 					});
 				return success(command.id, command.type, { peers });
+			}
+			case "get_direct_worker_transport": {
+				const match = await this.findWorkerForClient(client, command.activeSessionId);
+				if (match.worker.descriptor.ownerClientId !== undefined) {
+					throw new Error("Direct transport is unavailable for client-owned workers");
+				}
+				const ticket = await this.issuePeerTransport(match.worker, match.summary, "session_client");
+				return success(command.id, command.type, ticket);
+			}
+			case "get_agent_message_transport": {
+				const requester = [...this.workers.values()].find(
+					(worker) =>
+						worker.descriptor.authenticationToken === command.workerToken &&
+						worker.descriptor.workerInstanceId === command.workerInstanceId,
+				);
+				if (!requester) throw new Error("Worker authentication failed");
+				this.requireAvailableWorkerClient(requester);
+				const sourceSummary = this.findSummaryInWorker(requester, command.fromActiveSessionId);
+				if (!sourceSummary) throw new Error("Worker source session is unavailable");
+				const target = await this.findWorker(command.targetActiveSessionId, (worker) => this.isLiveWorker(worker));
+				if (target.worker === requester) throw new Error("Agent messaging cannot target the sending worker");
+				assertAgentFamilyReach(this.familyCatalogEntry(sourceSummary), this.familyCatalogEntry(target.summary));
+				const sender: AgentSessionMessageSender = {
+					activeSessionId: sourceSummary.activeSessionId ?? sourceSummary.id,
+					sessionId: sourceSummary.sessionId,
+					...(sourceSummary.sessionName ? { sessionName: sourceSummary.sessionName } : {}),
+					runtimeKind: sourceSummary.runtimeKind ?? "top-level",
+					clientId: `worker:${requester.descriptor.workerId}`,
+				};
+				const ticket = await this.issuePeerTransport(target.worker, target.summary, "agent_message", sender);
+				return success(command.id, command.type, ticket);
 			}
 			case "list_saved_sessions":
 				return this.handleSavedSessionList(client, command);
@@ -2505,6 +2546,7 @@ export class DaemonSupervisor {
 		const rootActiveSessionId = existing?.descriptor.rootActiveSessionId ?? createActiveSessionId();
 		const socketPath = existing?.descriptor.socketPath ?? workerSocketPath(this.socketPath, workerId);
 		const token = existing?.descriptor.authenticationToken ?? randomBytes(32).toString("base64url");
+		const workerInstanceId = randomUUID();
 		const now = new Date().toISOString();
 		const descriptorPath = existing?.descriptorPath ?? join(this.descriptorDir, `${workerId}.json`);
 		const recoveryJournalPath =
@@ -2517,6 +2559,8 @@ export class DaemonSupervisor {
 			...launchEnv,
 			[DAEMON_WORKER_ROLE_ENV]: "1",
 			[DAEMON_WORKER_TOKEN_ENV]: token,
+			[DAEMON_WORKER_ID_ENV]: workerId,
+			[DAEMON_WORKER_INSTANCE_ID_ENV]: workerInstanceId,
 			[DAEMON_WORKER_ACTIVE_SESSION_ID_ENV]: rootActiveSessionId,
 			[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV]: this.socketPath,
 			[DAEMON_WORKER_RECOVERY_JOURNAL_ENV]: recoveryJournalPath,
@@ -2574,6 +2618,7 @@ export class DaemonSupervisor {
 				orphanProcessJournalPath,
 				supervisorSocketPath: this.socketPath,
 				authenticationToken: token,
+				workerInstanceId,
 				rootActiveSessionId,
 				ownerClientId: existing?.descriptor.ownerClientId ?? ownerClientId,
 				sessionDir: createCommand.config?.sessionDir,
@@ -2752,7 +2797,12 @@ export class DaemonSupervisor {
 				await client.waitForHello(1000);
 				await client.authenticateWorker(
 					worker.descriptor.authenticationToken,
-					this.supervisorAuthenticationClaim(),
+					{
+						...this.supervisorAuthenticationClaim(),
+						...(worker.descriptor.workerInstanceId
+							? { workerInstanceId: worker.descriptor.workerInstanceId }
+							: {}),
+					},
 					1000,
 				);
 				await this.assertRecoveryAllowed();
@@ -3653,6 +3703,73 @@ export class DaemonSupervisor {
 			throw new Error(`Session worker is ${this.effectiveWorkerState(worker)}`);
 		}
 		return worker.client;
+	}
+
+	private async issuePeerTransport(
+		worker: ResidentWorker,
+		summary: SessionSummary,
+		purpose: DaemonPeerTransportPurpose,
+		sender?: AgentSessionMessageSender,
+	): Promise<DaemonPeerTransportTicket> {
+		await this.assertCurrentOwnership();
+		await this.refreshWorkerSummaries(worker, true);
+		const workerClient = this.requireAvailableWorkerClient(worker);
+		const activeSessionId = summary.activeSessionId ?? summary.id;
+		const currentSummary = this.findSummaryInWorker(worker, activeSessionId);
+		if (!currentSummary) throw new Error("Direct transport target changed during admission");
+		const workerInstanceId = worker.descriptor.workerInstanceId;
+		const workerProcessStartId = worker.descriptor.processStartId;
+		if (!workerInstanceId || !workerProcessStartId) {
+			throw new Error("Direct transport requires an exact worker process identity");
+		}
+		if (this.processIdentity(worker.descriptor.pid, workerProcessStartId) !== "current") {
+			throw new Error("Direct transport worker process identity is not current");
+		}
+		if (purpose === "agent_message" && !sender) {
+			throw new Error("Direct agent-message transport requires a bound sender");
+		}
+		let socketIdentity: ReturnType<typeof getDaemonSocketIdentity>;
+		try {
+			socketIdentity = getDaemonSocketIdentity(worker.descriptor.socketPath);
+		} catch {
+			throw new Error("Direct transport requires an exact worker socket identity");
+		}
+		if (!socketIdentity) throw new Error("Direct transport requires an exact worker socket identity");
+		const grantId = randomUUID();
+		const token = randomBytes(32).toString("base64url");
+		const expiresAt = new Date(Date.now() + PEER_TRANSPORT_GRANT_TTL_MS).toISOString();
+		const rootActiveSessionId = worker.descriptor.rootActiveSessionId;
+		const resolvedActiveSessionId = currentSummary.activeSessionId ?? currentSummary.id;
+		const commonGrant = {
+			grantId,
+			token,
+			expiresAt,
+			workerId: worker.descriptor.workerId,
+			workerInstanceId,
+			rootActiveSessionId,
+			activeSessionId: resolvedActiveSessionId,
+			issuerGeneration: this.generation,
+		};
+		const grant: DaemonWorkerPeerGrant =
+			purpose === "session_client"
+				? { ...commonGrant, purpose }
+				: { ...commonGrant, purpose, targetSessionId: currentSummary.sessionId, sender: sender! };
+		const registration = await workerClient.requestWorker({ type: "worker_register_peer_transport", grant }, 3000);
+		if (!registration.success) throw deserializeDaemonError(registration);
+		return {
+			purpose,
+			socketPath: worker.descriptor.socketPath,
+			socketIdentity,
+			workerId: worker.descriptor.workerId,
+			workerInstanceId,
+			rootActiveSessionId,
+			activeSessionId: resolvedActiveSessionId,
+			workerPid: worker.descriptor.pid,
+			workerProcessStartId,
+			grantId,
+			token,
+			expiresAt,
+		};
 	}
 
 	private familyCatalogEntry(summary: SessionSummary): AgentFamilyCatalogEntry {
