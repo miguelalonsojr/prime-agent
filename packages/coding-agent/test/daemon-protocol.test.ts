@@ -125,6 +125,15 @@ describe("daemon protocol helpers", () => {
 		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).toContain("acp_mcp_servers");
 	});
 
+	it("capability-gates cached session lists while preserving legacy list behavior", () => {
+		expect(getDaemonCommandCompatibilities({ type: "list" })).toEqual([DAEMON_COMMAND_COMPATIBILITY.list]);
+		expect(getDaemonCommandCompatibilities({ type: "list", refresh: false })).toEqual([
+			{ minProtocol: 7, minSchemaRevision: 24, capability: "cached_session_list" },
+			DAEMON_COMMAND_COMPATIBILITY.list,
+		]);
+		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).toContain("cached_session_list");
+	});
+
 	it("capability-gates the optional model catalog surface", () => {
 		expect(DAEMON_COMMAND_COMPATIBILITY.get_model_catalog).toEqual({
 			minProtocol: 7,

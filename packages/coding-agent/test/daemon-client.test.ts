@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { createAgentsViewListCommand } from "../src/modes/agents-view/agents-view-mode.js";
 import { DaemonClient, getDaemonSocketCloseReason } from "../src/modes/daemon/daemon-client.js";
 import {
 	DAEMON_COMMAND_COMPATIBILITY,
@@ -199,6 +200,30 @@ describe("DaemonClient", () => {
 		await expect(client.waitForHello()).resolves.toMatchObject({ appVersion: "9.9.9" });
 
 		client.close();
+	});
+
+	it.each([
+		{ capabilities: [] as string[], expected: { type: "list" } },
+		{ capabilities: ["cached_session_list"], expected: { type: "list", refresh: false } },
+	])("gates the Agents View polling command from the daemon handshake", async ({ capabilities, expected }) => {
+		const client = new DaemonClient("/tmp/prime-agent.sock");
+		const connect = client.connect();
+		const socket = netMock.sockets[0]!;
+		socket.emit("connect");
+		await connect;
+		emitHello(socket, DAEMON_PROTOCOL_VERSION, capabilities, DAEMON_SCHEMA_REVISION);
+
+		const request = client.request(
+			createAgentsViewListCommand(client.supportsServerCapability("cached_session_list")),
+		);
+		await vi.waitFor(() => expect(socket.writes).toHaveLength(1));
+		const envelope = JSON.parse(socket.writes[0]!.trim()) as { command?: Record<string, unknown> };
+		expect(envelope.command).toMatchObject(expected);
+		if (capabilities.length === 0) {
+			expect(envelope.command).not.toHaveProperty("refresh");
+		}
+		client.close();
+		await expect(request).rejects.toThrow("closed before the operation completed");
 	});
 
 	it("rejects unsupported optional commands without writing them to an older daemon", async () => {

@@ -69,8 +69,9 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 22 adds capability-gated, session-scoped ACP MCP server replacement.
 // Revision 23 scopes ACP MCP replacement and cleanup to a connection owner.
 // Revision 24 lets workers query the supervisor agent roster on demand.
-export const DAEMON_SCHEMA_REVISION = 24;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-24-0feab772ccc0";
+// Revision 25 lets Agents View request cached worker summaries without global refresh traffic.
+export const DAEMON_SCHEMA_REVISION = 25;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-25-fb93f18a9866";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -119,7 +120,8 @@ export type DaemonServerCapability =
 	| "rlm_quiescence_barrier"
 	| "session_input_pause"
 	| "owned_prompt_cancellation"
-	| "acp_mcp_servers";
+	| "acp_mcp_servers"
+	| "cached_session_list";
 
 export type DaemonReplayStatus = "complete" | "partial" | "unavailable";
 
@@ -165,6 +167,7 @@ export const DAEMON_DEFAULT_SERVER_CAPABILITIES: readonly DaemonServerCapability
 	"rlm_quiescence_barrier",
 	"session_input_pause",
 	"acp_mcp_servers",
+	"cached_session_list",
 ];
 
 export interface DaemonRuntimeIdentity {
@@ -382,6 +385,8 @@ export type DaemonCommand =
 			cwd?: string;
 			sessionDir?: string;
 			includeClientOwned?: boolean;
+			/** False returns the supervisor's cached summaries without polling every worker. */
+			refresh?: boolean;
 	  }
 	| DaemonSavedSessionListCommand
 	| { id?: string; type: "list_agent_peers"; workerToken: string }
@@ -727,6 +732,11 @@ const SESSION_INPUT_PAUSE_COMMAND = {
 	capability: "session_input_pause",
 } as const;
 const AGENT_PEER_LIST_COMMAND = { minProtocol: 7, minSchemaRevision: 24 } as const;
+const CACHED_SESSION_LIST_COMMAND = {
+	minProtocol: 7,
+	minSchemaRevision: 25,
+	capability: "cached_session_list",
+} as const;
 
 export const DAEMON_COMMAND_COMPATIBILITY = {
 	ack_result: LEGACY_DAEMON_COMMAND,
@@ -837,6 +847,9 @@ export const DAEMON_COMMAND_COMPATIBILITY = {
 
 export function getDaemonCommandCompatibilities(command: DaemonCommand): readonly DaemonCommandCompatibility[] {
 	const requirements: DaemonCommandCompatibility[] = [];
+	if (command.type === "list" && command.refresh === false) {
+		requirements.push(CACHED_SESSION_LIST_COMMAND);
+	}
 	if ((command.type === "attach" || command.type === "reattach") && command.recoveryConfig !== undefined) {
 		requirements.push(OWNED_SESSION_RECOVERY_CONTEXT);
 	}

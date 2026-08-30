@@ -2002,18 +2002,19 @@ describe("daemon worker supervisor monitoring", () => {
 		});
 		const liveWorker = makeWorker("worker-live");
 		const stoppingWorker = makeWorker("worker-stopping", new Date().toISOString());
+		const refreshWorkerSummaries = vi.fn(async () => {});
 		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
 			workers: new Map([
 				[liveWorker.descriptor.workerId, liveWorker],
 				[stoppingWorker.descriptor.workerId, stoppingWorker],
 			]),
 			clients: new Set(),
-			refreshWorkerSummaries: vi.fn(async () => {}),
+			refreshWorkerSummaries,
 			log: vi.fn(),
 		}) as {
 			handleList(
 				client: object,
-				command: { id: string; type: "list" },
+				command: { id: string; type: "list"; refresh?: boolean },
 			): Promise<{
 				success: boolean;
 				data?: { sessions: Array<{ activeSessionId?: string; id: string; workerState?: string }> };
@@ -2023,11 +2024,287 @@ describe("daemon worker supervisor monitoring", () => {
 		const response = await supervisor.handleList({}, { id: "list-1", type: "list" });
 
 		expect(response.success).toBe(true);
+		expect(refreshWorkerSummaries).toHaveBeenCalledTimes(1);
+		await supervisor.handleList({}, { id: "list-2", type: "list", refresh: false });
+		expect(refreshWorkerSummaries).toHaveBeenCalledTimes(1);
 		const sessions = response.data?.sessions ?? [];
 		expect(sessions.map((session) => [session.activeSessionId ?? session.id, session.workerState]).sort()).toEqual([
 			["worker-live-active", "ready"],
 			["worker-stopping-active", "stopping"],
 		]);
+	});
+
+	it("coalesces high-frequency summary updates to one refresh per interval", async () => {
+		vi.useFakeTimers();
+		vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+		const startWorkerSummaryRefresh = vi.fn(async () => undefined);
+		const worker = {
+			descriptor: { stopRequestedAt: undefined },
+			intentionalStop: false,
+			summaryRefreshLastStartedAt: Date.now(),
+		};
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			startWorkerSummaryRefresh,
+		}) as {
+			scheduleWorkerSummaryRefresh(target: typeof worker): void;
+		};
+
+		for (let index = 0; index < 100; index++) {
+			supervisor.scheduleWorkerSummaryRefresh(worker);
+		}
+		await vi.advanceTimersByTimeAsync(999);
+		expect(startWorkerSummaryRefresh).not.toHaveBeenCalled();
+		await vi.advanceTimersByTimeAsync(1);
+		expect(startWorkerSummaryRefresh).toHaveBeenCalledTimes(1);
+	});
+
+	it("runs one dirty follow-up after an in-flight summary refresh", async () => {
+		vi.useFakeTimers();
+		vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+		const active = createDeferred<void>();
+		const startWorkerSummaryRefresh = vi.fn(async () => undefined);
+		const worker = {
+			descriptor: { stopRequestedAt: undefined },
+			intentionalStop: false,
+			summaryRefreshLastStartedAt: Date.now() - 1000,
+			summaryRefresh: {
+				promise: active.promise,
+				client: {},
+				recovery: false,
+				generation: 1,
+			},
+		};
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			startWorkerSummaryRefresh,
+		}) as {
+			scheduleWorkerSummaryRefresh(target: typeof worker): void;
+		};
+
+		supervisor.scheduleWorkerSummaryRefresh(worker);
+		await vi.runOnlyPendingTimersAsync();
+		expect(startWorkerSummaryRefresh).not.toHaveBeenCalled();
+		for (let index = 0; index < 100; index++) {
+			supervisor.scheduleWorkerSummaryRefresh(worker);
+		}
+		Reflect.set(worker, "summaryRefresh", undefined);
+		active.resolve();
+		await vi.runAllTimersAsync();
+		expect(startWorkerSummaryRefresh).toHaveBeenCalledTimes(1);
+	});
+
+	it("does not cancel a dirty follow-up when an explicit list joins the active refresh", async () => {
+		vi.useFakeTimers();
+		const firstResponse = createDeferred<ReturnType<typeof success>>();
+		const request = vi
+			.fn()
+			.mockImplementationOnce(() => firstResponse.promise)
+			.mockResolvedValue(success(undefined, "list", { sessions: [] }));
+		const worker = {
+			descriptor: {
+				workerId: "worker-dirty-list",
+				rootActiveSessionId: "active-root",
+				createCommand: { type: "create" as const },
+			},
+			client: { request },
+			intentionalStop: false,
+			summaries: new Map<string, SessionSummary>(),
+		};
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			streamReconstructor: { seed: vi.fn(), clear: vi.fn() },
+			persistWorker: vi.fn(),
+		}) as {
+			refreshWorkerSummaries(target: typeof worker): Promise<void>;
+			scheduleWorkerSummaryRefresh(target: typeof worker, immediate?: boolean): void;
+		};
+
+		const first = supervisor.refreshWorkerSummaries(worker);
+		supervisor.scheduleWorkerSummaryRefresh(worker, true);
+		const joined = supervisor.refreshWorkerSummaries(worker);
+		expect(joined).toBe(first);
+		firstResponse.resolve(success(undefined, "list", { sessions: [] }));
+		await first;
+		await vi.runAllTimersAsync();
+
+		expect(request).toHaveBeenCalledTimes(2);
+	});
+
+	it("single-flights concurrent summary refreshes for one worker", async () => {
+		const response = createDeferred<ReturnType<typeof success>>();
+		const request = vi.fn(() => response.promise);
+		const worker = {
+			descriptor: {
+				workerId: "worker-summary-flight",
+				rootActiveSessionId: "active-root",
+				createCommand: { type: "create" as const },
+			},
+			client: { request },
+			intentionalStop: false,
+			summaries: new Map<string, SessionSummary>(),
+		};
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			streamReconstructor: { seed: vi.fn(), clear: vi.fn() },
+			persistWorker: vi.fn(),
+		}) as {
+			refreshWorkerSummaries(target: typeof worker, recovery?: boolean): Promise<void>;
+		};
+
+		const first = supervisor.refreshWorkerSummaries(worker);
+		const second = supervisor.refreshWorkerSummaries(worker);
+
+		expect(first).toBe(second);
+		expect(request).toHaveBeenCalledTimes(1);
+		response.resolve(success(undefined, "list", { sessions: [] }));
+		await Promise.all([first, second]);
+		expect(worker.summaries.size).toBe(0);
+	});
+
+	it("refreshes different workers concurrently", async () => {
+		const firstResponse = createDeferred<ReturnType<typeof success>>();
+		const secondResponse = createDeferred<ReturnType<typeof success>>();
+		const makeWorker = (workerId: string, response: typeof firstResponse) => ({
+			descriptor: {
+				workerId,
+				rootActiveSessionId: `${workerId}-root`,
+				createCommand: { type: "create" as const },
+			},
+			client: { request: vi.fn(() => response.promise) },
+			intentionalStop: false,
+			summaries: new Map<string, SessionSummary>(),
+		});
+		const firstWorker = makeWorker("worker-one", firstResponse);
+		const secondWorker = makeWorker("worker-two", secondResponse);
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			streamReconstructor: { seed: vi.fn(), clear: vi.fn() },
+			persistWorker: vi.fn(),
+		}) as {
+			refreshWorkerSummaries(target: typeof firstWorker): Promise<void>;
+		};
+
+		const first = supervisor.refreshWorkerSummaries(firstWorker);
+		const second = supervisor.refreshWorkerSummaries(secondWorker);
+		expect(firstWorker.client.request).toHaveBeenCalledTimes(1);
+		expect(secondWorker.client.request).toHaveBeenCalledTimes(1);
+
+		firstResponse.resolve(success(undefined, "list", { sessions: [] }));
+		secondResponse.resolve(success(undefined, "list", { sessions: [] }));
+		await Promise.all([first, second]);
+	});
+
+	it("marks retained summaries recovering as soon as their worker disconnects", async () => {
+		const client = {};
+		const worker = {
+			descriptor: { lifecycle: "ready" as const },
+			client,
+			intentionalStop: false,
+			summaries: new Map<string, SessionSummary>(),
+			snapshotGenerations: new Map(),
+			transcriptCaches: new Map(),
+		};
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			shuttingDown: true,
+			invalidateWorkerSessionInputPauses: vi.fn(),
+		}) as {
+			handleWorkerClose(target: typeof worker, closedClient: object, error: Error): Promise<void>;
+			effectiveWorkerState(target: typeof worker): string;
+			requireAvailableWorkerClient(target: typeof worker): object;
+		};
+
+		await supervisor.handleWorkerClose(worker, client, new Error("disconnected"));
+
+		expect(worker.client).toBeUndefined();
+		expect(Reflect.get(worker, "summariesStale")).toBe(true);
+		expect(supervisor.effectiveWorkerState(worker)).toBe("recovering");
+		Reflect.set(worker, "client", {});
+		expect(() => supervisor.requireAvailableWorkerClient(worker)).toThrow("Session worker is recovering");
+	});
+
+	it("rejects a pre-reconnect response without overwriting the recovered summaries", async () => {
+		const staleResponse = createDeferred<ReturnType<typeof success>>();
+		const freshResponse = createDeferred<ReturnType<typeof success>>();
+		const staleClient = { request: vi.fn(() => staleResponse.promise) };
+		const freshClient = { request: vi.fn(() => freshResponse.promise) };
+		const worker = {
+			descriptor: {
+				workerId: "worker-reconnected",
+				rootActiveSessionId: "active-root",
+				createCommand: { type: "create" as const },
+			},
+			client: staleClient,
+			intentionalStop: false,
+			summaries: new Map<string, SessionSummary>(),
+		};
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			streamReconstructor: { seed: vi.fn(), clear: vi.fn() },
+			persistWorker: vi.fn(),
+			assertRecoveryAllowed: vi.fn(async () => undefined),
+		}) as {
+			markWorkerSummariesStale(target: typeof worker): void;
+			refreshWorkerSummaries(target: typeof worker): Promise<void>;
+		};
+		const staleSummary = {
+			id: "active-root",
+			activeSessionId: "active-root",
+			sessionId: "stale-session",
+			cwd: "/tmp",
+			isStreaming: false,
+		} as SessionSummary;
+		const freshSummary = { ...staleSummary, sessionId: "fresh-session" };
+
+		const stale = supervisor.refreshWorkerSummaries(worker);
+		const staleFailure = expect(stale).rejects.toThrow("Session worker changed during summary refresh");
+		supervisor.markWorkerSummariesStale(worker);
+		worker.client = freshClient;
+		const fresh = supervisor.refreshWorkerSummaries(worker);
+		freshResponse.resolve(success(undefined, "list", { sessions: [freshSummary] }));
+		await fresh;
+		staleResponse.resolve(success(undefined, "list", { sessions: [staleSummary] }));
+		await staleFailure;
+
+		expect(worker.summaries.get("active-root")?.sessionId).toBe("fresh-session");
+		expect(Reflect.get(worker, "summariesStale")).toBe(false);
+	});
+
+	it("lets a strict recovery refresh supersede an older normal flight", async () => {
+		const normalResponse = createDeferred<ReturnType<typeof success>>();
+		const recoveryResponse = createDeferred<ReturnType<typeof success>>();
+		const request = vi
+			.fn()
+			.mockImplementationOnce(() => normalResponse.promise)
+			.mockImplementationOnce(() => recoveryResponse.promise);
+		const worker = {
+			descriptor: {
+				workerId: "worker-summary-recovery",
+				rootActiveSessionId: "active-root",
+				createCommand: { type: "create" as const },
+			},
+			client: { request },
+			intentionalStop: false,
+			summaries: new Map<string, SessionSummary>(),
+		};
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			streamReconstructor: { seed: vi.fn(), clear: vi.fn() },
+			persistWorker: vi.fn(),
+			assertRecoveryAllowed: vi.fn(async () => undefined),
+		}) as {
+			refreshWorkerSummaries(target: typeof worker, recovery?: boolean): Promise<void>;
+		};
+		const root = {
+			id: "active-root",
+			activeSessionId: "active-root",
+			sessionId: "session-root",
+			cwd: "/tmp",
+			isStreaming: false,
+		} as SessionSummary;
+
+		const normal = supervisor.refreshWorkerSummaries(worker);
+		const normalFailure = expect(normal).rejects.toThrow("Session worker changed during summary refresh");
+		const recovery = supervisor.refreshWorkerSummaries(worker, true);
+		expect(request).toHaveBeenCalledTimes(2);
+		recoveryResponse.resolve(success(undefined, "list", { sessions: [root] }));
+		await recovery;
+		normalResponse.resolve(success(undefined, "list", { sessions: [] }));
+		await normalFailure;
+		expect(worker.summaries.get("active-root")).toBe(root);
 	});
 
 	it("adopts a tombstoned worker through identity-aware stop handling", async () => {

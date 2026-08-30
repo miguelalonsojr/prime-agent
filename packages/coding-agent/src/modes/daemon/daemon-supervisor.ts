@@ -162,6 +162,7 @@ const IDLE_EVICTION_MAX_SWEEP_INTERVAL_MS = 5 * 60_000;
 const IDLE_EVICTION_MIN_SWEEP_INTERVAL_MS = 60_000;
 const IDLE_EVICTION_DRAIN_TIMEOUT_MS = 5_000;
 const CHILD_PASSIVATION_PER_WORKER_CAP = 2;
+const WORKER_SUMMARY_REFRESH_INTERVAL_MS = 1000;
 const SUPERVISOR_CONFIG_FILE_NAME = "supervisor-config";
 const WORKER_STARTUP_GATE_FD = 3;
 
@@ -272,6 +273,13 @@ export const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"shutdown",
 ]);
 
+interface WorkerSummaryRefresh {
+	promise: Promise<void>;
+	client: DaemonWorkerClient;
+	recovery: boolean;
+	generation: number;
+}
+
 interface ResidentWorker {
 	descriptor: DaemonWorkerDescriptor;
 	descriptorPath: string;
@@ -279,6 +287,14 @@ interface ResidentWorker {
 	heartbeatSnapshot?: AgentConnectionHeartbeat[];
 	heartbeatSnapshotStale?: boolean;
 	summaries: Map<string, SessionSummary>;
+	summariesStale?: boolean;
+	summaryRefresh?: WorkerSummaryRefresh;
+	summaryRefreshGeneration?: number;
+	summaryRefreshTimer?: ReturnType<typeof setTimeout>;
+	summaryRefreshPending?: boolean;
+	summaryRefreshPendingImmediate?: boolean;
+	summaryRefreshWaitingForFlight?: boolean;
+	summaryRefreshLastStartedAt?: number;
 	snapshotCache: Map<string, DaemonAttachResult>;
 	transcriptCaches: Map<string, SnapshotTranscriptCache>;
 	snapshotGenerations: Map<string, Map<string, SnapshotTranscriptGeneration>>;
@@ -2176,11 +2192,17 @@ export class DaemonSupervisor {
 		client: DaemonSocketClient,
 		command: Extract<DaemonCommand, { type: "list" }>,
 	): Promise<DaemonResponse> {
-		await Promise.all(
-			[...this.workers.values()]
-				.filter((worker) => !this.isWorkerStopping(worker))
-				.map((worker) => this.refreshWorkerSummaries(worker).catch(() => undefined)),
-		);
+		const listableWorkers = [...this.workers.values()].filter((worker) => !this.isWorkerStopping(worker));
+		if (command.refresh === false) {
+			await Promise.all(
+				listableWorkers.map((worker) => {
+					const refresh = worker.summaryRefresh;
+					return refresh && refresh.client === worker.client ? refresh.promise.catch(() => undefined) : undefined;
+				}),
+			);
+		} else {
+			await Promise.all(listableWorkers.map((worker) => this.refreshWorkerSummaries(worker).catch(() => undefined)));
+		}
 		const clientOwnedWorkers = [...this.workers.values()].filter((worker) => !this.isVisibleWorker(worker));
 		// Stopping workers stay listed (with an honest workerState) because this
 		// list also feeds busy-daemon safety checks in daemon-launch.
@@ -2714,6 +2736,18 @@ export class DaemonSupervisor {
 		}
 	}
 
+	private markWorkerSummariesStale(worker: ResidentWorker): void {
+		worker.summariesStale = true;
+		worker.summaryRefreshGeneration = (worker.summaryRefreshGeneration ?? 0) + 1;
+		if (worker.summaryRefreshTimer) {
+			clearTimeout(worker.summaryRefreshTimer);
+			worker.summaryRefreshTimer = undefined;
+		}
+		worker.summaryRefreshPending = false;
+		worker.summaryRefreshPendingImmediate = false;
+		worker.summaryRefreshWaitingForFlight = false;
+	}
+
 	private async connectWorker(worker: ResidentWorker, timeoutMs: number): Promise<DaemonWorkerClient> {
 		const deadline = Date.now() + timeoutMs;
 		let lastError: unknown;
@@ -2731,6 +2765,7 @@ export class DaemonSupervisor {
 				await this.assertRecoveryAllowed();
 				client.onFrame((frame) => this.handleWorkerFrame(worker, frame));
 				client.onClose((error) => void this.handleWorkerClose(worker, client, error));
+				this.markWorkerSummariesStale(worker);
 				worker.client?.close();
 				worker.client = client;
 				return client;
@@ -2830,6 +2865,7 @@ export class DaemonSupervisor {
 			return;
 		}
 		worker.client = undefined;
+		this.markWorkerSummariesStale(worker);
 		this.invalidateWorkerSessionInputPauses(worker, "Session worker disconnected while input was paused");
 		const interrupted = new Map<string, Set<string>>();
 		for (const [activeSessionId, generations] of worker.snapshotGenerations ?? []) {
@@ -3164,6 +3200,7 @@ export class DaemonSupervisor {
 							await this.assertRecoveryAllowed();
 							worker.client?.close();
 							worker.client = undefined;
+							this.markWorkerSummariesStale(worker);
 							if (retryIndex < WORKER_RETRY_DELAYS_MS.length - 1) {
 								throw error;
 							}
@@ -3204,6 +3241,7 @@ export class DaemonSupervisor {
 					}
 					worker.client?.close();
 					worker.client = undefined;
+					this.markWorkerSummariesStale(worker);
 					worker.descriptor.consecutiveFailures++;
 					worker.descriptor.lastFailureAt = new Date().toISOString();
 					worker.descriptor.lastError = error instanceof Error ? error.message : String(error);
@@ -3304,21 +3342,73 @@ export class DaemonSupervisor {
 		);
 	}
 
-	private async refreshWorkerSummaries(worker: ResidentWorker, recovery = false): Promise<void> {
+	private refreshWorkerSummaries(worker: ResidentWorker, recovery = false): Promise<void> {
+		const strict = recovery || worker.summariesStale === true;
+		const existing = worker.summaryRefresh;
+		if (existing && existing.client === worker.client && (!strict || existing.recovery)) {
+			return existing.promise;
+		}
+		if (worker.summaryRefreshTimer) {
+			clearTimeout(worker.summaryRefreshTimer);
+			worker.summaryRefreshTimer = undefined;
+		}
+		worker.summaryRefreshPending = false;
+		worker.summaryRefreshPendingImmediate = false;
+		return this.startWorkerSummaryRefresh(worker, strict);
+	}
+
+	private startWorkerSummaryRefresh(worker: ResidentWorker, recovery = false): Promise<void> {
+		const strict = recovery || worker.summariesStale === true;
 		if (this.isWorkerStopping(worker)) {
-			throw new Error("Session worker is stopping");
+			return Promise.reject(new Error("Session worker is stopping"));
 		}
-		if (!worker.client) {
-			throw new Error("Session worker is not connected");
+		const client = worker.client;
+		if (!client) {
+			return Promise.reject(new Error("Session worker is not connected"));
 		}
-		const response = await worker.client.request({ type: "list" }, 5000);
+		const existing = worker.summaryRefresh;
+		if (existing?.client === client && (!strict || existing.recovery)) {
+			return existing.promise;
+		}
+
+		const generation = (worker.summaryRefreshGeneration ?? 0) + 1;
+		worker.summaryRefreshGeneration = generation;
+		worker.summaryRefreshLastStartedAt = Date.now();
+		const run = this.performWorkerSummaryRefresh(worker, client, generation, strict);
+		let tracked: Promise<void>;
+		tracked = run.finally(() => {
+			if (worker.summaryRefresh?.promise === tracked) {
+				worker.summaryRefresh = undefined;
+			}
+		});
+		worker.summaryRefresh = { promise: tracked, client, recovery: strict, generation };
+		return tracked;
+	}
+
+	private async performWorkerSummaryRefresh(
+		worker: ResidentWorker,
+		client: DaemonWorkerClient,
+		generation: number,
+		recovery: boolean,
+	): Promise<void> {
+		const response = await client.request({ type: "list" }, 5000);
 		const summaries = sessionSummariesFromResponse(response);
 		const nextSummaries = new Map(summaries.map((summary) => [summary.activeSessionId ?? summary.id, summary]));
 		const root = nextSummaries.get(worker.descriptor.rootActiveSessionId);
 		if (recovery && !root) {
-			throw new Error(`Session worker omitted its root session during recovery`);
+			throw new Error("Session worker omitted its root session during recovery");
+		}
+		if (worker.client !== client || worker.summaryRefreshGeneration !== generation) {
+			throw new Error("Session worker changed during summary refresh");
+		}
+		if (recovery) {
+			await this.assertRecoveryAllowed();
+			if (worker.client !== client || worker.summaryRefreshGeneration !== generation) {
+				throw new Error("Session worker changed during summary refresh");
+			}
 		}
 		worker.summaries = nextSummaries;
+		worker.summariesStale = false;
 		for (const summary of summaries) {
 			const activeSessionId = summary.activeSessionId ?? summary.id;
 			if (summary.streamingMessage?.role === "assistant") {
@@ -3328,9 +3418,6 @@ export class DaemonSupervisor {
 			}
 		}
 		if (root) {
-			if (recovery) {
-				await this.assertRecoveryAllowed();
-			}
 			worker.descriptor.rootSessionId = root.sessionId;
 			worker.descriptor.sessionFile = root.sessionFile;
 			worker.descriptor.createCommand = durableDaemonCreateCommand({
@@ -3340,6 +3427,55 @@ export class DaemonSupervisor {
 			});
 			this.persistWorker(worker);
 		}
+	}
+
+	private scheduleWorkerSummaryRefresh(worker: ResidentWorker, immediate = false): void {
+		worker.summaryRefreshPending = true;
+		worker.summaryRefreshPendingImmediate ||= immediate;
+		if (immediate && worker.summaryRefreshTimer) {
+			clearTimeout(worker.summaryRefreshTimer);
+			worker.summaryRefreshTimer = undefined;
+		}
+		if (worker.summaryRefreshTimer || worker.summaryRefreshWaitingForFlight || this.isWorkerStopping(worker)) {
+			return;
+		}
+		const earliestStart = worker.summaryRefreshPendingImmediate
+			? 0
+			: (worker.summaryRefreshLastStartedAt ?? 0) + WORKER_SUMMARY_REFRESH_INTERVAL_MS;
+		const delayMs = Math.max(0, earliestStart - Date.now());
+		const timer = setTimeout(() => {
+			if (worker.summaryRefreshTimer !== timer) {
+				return;
+			}
+			worker.summaryRefreshTimer = undefined;
+			if (!worker.summaryRefreshPending || this.isWorkerStopping(worker)) {
+				return;
+			}
+			const activeRefresh = worker.summaryRefresh;
+			if (activeRefresh) {
+				worker.summaryRefreshWaitingForFlight = true;
+				void activeRefresh.promise
+					.catch(() => undefined)
+					.finally(() => {
+						worker.summaryRefreshWaitingForFlight = false;
+						if (worker.summaryRefreshPending) {
+							this.scheduleWorkerSummaryRefresh(worker, worker.summaryRefreshPendingImmediate);
+						}
+					});
+				return;
+			}
+			worker.summaryRefreshPending = false;
+			worker.summaryRefreshPendingImmediate = false;
+			void this.startWorkerSummaryRefresh(worker)
+				.catch(() => undefined)
+				.finally(() => {
+					if (worker.summaryRefreshPending) {
+						this.scheduleWorkerSummaryRefresh(worker, worker.summaryRefreshPendingImmediate);
+					}
+				});
+		}, delayMs);
+		timer.unref?.();
+		worker.summaryRefreshTimer = timer;
 	}
 
 	private async familyCatalogEntries(): Promise<AgentFamilyCatalogEntry[]> {
@@ -3508,7 +3644,7 @@ export class DaemonSupervisor {
 		if (this.isWorkerStopping(worker)) {
 			return "stopping";
 		}
-		if (worker.descriptor.lifecycle === "ready" && worker.client === undefined) {
+		if (worker.descriptor.lifecycle === "ready" && (worker.client === undefined || worker.summariesStale)) {
 			return "recovering";
 		}
 		return worker.descriptor.lifecycle;
@@ -3517,6 +3653,7 @@ export class DaemonSupervisor {
 	private requireAvailableWorkerClient(worker: ResidentWorker, allowStopping = false): DaemonWorkerClient {
 		if (
 			!worker.client ||
+			worker.summariesStale ||
 			worker.descriptor.lifecycle !== "ready" ||
 			(!allowStopping && this.isWorkerStopping(worker))
 		) {
@@ -4588,14 +4725,19 @@ export class DaemonSupervisor {
 			}
 			this.writeSerialized(client, publicPayload);
 		}
-		if (outboundType === "session_replaced" || outboundType === "session_closed") {
-			void this.refreshWorkerSummaries(worker).catch(() => undefined);
-		} else if (
+		if (
+			outboundType === "session_replaced" ||
+			outboundType === "session_closed" ||
 			sessionEventType === "turn_start" ||
-			sessionEventType === "turn_end" ||
-			sessionEventType === "rlm_child_update"
+			sessionEventType === "turn_end"
 		) {
-			void this.refreshWorkerSummaries(worker).catch(() => undefined);
+			this.scheduleWorkerSummaryRefresh(worker, true);
+		} else if (
+			outboundType === "session_event" ||
+			outboundType === "session_status" ||
+			outboundType === "session_resynced"
+		) {
+			this.scheduleWorkerSummaryRefresh(worker);
 		}
 		if (
 			decodedOutbound?.type === "session_closed" &&
@@ -5038,6 +5180,13 @@ export class DaemonSupervisor {
 			clearTimeout(worker.ownerCleanupTimer);
 			worker.ownerCleanupTimer = undefined;
 		}
+		if (worker.summaryRefreshTimer) {
+			clearTimeout(worker.summaryRefreshTimer);
+			worker.summaryRefreshTimer = undefined;
+		}
+		worker.summaryRefreshPending = false;
+		worker.summaryRefreshPendingImmediate = false;
+		worker.summaryRefreshWaitingForFlight = false;
 		if (!recoveryCleanup) {
 			worker.stopRevision++;
 		}

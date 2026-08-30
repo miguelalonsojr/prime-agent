@@ -1,0 +1,1 @@
+- Fixed Agents View startup and refresh overhead by indexing saved-session metadata and coalescing worker summary updates.

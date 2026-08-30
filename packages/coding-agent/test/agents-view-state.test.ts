@@ -863,6 +863,7 @@ describe("agents view state", () => {
 
 	test("requests only daemon-resident sessions for the agents view refresh", () => {
 		expect(createAgentsViewListCommand()).toEqual({ type: "list" });
+		expect(createAgentsViewListCommand(true)).toEqual({ type: "list", refresh: false });
 	});
 
 	test("resolves active summaries by session file path", () => {

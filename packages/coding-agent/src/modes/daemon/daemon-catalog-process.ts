@@ -4,8 +4,11 @@ import { createCliSubprocessEnv, createCliSubprocessLaunchSpec } from "../../cli
 import type { DeleteSessionFileResult } from "../../core/session-file-actions.js";
 import { deleteSessionFile } from "../../core/session-file-actions.js";
 import { readSessionInfo, type SessionInfo, SessionManager } from "../../core/session-manager.js";
+import { SessionMetadataCatalog } from "./session-metadata-catalog.js";
 
 export const DAEMON_CATALOG_ROLE_ENV = "PRIME_AGENT_INTERNAL_DAEMON_CATALOG";
+
+const sessionMetadataCatalog = new SessionMetadataCatalog();
 
 interface SessionInfoWire extends Omit<SessionInfo, "created" | "modified"> {
 	created: string;
@@ -107,6 +110,33 @@ export function isDaemonCatalogProcess(environment: NodeJS.ProcessEnv = process.
 	return environment[DAEMON_CATALOG_ROLE_ENV] === "1";
 }
 
+export function createDaemonCatalogSubprocessEnv(
+	environment: NodeJS.ProcessEnv = process.env,
+	nodeVersion = process.versions.node,
+	bunVersion = process.versions.bun,
+): NodeJS.ProcessEnv {
+	const catalogEnvironment: NodeJS.ProcessEnv = { ...environment, [DAEMON_CATALOG_ROLE_ENV]: "1" };
+	const [major, minor] = nodeVersion.split(".").map(Number);
+	if (!bunVersion && major === 22 && (minor ?? 0) < 13) {
+		const options = catalogEnvironment.NODE_OPTIONS?.trim();
+		if (!options?.split(/\s+/).includes("--experimental-sqlite")) {
+			catalogEnvironment.NODE_OPTIONS = [options, "--experimental-sqlite"].filter(Boolean).join(" ");
+		}
+	}
+	return createCliSubprocessEnv(catalogEnvironment);
+}
+
+export async function deleteCatalogSessionFile(
+	sessionPath: string,
+	catalog: SessionMetadataCatalog = sessionMetadataCatalog,
+): Promise<DeleteSessionFileResult> {
+	const result = await deleteSessionFile(sessionPath);
+	if (result.ok) {
+		await catalog.invalidate(sessionPath);
+	}
+	return result;
+}
+
 export async function runDaemonCatalogProcess(): Promise<never> {
 	process.on("disconnect", () => process.exit(0));
 	process.on("message", (value: unknown) => {
@@ -116,6 +146,7 @@ export async function runDaemonCatalogProcess(): Promise<never> {
 		void handleCatalogRequest(value);
 	});
 	sendCatalogMessage({ type: "ready" });
+	setImmediate(() => void sessionMetadataCatalog.warm().catch(() => undefined));
 	return new Promise(() => {});
 }
 
@@ -129,9 +160,7 @@ async function handleCatalogRequest(request: CatalogRequest): Promise<void> {
 					onSession: (session: SessionInfo) =>
 						sendCatalogMessage({ type: "session", id: request.id, session: serializeSessionInfo(session) }),
 				};
-				const sessions = request.cwd
-					? await SessionManager.list(request.cwd, request.sessionDir, callbacks)
-					: await SessionManager.listAll(callbacks, request.sessionDir);
+				const sessions = await sessionMetadataCatalog.list(request.cwd, request.sessionDir, callbacks);
 				sendCatalogMessage({
 					type: "response",
 					id: request.id,
@@ -142,7 +171,7 @@ async function handleCatalogRequest(request: CatalogRequest): Promise<void> {
 			}
 			case "resolve": {
 				const localMatch = resolveCatalogSessionMatch(
-					await SessionManager.list(request.cwd, request.sessionDir),
+					await sessionMetadataCatalog.list(request.cwd, request.sessionDir),
 					request.selector,
 				);
 				if (localMatch) {
@@ -155,7 +184,7 @@ async function handleCatalogRequest(request: CatalogRequest): Promise<void> {
 					return;
 				}
 				const globalMatch = resolveCatalogSessionMatch(
-					await SessionManager.listAll(undefined, request.sessionDir),
+					await sessionMetadataCatalog.list(undefined, request.sessionDir),
 					request.selector,
 				);
 				if (globalMatch) {
@@ -178,7 +207,7 @@ async function handleCatalogRequest(request: CatalogRequest): Promise<void> {
 					type: "response",
 					id: request.id,
 					success: true,
-					data: await deleteSessionFile(request.sessionPath),
+					data: await deleteCatalogSessionFile(request.sessionPath),
 				});
 				return;
 			case "archive": {
@@ -216,6 +245,7 @@ async function handleCatalogRequest(request: CatalogRequest): Promise<void> {
 				sendCatalogMessage({ type: "response", id: request.id, success: true });
 				return;
 			case "shutdown":
+				sessionMetadataCatalog.close();
 				sendCatalogMessage({ type: "response", id: request.id, success: true });
 				setImmediate(() => process.exit(0));
 				return;
@@ -322,7 +352,7 @@ export class DaemonCatalogClient {
 		const launch = createCliSubprocessLaunchSpec(["--version"]);
 		const child = spawn(launch.command, launch.args, {
 			cwd: process.cwd(),
-			env: createCliSubprocessEnv({ ...process.env, [DAEMON_CATALOG_ROLE_ENV]: "1" }),
+			env: createDaemonCatalogSubprocessEnv(),
 			stdio: ["ignore", "ignore", "ignore", "ipc"],
 		});
 		this.child = child;

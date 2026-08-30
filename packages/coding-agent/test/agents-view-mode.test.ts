@@ -35,6 +35,7 @@ vi.mock("../src/modes/daemon/daemon-client.js", () => ({
 		connect = vi.fn(async () => undefined);
 		close = vi.fn();
 		request = modeMocks.clientRequest;
+		supportsServerCapability = vi.fn(() => true);
 	},
 	getDaemonSocketCloseReason: vi.fn(),
 }));
@@ -92,6 +93,16 @@ const settingsManager = {
 describe("AgentsViewMode", () => {
 	beforeAll(() => setKeybindings(new KeybindingsManager()));
 	beforeEach(() => vi.clearAllMocks());
+
+	it("uses cached worker summaries only for the periodic poll", async () => {
+		const refreshSessions = vi.fn(async () => true);
+		const self = { liveCatalogPollPromise: undefined, refreshSessions };
+
+		invoke("pollSessions", self);
+
+		expect(refreshSessions).toHaveBeenCalledWith({ useCachedSummaries: true });
+		await Reflect.get(self, "liveCatalogPollPromise");
+	});
 
 	it("keeps the selection chosen by row rebuilding when the query changes", () => {
 		const self = {
@@ -665,6 +676,39 @@ afterEach(() => {
 });
 
 describe("AgentsViewMode persistent catalog state", () => {
+	it.each([
+		{ label: "initial refresh", options: {}, supported: true, expected: { type: "list" } },
+		{
+			label: "poll against an older daemon",
+			options: { useCachedSummaries: true },
+			supported: false,
+			expected: { type: "list" },
+		},
+		{
+			label: "poll against a capable daemon",
+			options: { useCachedSummaries: true },
+			supported: true,
+			expected: { type: "list", refresh: false },
+		},
+	])("sends a compatible list command for $label", async ({ options, supported, expected }) => {
+		const view = new AgentsViewMode(
+			{ config: {}, uiServices: createUiServices() },
+			createInitialAgentsViewPersistentState({}),
+		);
+		const request = vi.fn(async () => ({ success: true as const, data: { sessions: [] } }));
+		Reflect.set(view, "client", {
+			isConnected: true,
+			request,
+			supportsServerCapability: vi.fn(() => supported),
+		});
+
+		try {
+			await expect(invoke("refreshSessions", view, options)).resolves.toBe(true);
+			expect(request).toHaveBeenCalledWith(expected);
+		} finally {
+			stopThemeWatcher();
+		}
+	});
 	it("keeps an initial handoff scope when the first live poll fails after both catalogs settle", async () => {
 		const root = summary();
 		const scope = { sessionId: root.sessionId, activeSessionId: root.activeSessionId };

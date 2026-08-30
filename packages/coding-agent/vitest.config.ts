@@ -6,11 +6,14 @@ const aiSrcOAuth = fileURLToPath(new URL("../ai/src/oauth.ts", import.meta.url))
 const aiSrcMcp = fileURLToPath(new URL("../ai/src/mcp.ts", import.meta.url));
 const agentSrcIndex = fileURLToPath(new URL("../agent/src/index.ts", import.meta.url));
 const tuiSrcIndex = fileURLToPath(new URL("../tui/src/index.ts", import.meta.url));
+const [nodeMajor, nodeMinor] = process.versions.node.split(".").map(Number);
+const sqliteExecArgv = nodeMajor === 22 && (nodeMinor ?? 0) < 13 ? ["--experimental-sqlite"] : [];
 
 export default defineConfig({
 	test: {
 		globals: true,
 		environment: "node",
+		execArgv: sqliteExecArgv,
 		testTimeout: 30000,
 		env: { DO_NOT_TRACK: "1" },
 		tags: [

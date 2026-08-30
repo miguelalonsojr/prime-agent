@@ -208,10 +208,10 @@ export function createAgentsViewResumeConfig(
 	return resumeConfig;
 }
 
-export function createAgentsViewListCommand(): Extract<DaemonCommand, { type: "list" }> {
+export function createAgentsViewListCommand(useCachedSummaries = false): Extract<DaemonCommand, { type: "list" }> {
 	// Omitting `all` returns daemon-resident sessions only; on-disk ones come back
 	// through the view's saved-session catalog.
-	return { type: "list" };
+	return { type: "list", ...(useCachedSummaries ? { refresh: false } : {}) };
 }
 
 export function resolveAgentsViewActiveSummaryForPath(
@@ -2081,21 +2081,25 @@ export class AgentsViewMode implements Component, Focusable {
 
 	private pollSessions(): void {
 		if (this.liveCatalogPollPromise) return;
-		const poll = this.refreshSessions().then(() => undefined);
+		const poll = this.refreshSessions({ useCachedSummaries: true }).then(() => undefined);
 		this.liveCatalogPollPromise = poll;
 		void poll.finally(() => {
 			if (this.liveCatalogPollPromise === poll) this.liveCatalogPollPromise = undefined;
 		});
 	}
 
-	private async refreshSessions(options: { preserveStatusOnError?: boolean } = {}): Promise<boolean> {
+	private async refreshSessions(
+		options: { preserveStatusOnError?: boolean; useCachedSummaries?: boolean } = {},
+	): Promise<boolean> {
 		if (this.reconnectPromise || this.daemonShutdownReceived) return false;
 		const generation = ++this.liveCatalogGeneration;
 		this.liveCatalogRefreshPending = true;
 		try {
 			const client = this.requireClient();
 			try {
-				const response = await client.request(createAgentsViewListCommand());
+				const useCachedSummaries =
+					options.useCachedSummaries === true && client.supportsServerCapability("cached_session_list");
+				const response = await client.request(createAgentsViewListCommand(useCachedSummaries));
 				if (generation !== this.liveCatalogGeneration) return false;
 				this.liveCatalogReady = true;
 				this.applySessionList(expectSessionList(requireDaemonData(response)), true);
