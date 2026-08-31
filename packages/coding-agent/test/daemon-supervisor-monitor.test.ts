@@ -2103,27 +2103,33 @@ describe("daemon worker supervisor monitoring", () => {
 				workerId: "persisted-worker",
 				rootActiveSessionId: root.activeSessionId,
 				lifecycle: "ready",
+				createCommand: { type: "create" as const, sessionPath },
 			},
 			client,
 			summaries: new Map([[root.activeSessionId, root]]),
 			intentionalStop: false,
 		};
+		const launchWorker = vi.fn();
 		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
 			workers: new Map([[worker.descriptor.workerId, worker]]),
+			openingWorkers: new Map(),
+			defaultSessionConfig: {},
+			launchWorker,
 		}) as {
-			reuseWorkerForCreate(
-				target: typeof worker,
-				ownerClientId: undefined,
-				sessionPath: string,
+			createOrReuseWorker(
+				clientId: string,
+				command: { type: "create"; sessionPath: string },
 			): Promise<typeof worker>;
 		};
 
-		const reopened = await supervisor.reuseWorkerForCreate(worker, undefined, sessionPath);
+		const reopened = await supervisor.createOrReuseWorker("client-1", { type: "create", sessionPath });
 		const reopenedSummary = reopened.summaries.get(root.activeSessionId);
 
+		expect(reopened).toBe(worker);
 		expect(reopened.client).toBe(client);
 		expect(reopenedSummary?.sessionId).toBe(previousSessionId);
 		expect(reopenedSummary?.sessionFile).toBe(sessionPath);
+		expect(launchWorker).not.toHaveBeenCalled();
 	});
 
 	it("starts recovery before reusing a persisted recovering worker", async () => {

@@ -192,12 +192,13 @@ describe("session metadata catalog", () => {
 		const catalog = new SessionMetadataCatalog();
 
 		try {
-			await catalog.list(undefined, sessionDir);
+			expect((await catalog.list(undefined, sessionDir)).map((session) => session.id)).toContain("empty-session");
 			await expect(deleteCatalogSessionFile(sessionPath, catalog)).resolves.toMatchObject({ ok: true });
 
-			expect(await catalog.list(undefined, sessionDir)).not.toContainEqual(
-				expect.objectContaining({ id: "empty-session" }),
-			);
+			const database = new DatabaseSync(getSessionMetadataCatalogPath(sessionDir));
+			const row = database.prepare("SELECT COUNT(*) AS count FROM sessions").get() as { count: number };
+			database.close();
+			expect(row.count).toBe(0);
 		} finally {
 			catalog.close();
 		}
