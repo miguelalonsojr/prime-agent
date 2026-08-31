@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	DAEMON_PROTOCOL_NAME,
 	DAEMON_PROTOCOL_VERSION,
@@ -108,6 +108,46 @@ describe("daemon worker direct client", () => {
 		await expect(client.authenticatePeer(ticket(fixture.socketPath))).rejects.toThrow(
 			"Daemon worker response did not match its private frame",
 		);
+		client.close();
+	});
+
+	it("marks a peer request uncertain before a socket write callback reports failure", async () => {
+		const client = new DaemonWorkerClient("/unused-worker.sock");
+		const onAdmitted = vi.fn();
+		Object.assign(client, {
+			socket: { destroyed: false, destroy: vi.fn() },
+			channel: {
+				close: vi.fn(),
+				send: async (_header: unknown, _payload: unknown, onWriteStarted?: () => void) => {
+					onWriteStarted?.();
+					throw new Error("write callback failed");
+				},
+			},
+		});
+
+		await expect(
+			client.requestPeer({ type: "peer_deliver_message", message: "deliver once" }, 1000, onAdmitted),
+		).rejects.toThrow("Daemon worker request outcome is uncertain after write began: peer_deliver_message");
+		expect(onAdmitted).toHaveBeenCalledOnce();
+		client.close();
+	});
+
+	it("keeps a peer request uncertain when the socket closes after write initiation", async () => {
+		const client = new DaemonWorkerClient("/unused-worker.sock");
+		Object.assign(client, {
+			socket: { destroyed: false, destroy: vi.fn() },
+			channel: {
+				close: vi.fn(),
+				send: async (_header: unknown, _payload: unknown, onWriteStarted?: () => void) => {
+					onWriteStarted?.();
+					(client as unknown as { rejectAll(error: Error): void }).rejectAll(new Error("worker socket closed"));
+				},
+			},
+		});
+
+		await expect(
+			client.requestPeer({ type: "peer_deliver_message", message: "deliver once" }, 1000, vi.fn()),
+		).rejects.toThrow("Daemon worker request outcome is uncertain after write began: peer_deliver_message");
 		client.close();
 	});
 

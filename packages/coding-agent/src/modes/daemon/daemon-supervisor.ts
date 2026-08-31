@@ -3753,6 +3753,8 @@ export class DaemonSupervisor {
 			expiresAt,
 			workerId: worker.descriptor.workerId,
 			workerInstanceId,
+			workerProcessStartId,
+			socketIdentity,
 			rootActiveSessionId,
 			activeSessionId: resolvedActiveSessionId,
 			issuerGeneration: this.generation,

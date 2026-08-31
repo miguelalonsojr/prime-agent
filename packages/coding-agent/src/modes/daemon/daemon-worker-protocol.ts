@@ -10,6 +10,7 @@ import type {
 	DaemonOutbound,
 	DaemonPeerTransportPurpose,
 } from "./daemon-protocol.js";
+import type { DaemonSocketIdentity } from "./daemon-socket.js";
 
 export const DAEMON_WORKER_ROLE_ENV = "PRIME_AGENT_INTERNAL_DAEMON_WORKER";
 export const DAEMON_WORKER_TOKEN_ENV = "PRIME_AGENT_INTERNAL_DAEMON_WORKER_TOKEN";
@@ -55,31 +56,28 @@ export function durableDaemonCreateCommand(command: DaemonCreateCommand): Durabl
 	};
 }
 
-export type DaemonWorkerPeerGrant =
-	| {
-			grantId: string;
-			token: string;
-			expiresAt: string;
-			purpose: "session_client";
-			workerId: string;
-			workerInstanceId: string;
-			rootActiveSessionId: string;
-			activeSessionId: string;
-			issuerGeneration: string;
-	  }
-	| {
-			grantId: string;
-			token: string;
-			expiresAt: string;
-			purpose: "agent_message";
-			workerId: string;
-			workerInstanceId: string;
-			rootActiveSessionId: string;
-			activeSessionId: string;
-			targetSessionId: string;
-			issuerGeneration: string;
-			sender: AgentSessionMessageSender;
-	  };
+interface DaemonWorkerPeerGrantBinding {
+	grantId: string;
+	token: string;
+	expiresAt: string;
+	workerId: string;
+	workerInstanceId: string;
+	workerProcessStartId: string;
+	socketIdentity: DaemonSocketIdentity;
+	rootActiveSessionId: string;
+	activeSessionId: string;
+	issuerGeneration: string;
+}
+
+export type DaemonWorkerPeerGrant = DaemonWorkerPeerGrantBinding &
+	(
+		| { purpose: "session_client" }
+		| {
+				purpose: "agent_message";
+				targetSessionId: string;
+				sender: AgentSessionMessageSender;
+		  }
+	);
 
 export type DaemonPeerCommand =
 	| {

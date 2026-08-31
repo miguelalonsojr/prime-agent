@@ -192,6 +192,8 @@ function createAgentDaemonFixture(rootIndex: number, stalled: boolean): AgentDae
 				purpose: "agent_message",
 				workerId: `worker-${rootIndex}`,
 				workerInstanceId: `instance-${rootIndex}`,
+				workerProcessStartId: "proc:test",
+				socketIdentity: { dev: 10, ino: 20 },
 				rootActiveSessionId,
 				activeSessionId: targetActiveSessionId,
 				targetSessionId,

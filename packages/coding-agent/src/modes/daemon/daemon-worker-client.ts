@@ -33,6 +33,13 @@ export type DaemonWorkerFrameListener = (frame: PrivateFrame<DaemonWorkerFrameHe
 export type DaemonWorkerCloseListener = (error: Error) => void;
 type DaemonHello = Extract<DaemonOutbound, { type: "daemon_hello" }>;
 
+class DaemonWorkerRequestUncertainError extends Error {
+	constructor(commandType: string, cause: Error) {
+		super(`Daemon worker request outcome is uncertain after write began: ${commandType}`, { cause });
+		this.name = "DaemonWorkerRequestUncertainError";
+	}
+}
+
 export class DaemonWorkerClient {
 	private socket?: Socket;
 	private channel?: PrivateFramedChannel<DaemonWorkerFrameHeader>;
@@ -46,6 +53,7 @@ export class DaemonWorkerClient {
 			reject: (error: Error) => void;
 			timeout: ReturnType<typeof setTimeout>;
 			commandType: string;
+			writeStarted: boolean;
 		}
 	>();
 	private requestId = 0;
@@ -217,23 +225,32 @@ export class DaemonWorkerClient {
 		const fullCommand = { ...command, id } as DaemonWorkerWireCommand;
 		const response = new Promise<DaemonResponse>((resolve, reject) => {
 			const timeout = setTimeout(() => {
+				const pending = this.pending.get(id);
 				this.pending.delete(id);
-				reject(new Error(`Timed out waiting for daemon worker response to ${command.type}`));
+				const error = new Error(`Timed out waiting for daemon worker response to ${command.type}`);
+				reject(pending?.writeStarted ? new DaemonWorkerRequestUncertainError(command.type, error) : error);
 			}, timeoutMs);
-			this.pending.set(id, { resolve, reject, timeout, commandType: command.type });
+			this.pending.set(id, { resolve, reject, timeout, commandType: command.type, writeStarted: false });
 		});
 		try {
 			await this.channel.send(
 				{ kind: "command", requestId: id, commandType: command.type },
 				Buffer.from(serializeJsonLine(fullCommand)),
+				onAdmitted
+					? () => {
+							const pending = this.pending.get(id);
+							if (pending) pending.writeStarted = true;
+							onAdmitted();
+						}
+					: undefined,
 			);
-			onAdmitted?.();
 		} catch (error) {
 			const pending = this.pending.get(id);
 			if (pending) {
 				clearTimeout(pending.timeout);
 				this.pending.delete(id);
-				pending.reject(error instanceof Error ? error : new Error(String(error)));
+				const cause = error instanceof Error ? error : new Error(String(error));
+				pending.reject(pending.writeStarted ? new DaemonWorkerRequestUncertainError(command.type, cause) : cause);
 			}
 		}
 		return response;
@@ -397,7 +414,9 @@ export class DaemonWorkerClient {
 	private rejectAll(error: Error): void {
 		for (const [id, pending] of this.pending) {
 			clearTimeout(pending.timeout);
-			pending.reject(error);
+			pending.reject(
+				pending.writeStarted ? new DaemonWorkerRequestUncertainError(pending.commandType, error) : error,
+			);
 			this.pending.delete(id);
 		}
 		for (const waiter of [...this.helloWaiters]) {

@@ -511,6 +511,9 @@ describe("daemon worker supervisor monitoring", () => {
 	});
 
 	it("registers and consumes a one-use direct peer grant without creating a supervisor claim", async () => {
+		const workerProcessStartId = getProcessStartId(process.pid);
+		if (!workerProcessStartId) throw new Error("Test requires a process-start identity");
+		const socketIdentity = { dev: 10, ino: 20 };
 		const grant: DaemonWorkerPeerGrant = {
 			grantId: "grant-1",
 			token: "peer-token",
@@ -518,6 +521,8 @@ describe("daemon worker supervisor monitoring", () => {
 			purpose: "session_client",
 			workerId: "worker-1",
 			workerInstanceId: "instance-1",
+			workerProcessStartId,
+			socketIdentity,
 			rootActiveSessionId: "root-1",
 			activeSessionId: "root-1",
 			issuerGeneration: "supervisor-1",
@@ -525,6 +530,8 @@ describe("daemon worker supervisor monitoring", () => {
 		const handleCommand = vi.fn(async () => undefined);
 		const daemon = Object.assign(Object.create(AgentDaemon.prototype), {
 			handleCommand,
+			workerProcessStartId,
+			socketIdentity,
 			options: {
 				worker: {
 					authenticationToken: "supervisor-token",
@@ -603,6 +610,8 @@ describe("daemon worker supervisor monitoring", () => {
 			purpose: "session_client",
 			workerId: "worker-1",
 			workerInstanceId: "instance-1",
+			workerProcessStartId: "proc:test",
+			socketIdentity: { dev: 10, ino: 20 },
 			rootActiveSessionId: "root-1",
 			activeSessionId: "root-1",
 			issuerGeneration: "supervisor-1",
@@ -646,6 +655,65 @@ describe("daemon worker supervisor monitoring", () => {
 		expect(daemon.peerGrants).toHaveLength(0);
 	});
 
+	it("rejects a stored peer grant when the captured listener identity changes before consumption", async () => {
+		const workerProcessStartId = getProcessStartId(process.pid);
+		if (!workerProcessStartId) throw new Error("Test requires a process-start identity");
+		const grant = {
+			grantId: "grant-1",
+			token: "peer-token",
+			expiresAt: new Date(Date.now() + 10_000).toISOString(),
+			purpose: "session_client",
+			workerId: "worker-1",
+			workerInstanceId: "instance-1",
+			workerProcessStartId,
+			socketIdentity: { dev: 10, ino: 20 },
+			rootActiveSessionId: "root-1",
+			activeSessionId: "root-1",
+			issuerGeneration: "supervisor-1",
+		} as DaemonWorkerPeerGrant;
+		const peer = {
+			id: "peer",
+			authenticated: false,
+			transport: "private-framed",
+			socket: { destroyed: false, write: vi.fn(() => true), end: vi.fn() },
+			attachedActiveSessionIds: new Set(),
+			detachInput: vi.fn(),
+			supportsExtensionUi: false,
+			capabilities: new Set(),
+		} as unknown as DaemonSocketClient;
+		const daemon = Object.assign(Object.create(AgentDaemon.prototype), {
+			options: { worker: { workerId: "worker-1", workerInstanceId: "instance-1" } },
+			workerProcessStartId,
+			socketIdentity: { dev: 30, ino: 40 },
+			promptAdmissions: new Map(),
+			peerAdmissionsFenced: false,
+			peerGrants: new Map([[grant.grantId, grant]]),
+			peerClaims: new Map(),
+			supervisorClaims: new Map([
+				[{} as DaemonSocketClient, { claim: { supervisorGeneration: grant.issuerGeneration } }],
+			]),
+		}) as unknown as {
+			peerGrants: Map<string, DaemonWorkerPeerGrant>;
+			peerClaims: Map<DaemonSocketClient, DaemonWorkerPeerGrant>;
+			handleLine(client: DaemonSocketClient, line: string): Promise<void>;
+		};
+
+		await daemon.handleLine(
+			peer,
+			JSON.stringify({
+				type: "peer_auth",
+				grantId: grant.grantId,
+				token: grant.token,
+				workerInstanceId: grant.workerInstanceId,
+				purpose: grant.purpose,
+			}),
+		);
+
+		expect(peer.socket.end).toHaveBeenCalledOnce();
+		expect(daemon.peerClaims.has(peer)).toBe(false);
+		expect(daemon.peerGrants.has(grant.grantId)).toBe(false);
+	});
+
 	it("admits at most one pipelined delivery and holds it in the worker mutation drain", async () => {
 		const delivery = createDeferred<object>();
 		const sendAgentSessionMessage = vi.fn(async () => delivery.promise);
@@ -668,6 +736,8 @@ describe("daemon worker supervisor monitoring", () => {
 			purpose: "agent_message",
 			workerId: "worker-1",
 			workerInstanceId: "instance-1",
+			workerProcessStartId: "proc:test",
+			socketIdentity: { dev: 10, ino: 20 },
 			rootActiveSessionId: "root-1",
 			activeSessionId: "target-1",
 			targetSessionId: "target-session",
@@ -752,19 +822,24 @@ describe("daemon worker supervisor monitoring", () => {
 	});
 
 	it("accepts peer grant registration only from the matching supervisor and worker incarnation", async () => {
-		const grant: DaemonWorkerPeerGrant = {
+		const workerProcessStartId = getProcessStartId(process.pid);
+		if (!workerProcessStartId) throw new Error("Test requires a process-start identity");
+		const socketIdentity = { dev: 10, ino: 20 };
+		const grant = {
 			grantId: "grant-1",
 			token: "peer-token",
 			expiresAt: new Date(Date.now() + 10_000).toISOString(),
 			purpose: "agent_message",
 			workerId: "worker-1",
 			workerInstanceId: "instance-1",
+			workerProcessStartId,
+			socketIdentity,
 			rootActiveSessionId: "root-1",
 			activeSessionId: "target-1",
 			targetSessionId: "target-session",
 			issuerGeneration: "supervisor-1",
 			sender: { activeSessionId: "source-1", sessionId: "source-session", clientId: "worker:source" },
-		};
+		} as DaemonWorkerPeerGrant;
 		const client = {
 			id: "supervisor",
 			transport: "private-framed",
@@ -776,6 +851,8 @@ describe("daemon worker supervisor monitoring", () => {
 		} as unknown as DaemonSocketClient;
 		const daemon = Object.assign(Object.create(AgentDaemon.prototype), {
 			options: { worker: { workerId: "worker-1", workerInstanceId: "instance-1" } },
+			workerProcessStartId,
+			socketIdentity,
 			workerRootActiveSessionId: "root-1",
 			peerAdmissionsFenced: false,
 			peerGrants: new Map(),
@@ -794,6 +871,14 @@ describe("daemon worker supervisor monitoring", () => {
 		const staleGrant = { ...grant, grantId: "stale", workerInstanceId: "instance-old" };
 		await daemon.handleWorkerCommand(client, { type: "worker_register_peer_transport", grant: staleGrant });
 		expect(daemon.peerGrants.has(staleGrant.grantId)).toBe(false);
+
+		const wrongProcessGrant = { ...grant, grantId: "wrong-process", workerProcessStartId: "proc:replaced" };
+		await daemon.handleWorkerCommand(client, { type: "worker_register_peer_transport", grant: wrongProcessGrant });
+		expect(daemon.peerGrants.has(wrongProcessGrant.grantId)).toBe(false);
+
+		const replacedSocketGrant = { ...grant, grantId: "replaced-socket", socketIdentity: { dev: 30, ino: 40 } };
+		await daemon.handleWorkerCommand(client, { type: "worker_register_peer_transport", grant: replacedSocketGrant });
+		expect(daemon.peerGrants.has(replacedSocketGrant.grantId)).toBe(false);
 	});
 
 	it("registers a ticket whose endpoint identity matches the current worker process", async () => {
@@ -850,6 +935,8 @@ describe("daemon worker supervisor monitoring", () => {
 				grant: {
 					workerId: ticket.workerId,
 					workerInstanceId: ticket.workerInstanceId,
+					workerProcessStartId: ticket.workerProcessStartId,
+					socketIdentity: ticket.socketIdentity,
 					purpose: "session_client",
 				},
 			});

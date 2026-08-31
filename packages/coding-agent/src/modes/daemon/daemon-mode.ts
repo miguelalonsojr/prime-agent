@@ -95,7 +95,12 @@ import {
 	type SessionPassivationSnapshot,
 } from "../../core/session-action-store.js";
 import { deleteSessionArtifacts, deleteSessionFile } from "../../core/session-file-actions.js";
-import { acquireSessionLease, canonicalSessionPath, type SessionLease } from "../../core/session-lease.js";
+import {
+	acquireSessionLease,
+	canonicalSessionPath,
+	getProcessStartId,
+	type SessionLease,
+} from "../../core/session-lease.js";
 import {
 	getSessionArtifactPathForFile,
 	readSessionInfo,
@@ -129,6 +134,7 @@ import { DaemonClient } from "./daemon-client.js";
 import { filterClientEnv, withClientEnv } from "./daemon-client-env.js";
 import { deserializeDaemonError, serializeDaemonError } from "./daemon-errors.js";
 import { bindActiveSessionState } from "./daemon-extension-binding.js";
+import { parseDaemonPeerTransportTicket } from "./daemon-peer-transport-ticket.js";
 import {
 	createDaemonEventMeta,
 	createDaemonReplayInfo,
@@ -144,7 +150,6 @@ import {
 	type DaemonClosingReason,
 	type DaemonCommand,
 	type DaemonOutbound,
-	type DaemonPeerTransportTicket,
 	type DaemonResponse,
 	type DaemonSessionClosedReason,
 	type DaemonSessionSnapshot,
@@ -480,6 +485,7 @@ export class AgentDaemon {
 	};
 	private ownsSocketPath = false;
 	private socketIdentity?: DaemonSocketIdentity;
+	private readonly workerProcessStartId: string | undefined;
 	private readonly clients = new Set<DaemonSocketClient>();
 	private readonly sessions = new Map<string, ActiveSessionState>();
 	private readonly openingSessions = new Map<string, Promise<ActiveSessionState>>();
@@ -567,6 +573,7 @@ export class AgentDaemon {
 			throw new Error("Daemon config is missing agentDir");
 		}
 		this.agentDir = options.defaultSessionConfig.agentDir;
+		this.workerProcessStartId = options.worker ? getProcessStartId(process.pid) : undefined;
 		this.cronStore = options.worker
 			? AgentCronJobStore.forSessionArtifacts()
 			: new AgentCronJobStore(getCronJobsPath(this.agentDir));
@@ -3339,6 +3346,7 @@ export class AgentDaemon {
 						grant.issuerGeneration !== supervisorGeneration ||
 						this.options.worker.workerId !== grant.workerId ||
 						this.options.worker.workerInstanceId !== grant.workerInstanceId ||
+						!this.peerGrantMatchesCurrentWorker(grant) ||
 						!Number.isFinite(expiresAt) ||
 						expiresAt <= Date.now()
 					) {
@@ -3645,6 +3653,19 @@ export class AgentDaemon {
 		}
 	}
 
+	private peerGrantMatchesCurrentWorker(grant: DaemonWorkerPeerGrant): boolean {
+		const workerProcessStartId = this.workerProcessStartId;
+		const socketIdentity = this.socketIdentity;
+		return (
+			workerProcessStartId !== undefined &&
+			getProcessStartId(process.pid) === workerProcessStartId &&
+			grant.workerProcessStartId === workerProcessStartId &&
+			socketIdentity !== undefined &&
+			grant.socketIdentity.dev === socketIdentity.dev &&
+			grant.socketIdentity.ino === socketIdentity.ino
+		);
+	}
+
 	private writeWorkerSuccess(client: DaemonSocketClient, command: DaemonWorkerCommand, data?: unknown): void {
 		this.write(client, {
 			id: command.id,
@@ -3676,6 +3697,7 @@ export class AgentDaemon {
 						grant.issuerGeneration !== boundClaim.claim.supervisorGeneration ||
 						grant.workerId !== this.options.worker?.workerId ||
 						grant.workerInstanceId !== this.options.worker?.workerInstanceId ||
+						!this.peerGrantMatchesCurrentWorker(grant) ||
 						grant.rootActiveSessionId !== this.workerRootActiveSessionId ||
 						!targetState ||
 						(grant.purpose === "agent_message" &&
@@ -6003,7 +6025,7 @@ export class AgentDaemon {
 				}
 				return undefined;
 			}
-			const ticket = readPeerTransportTicket(endpoint.data, "agent_message");
+			const ticket = parseDaemonPeerTransportTicket(endpoint.data, "agent_message");
 			if (!ticket) return undefined;
 			const socketIdentity = getDaemonSocketIdentity(ticket.socketPath);
 			if (
@@ -7160,37 +7182,6 @@ export class AgentDaemon {
 		this.cleanupSocketPath();
 		process.exit(exitCode);
 	}
-}
-
-function readPeerTransportTicket(
-	value: unknown,
-	purpose: DaemonPeerTransportTicket["purpose"],
-): DaemonPeerTransportTicket | undefined {
-	if (!value || typeof value !== "object") return undefined;
-	const candidate = value as Partial<DaemonPeerTransportTicket>;
-	if (
-		candidate.purpose !== purpose ||
-		typeof candidate.socketPath !== "string" ||
-		typeof candidate.workerId !== "string" ||
-		typeof candidate.workerInstanceId !== "string" ||
-		typeof candidate.rootActiveSessionId !== "string" ||
-		typeof candidate.activeSessionId !== "string" ||
-		typeof candidate.workerPid !== "number" ||
-		typeof candidate.workerProcessStartId !== "string" ||
-		typeof candidate.grantId !== "string" ||
-		typeof candidate.token !== "string" ||
-		typeof candidate.expiresAt !== "string"
-	) {
-		return undefined;
-	}
-	if (
-		!candidate.socketIdentity ||
-		typeof candidate.socketIdentity.dev !== "number" ||
-		typeof candidate.socketIdentity.ino !== "number"
-	) {
-		return undefined;
-	}
-	return candidate as DaemonPeerTransportTicket;
 }
 
 function hasDaemonOutboundActiveSessionId(

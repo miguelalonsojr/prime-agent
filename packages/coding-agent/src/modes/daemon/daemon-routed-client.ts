@@ -9,12 +9,8 @@ import {
 	type DaemonTransportClient,
 	getDaemonSocketCloseReason,
 } from "./daemon-client.js";
-import type {
-	DaemonClosingReason,
-	DaemonPeerTransportTicket,
-	DaemonResponse,
-	DaemonServerCapability,
-} from "./daemon-protocol.js";
+import { parseDaemonPeerTransportTicket } from "./daemon-peer-transport-ticket.js";
+import type { DaemonClosingReason, DaemonResponse, DaemonServerCapability } from "./daemon-protocol.js";
 import { getDaemonSocketIdentity } from "./daemon-socket.js";
 import { DaemonWorkerClient } from "./daemon-worker-client.js";
 import { isDirectSessionCommand } from "./daemon-worker-protocol.js";
@@ -211,7 +207,7 @@ export async function createDaemonSessionTransport(
 	try {
 		const response = await supervisor.request({ type: "get_direct_worker_transport", activeSessionId }, 5000);
 		if (!response.success) return supervisor;
-		const ticket = readSessionTransportTicket(response.data);
+		const ticket = parseDaemonPeerTransportTicket(response.data, "session_client");
 		if (!ticket || ticket.activeSessionId !== activeSessionId || Date.parse(ticket.expiresAt) <= Date.now()) {
 			return supervisor;
 		}
@@ -232,32 +228,4 @@ export async function createDaemonSessionTransport(
 		direct?.close();
 		return supervisor;
 	}
-}
-
-function readSessionTransportTicket(value: unknown): DaemonPeerTransportTicket | undefined {
-	if (!value || typeof value !== "object") return undefined;
-	const candidate = value as Partial<DaemonPeerTransportTicket>;
-	if (
-		candidate.purpose !== "session_client" ||
-		typeof candidate.socketPath !== "string" ||
-		typeof candidate.workerId !== "string" ||
-		typeof candidate.workerInstanceId !== "string" ||
-		typeof candidate.rootActiveSessionId !== "string" ||
-		typeof candidate.activeSessionId !== "string" ||
-		typeof candidate.workerPid !== "number" ||
-		typeof candidate.workerProcessStartId !== "string" ||
-		typeof candidate.grantId !== "string" ||
-		typeof candidate.token !== "string" ||
-		typeof candidate.expiresAt !== "string"
-	) {
-		return undefined;
-	}
-	if (
-		!candidate.socketIdentity ||
-		typeof candidate.socketIdentity.dev !== "number" ||
-		typeof candidate.socketIdentity.ino !== "number"
-	) {
-		return undefined;
-	}
-	return candidate as DaemonPeerTransportTicket;
 }

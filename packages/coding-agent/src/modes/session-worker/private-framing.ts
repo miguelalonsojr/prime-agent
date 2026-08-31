@@ -141,12 +141,13 @@ export class PrivateFramedChannel<THeader extends object> {
 		return () => this.listeners.delete(listener);
 	}
 
-	async send(header: THeader, payload?: Uint8Array): Promise<void> {
+	async send(header: THeader, payload?: Uint8Array, onWriteStarted?: () => void): Promise<void> {
 		if (this.closed || this.stream.destroyed) {
 			throw new Error("Private frame channel is closed");
 		}
 		const frame = encodePrivateFrame(header, payload, this.limits);
 		await new Promise<void>((resolve, reject) => {
+			onWriteStarted?.();
 			this.stream.write(frame, (error?: Error | null) => {
 				if (error) {
 					reject(error);
