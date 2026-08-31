@@ -32,7 +32,11 @@ import {
 	type DaemonOutbound,
 	type DaemonResponse,
 } from "../src/modes/daemon/daemon-protocol.js";
-import { DaemonRoutedClient } from "../src/modes/daemon/daemon-routed-client.js";
+import {
+	createDaemonSessionTransport,
+	DaemonDirectTransportClosedError,
+	DaemonRoutedClient,
+} from "../src/modes/daemon/daemon-routed-client.js";
 import type { DaemonWorkerClient } from "../src/modes/daemon/daemon-worker-client.js";
 
 class FakeDaemonClient {
@@ -762,6 +766,19 @@ function emitSequencedQueueUpdate(client: FakeDaemonClient, activeSessionId: str
 }
 
 describe("DaemonAgentConnection", () => {
+	it("does not discover direct transport from an older daemon", async () => {
+		const supervisor = new FakeDaemonClient();
+
+		const transport = await createDaemonSessionTransport(
+			supervisor as unknown as DaemonTransportClient,
+			"active-1",
+			false,
+		);
+
+		expect(transport).toBe(supervisor);
+		expect(supervisor.requests).not.toContainEqual(expect.objectContaining({ type: "get_direct_worker_transport" }));
+	});
+
 	it("falls back to the supervisor when the direct socket closes during initial attach", async () => {
 		const supervisor = new FakeDaemonClient();
 		const closeListeners = new Set<(error: Error) => void>();
@@ -944,6 +961,39 @@ describe("DaemonAgentConnection", () => {
 		expect(response.success).toBe(false);
 		expect(close).not.toHaveBeenCalled();
 		expect(routed.hasDirectTransport).toBe(true);
+		routed.close();
+	});
+
+	it("rejects an in-flight direct mutation without replaying it through the supervisor", async () => {
+		const supervisor = new FakeDaemonClient();
+		const closeListeners = new Set<(error: Error) => void>();
+		let rejectDirectRequest: (error: Error) => void = () => {};
+		const direct = {
+			isConnected: true,
+			onMessage: () => () => {},
+			onClose: (listener: (error: Error) => void) => {
+				closeListeners.add(listener);
+				return () => closeListeners.delete(listener);
+			},
+			request: vi.fn(
+				() =>
+					new Promise<DaemonResponse>((_resolve, reject) => {
+						rejectDirectRequest = reject;
+					}),
+			),
+			close: () => {},
+		} as unknown as DaemonWorkerClient;
+		const routed = new DaemonRoutedClient(supervisor as unknown as DaemonTransportClient, direct);
+
+		const inFlightMutation = routed.request({ type: "prompt", activeSessionId: "active-1", message: "hello" });
+		await Promise.resolve();
+		const closeError = new Error("direct worker socket closed");
+		for (const listener of closeListeners) listener(closeError);
+		rejectDirectRequest(closeError);
+
+		await expect(inFlightMutation).rejects.toBeInstanceOf(DaemonDirectTransportClosedError);
+		expect(direct.request).toHaveBeenCalledTimes(1);
+		expect(supervisor.requests).not.toContainEqual(expect.objectContaining({ type: "prompt" }));
 		routed.close();
 	});
 

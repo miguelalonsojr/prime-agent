@@ -128,8 +128,14 @@ export class DaemonRoutedClient implements DaemonTransportClient {
 				return response;
 			});
 		}
-		if (this.direct?.isConnected && isDirectSessionCommand(command)) {
-			return this.direct.request(command, timeoutMs, options);
+		const direct = this.direct;
+		if (direct?.isConnected && isDirectSessionCommand(command)) {
+			return direct.request(command, timeoutMs, options).catch((error: unknown) => {
+				if (this.direct !== direct) {
+					throw new DaemonDirectTransportClosedError(error instanceof Error ? error : new Error(String(error)));
+				}
+				throw error;
+			});
 		}
 		return this.requestControlPlane(command, timeoutMs, options);
 	}
