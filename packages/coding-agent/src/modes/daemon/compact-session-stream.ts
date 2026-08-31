@@ -103,6 +103,9 @@ export class CompactAssistantStreamReconstructor {
 			return undefined;
 		}
 		const event = delta.assistantMessageEvent;
+		if ("contentIndex" in event && event.contentIndex > partial.content.length) {
+			return undefined;
+		}
 		switch (event.type) {
 			case "text_start":
 				partial.content[event.contentIndex] = delta.contentStart ?? { type: "text", text: "" };

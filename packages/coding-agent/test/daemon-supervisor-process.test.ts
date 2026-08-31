@@ -123,17 +123,30 @@ function readDaemonLogs(agentDir: string): string {
 	}
 }
 
-function readWorkerDescriptor(agentDir: string, rootActiveSessionId?: string): DaemonWorkerDescriptor {
+function findWorkerDescriptor(
+	agentDir: string,
+	rootActiveSessionId?: string,
+): {
+	path: string;
+	descriptor: DaemonWorkerDescriptor;
+} {
 	const workersRoot = join(agentDir, "daemon-workers");
 	for (const directory of readdirSync(workersRoot)) {
 		const descriptorDirectory = join(workersRoot, directory);
 		for (const name of readdirSync(descriptorDirectory)) {
 			if (!name.endsWith(".json")) continue;
-			const descriptor = JSON.parse(readFileSync(join(descriptorDirectory, name), "utf8")) as DaemonWorkerDescriptor;
-			if (!rootActiveSessionId || descriptor.rootActiveSessionId === rootActiveSessionId) return descriptor;
+			const path = join(descriptorDirectory, name);
+			const descriptor = JSON.parse(readFileSync(path, "utf8")) as DaemonWorkerDescriptor;
+			if (!rootActiveSessionId || descriptor.rootActiveSessionId === rootActiveSessionId) {
+				return { path, descriptor };
+			}
 		}
 	}
 	throw new Error("Worker descriptor was not persisted");
+}
+
+function readWorkerDescriptor(agentDir: string, rootActiveSessionId?: string): DaemonWorkerDescriptor {
+	return findWorkerDescriptor(agentDir, rootActiveSessionId).descriptor;
 }
 
 function countWorkerDescriptors(agentDir: string): number {
@@ -1237,6 +1250,76 @@ describe("daemon supervisor resident workers", () => {
 		);
 	}, 60_000);
 
+	it.each([
+		{
+			name: "worker instance identity",
+			corrupt: (descriptor: DaemonWorkerDescriptor) => {
+				descriptor.workerInstanceId = `stale-${descriptor.workerInstanceId}`;
+			},
+		},
+		{
+			name: "process-start identity",
+			corrupt: (descriptor: DaemonWorkerDescriptor) => {
+				descriptor.processStartId = `stale-${descriptor.processStartId}`;
+			},
+		},
+	])(
+		"rejects adoption when a persisted descriptor has a mismatched $name",
+		async ({ corrupt }) => {
+			const root = tempDir();
+			const agentDir = join(root, "agent");
+			const projectDir = join(root, "project");
+			const sessionDir = join(agentDir, "sessions");
+			const socketPath = join(
+				tmpdir(),
+				`prime-supervisor-stale-adoption-${process.pid}-${randomUUID().slice(0, 8)}.sock`,
+			);
+			mkdirSync(projectDir, { recursive: true });
+			const sessionManager = SessionManager.create(projectDir, sessionDir);
+			sessionManager.appendMessage({ role: "user", content: "stale adoption fixture", timestamp: 1 });
+			const sessionFile = sessionManager.getSessionFile();
+			if (!sessionFile) throw new Error("Fixture session did not persist");
+
+			const supervisor = spawnSupervisor(agentDir, socketPath, projectDir);
+			const client = await connectEventually(socketPath, supervisor);
+			const created = await client.request({
+				type: "create",
+				sessionPath: sessionFile,
+				config: { cwd: projectDir, agentDir, sessionDir, noTools: true, noExtensions: true },
+			});
+			if (!created.success) throw new Error(created.error);
+			const summary = requireSummary(created.data);
+			const activeSessionId = summary.activeSessionId ?? summary.id;
+			if (!summary.workerPid) throw new Error("Resident worker did not expose its pid");
+			workerPids.add(summary.workerPid);
+
+			supervisor.kill("SIGTERM");
+			await waitForExit(supervisor);
+			children.delete(supervisor);
+			client.close();
+			const persisted = findWorkerDescriptor(agentDir, activeSessionId);
+			corrupt(persisted.descriptor);
+			writeFileSync(persisted.path, `${JSON.stringify(persisted.descriptor, null, 2)}\n`);
+
+			const replacementClient = await connectEventually(socketPath);
+			await waitForCondition(
+				() => readWorkerDescriptor(agentDir, activeSessionId).lifecycle !== "recovering",
+				"Replacement supervisor did not settle stale worker adoption",
+				20_000,
+			);
+			expect(readWorkerDescriptor(agentDir, activeSessionId).lifecycle).toBe("failed");
+			await expect(replacementClient.request({ type: "attach", activeSessionId })).resolves.toMatchObject({
+				success: false,
+			});
+			expect(() => process.kill(summary.workerPid!, 0)).not.toThrow();
+
+			await replacementClient.request({ type: "shutdown" });
+			replacementClient.close();
+			await waitForSocketGone(socketPath);
+		},
+		30_000,
+	);
+
 	it("hosts resident roots in isolated worker processes without a session cap", {
 		tags: ["process-stress"],
 		timeout: 180_000,
@@ -1498,6 +1581,13 @@ describe("daemon supervisor resident workers", () => {
 			activeSessionId: createdSummary.activeSessionId,
 			sessionId: createdSummary.sessionId,
 		});
+		expect(readWorkerDescriptor(agentDir, activeSessionId).rootActiveSessionId).toBe(activeSessionId);
+		expect(() => process.kill(createdSummary.workerPid!, 0)).not.toThrow();
+		const replacementProbe = await connectEventually(socketPath);
+		await expect(replacementProbe.request({ type: "attach", activeSessionId })).resolves.toMatchObject({
+			success: true,
+		});
+		replacementProbe.close();
 		const listed = await client.request({ type: "list", all: true, sessionDir });
 		expect(listed.success).toBe(true);
 		if (!listed.success) {

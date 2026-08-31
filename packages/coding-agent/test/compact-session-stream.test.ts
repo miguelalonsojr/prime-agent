@@ -170,4 +170,56 @@ describe("compact daemon assistant streaming", () => {
 			},
 		});
 	});
+
+	it.each([
+		{ type: "text_start" as const, contentStart: { type: "text" as const, text: "late" } },
+		{ type: "thinking_start" as const, contentStart: { type: "thinking" as const, thinking: "late" } },
+		{
+			type: "toolcall_start" as const,
+			contentStart: { type: "toolCall" as const, id: "tool-late", name: "search", arguments: {} },
+		},
+		{
+			type: "toolcall_end" as const,
+			toolCall: { type: "toolCall" as const, id: "tool-late", name: "search", arguments: {} },
+		},
+	])("rejects sparse $type frames without introducing content holes", (event) => {
+		const reconstructor = new CompactAssistantStreamReconstructor();
+		const partial = assistant([{ type: "text", text: "seed" }]);
+		reconstructor.seed("active-sparse", partial);
+
+		const reconstructed = reconstructor.reconstruct({
+			type: "assistant_stream_delta",
+			activeSessionId: "active-sparse",
+			assistantMessageEvent: { ...event, contentIndex: 2 },
+			...("contentStart" in event ? { contentStart: event.contentStart } : {}),
+		});
+
+		expect(reconstructed).toBeUndefined();
+		expect(partial.content).toHaveLength(1);
+		expect(partial.content).not.toContain(null);
+		expect(partial.content.every((content) => content !== undefined)).toBe(true);
+	});
+
+	it("allows compact frames at the current content boundary and existing content indices", () => {
+		const reconstructor = new CompactAssistantStreamReconstructor();
+		const partial = assistant([{ type: "text", text: "seed" }]);
+		reconstructor.seed("active-boundary", partial);
+
+		expect(
+			reconstructor.reconstruct({
+				type: "assistant_stream_delta",
+				activeSessionId: "active-boundary",
+				assistantMessageEvent: { type: "text_start", contentIndex: 1 },
+				contentStart: { type: "text", text: "append" },
+			}),
+		).toMatchObject({ event: { message: { content: [{ text: "seed" }, { text: "append" }] } } });
+		expect(
+			reconstructor.reconstruct({
+				type: "assistant_stream_delta",
+				activeSessionId: "active-boundary",
+				assistantMessageEvent: { type: "text_start", contentIndex: 0 },
+				contentStart: { type: "text", text: "replacement" },
+			}),
+		).toMatchObject({ event: { message: { content: [{ text: "replacement" }, { text: "append" }] } } });
+	});
 });
