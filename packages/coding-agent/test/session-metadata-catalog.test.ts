@@ -193,6 +193,13 @@ describe("session metadata catalog", () => {
 
 		try {
 			expect((await catalog.list(undefined, sessionDir)).map((session) => session.id)).toContain("empty-session");
+			const beforeDeleteDatabase = new DatabaseSync(getSessionMetadataCatalogPath(sessionDir));
+			const cachedRow = beforeDeleteDatabase
+				.prepare("SELECT id, path FROM sessions WHERE path = ?")
+				.get(sessionPath) as { id: string; path: string } | undefined;
+			beforeDeleteDatabase.close();
+			expect(cachedRow).toEqual({ id: "empty-session", path: sessionPath });
+
 			await expect(deleteCatalogSessionFile(sessionPath, catalog)).resolves.toMatchObject({ ok: true });
 
 			const database = new DatabaseSync(getSessionMetadataCatalogPath(sessionDir));
