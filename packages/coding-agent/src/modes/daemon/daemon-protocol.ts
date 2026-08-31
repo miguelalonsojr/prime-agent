@@ -68,8 +68,9 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 21 lets cancellation target a prompt the session owns but has not started.
 // Revision 22 adds capability-gated, session-scoped ACP MCP server replacement.
 // Revision 23 scopes ACP MCP replacement and cleanup to a connection owner.
-export const DAEMON_SCHEMA_REVISION = 23;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-23-79debbaa67fc";
+// Revision 24 lets workers query the supervisor agent roster on demand.
+export const DAEMON_SCHEMA_REVISION = 24;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-24-0feab772ccc0";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -383,6 +384,7 @@ export type DaemonCommand =
 			includeClientOwned?: boolean;
 	  }
 	| DaemonSavedSessionListCommand
+	| { id?: string; type: "list_agent_peers"; workerToken: string }
 	| ({
 			id?: string;
 			type: "create";
@@ -724,11 +726,13 @@ const SESSION_INPUT_PAUSE_COMMAND = {
 	minSchemaRevision: 20,
 	capability: "session_input_pause",
 } as const;
+const AGENT_PEER_LIST_COMMAND = { minProtocol: 7, minSchemaRevision: 24 } as const;
 
 export const DAEMON_COMMAND_COMPATIBILITY = {
 	ack_result: LEGACY_DAEMON_COMMAND,
 	list: LEGACY_DAEMON_COMMAND,
 	list_saved_sessions: LEGACY_DAEMON_COMMAND,
+	list_agent_peers: AGENT_PEER_LIST_COMMAND,
 	create: LEGACY_DAEMON_COMMAND,
 	attach: LEGACY_DAEMON_COMMAND,
 	reattach: LEGACY_DAEMON_COMMAND,
@@ -1119,6 +1123,7 @@ const READ_ONLY_DAEMON_COMMANDS: ReadonlySet<DaemonCommand["type"]> = new Set([
 	"ack_result",
 	"list",
 	"list_saved_sessions",
+	"list_agent_peers",
 	"attach",
 	"reattach",
 	"agent_messages_status",

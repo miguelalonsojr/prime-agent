@@ -74,24 +74,13 @@ describe("daemon protocol helpers", () => {
 		expect(JSON.stringify(durable)).not.toContain("secret-");
 	});
 
-	it("keeps the advertised schema identity synchronized with wire type shapes", () => {
+	it("keeps the advertised schema identity synchronized with the full protocol source", () => {
 		const source = readFileSync(resolve(__dirname, "../src/modes/daemon/daemon-protocol.ts"), "utf8");
-		const commandSource = source.slice(
-			source.indexOf("export type DaemonCommand ="),
-			source.indexOf("type DaemonCommandName"),
+		const normalizedSource = source.replace(
+			/DAEMON_SCHEMA_ID = "protocol-7-schema-24-[^"]+"/,
+			'DAEMON_SCHEMA_ID = "protocol-7-schema-24-SCHEMA"',
 		);
-		const savedSessionSource = source.slice(
-			source.indexOf("export interface DaemonSavedSessionInfo"),
-			source.indexOf("export type DaemonDeleteSavedSessionResult"),
-		);
-		const outboundSource = source.slice(
-			source.indexOf("export type DaemonOutbound ="),
-			source.indexOf("export const DAEMON_OUTBOUND_COMPATIBILITY"),
-		);
-		const digest = createHash("sha256")
-			.update(`${commandSource}\n${savedSessionSource}\n${outboundSource}`)
-			.digest("hex")
-			.slice(0, 12);
+		const digest = createHash("sha256").update(normalizedSource).digest("hex").slice(0, 12);
 		expect(DAEMON_SCHEMA_ID).toBe(`protocol-${DAEMON_PROTOCOL_VERSION}-schema-${DAEMON_SCHEMA_REVISION}-${digest}`);
 	});
 
@@ -160,6 +149,17 @@ describe("daemon protocol helpers", () => {
 			capability: "kernel_cwd_propagation",
 		});
 		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).toContain("kernel_cwd_propagation");
+	});
+
+	it("uses composite schema revision 24 for supervisor agent-roster queries", () => {
+		expect(DAEMON_SCHEMA_REVISION).toBe(24);
+		expect(getDaemonCommandCompatibilities({ type: "list_agent_peers", workerToken: "worker" })).toContainEqual({
+			minProtocol: 7,
+			minSchemaRevision: 24,
+		});
+		expect(
+			getDaemonCommandCompatibilities({ type: "set_kernel_cwd", activeSessionId: "active", dir: "/tmp/project" }),
+		).toContainEqual({ minProtocol: 7, minSchemaRevision: 17, capability: "kernel_cwd_propagation" });
 	});
 
 	it("schema-gates the RLM max depth commands at their introducing revision", () => {

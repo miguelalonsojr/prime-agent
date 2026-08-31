@@ -4,7 +4,12 @@ import { DAEMON_COMMAND_COMPATIBILITY } from "../src/modes/daemon/daemon-protoco
 import { DAEMON_COMMAND_TYPES as SUPERVISOR_COMMAND_TYPES } from "../src/modes/daemon/daemon-supervisor.js";
 
 // Commands the supervisor answers itself; a worker never sees them.
-const SUPERVISOR_ONLY_COMMANDS = new Set(["reattach", "complete_owned_session", "promote_owned_session"]);
+const SUPERVISOR_ONLY_COMMANDS = new Set([
+	"reattach",
+	"complete_owned_session",
+	"promote_owned_session",
+	"list_agent_peers",
+]);
 
 describe("daemon command allowlists", () => {
 	it("accepts every command in the compatibility map at the supervisor", () => {
