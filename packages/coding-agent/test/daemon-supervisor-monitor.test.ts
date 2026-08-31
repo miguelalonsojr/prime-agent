@@ -2087,6 +2087,45 @@ describe("daemon worker supervisor monitoring", () => {
 		await expect(reused).resolves.toBe(worker);
 	});
 
+	it("reopens a persisted session through its existing worker client", async () => {
+		const sessionPath = "/tmp/persisted-session.jsonl";
+		const previousSessionId = "persisted-session";
+		const root = {
+			id: "active-root",
+			activeSessionId: "active-root",
+			sessionId: previousSessionId,
+			sessionFile: sessionPath,
+			cwd: "/tmp",
+		} as SessionSummary;
+		const client = {};
+		const worker = {
+			descriptor: {
+				workerId: "persisted-worker",
+				rootActiveSessionId: root.activeSessionId,
+				lifecycle: "ready",
+			},
+			client,
+			summaries: new Map([[root.activeSessionId, root]]),
+			intentionalStop: false,
+		};
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			workers: new Map([[worker.descriptor.workerId, worker]]),
+		}) as {
+			reuseWorkerForCreate(
+				target: typeof worker,
+				ownerClientId: undefined,
+				sessionPath: string,
+			): Promise<typeof worker>;
+		};
+
+		const reopened = await supervisor.reuseWorkerForCreate(worker, undefined, sessionPath);
+		const reopenedSummary = reopened.summaries.get(root.activeSessionId);
+
+		expect(reopened.client).toBe(client);
+		expect(reopenedSummary?.sessionId).toBe(previousSessionId);
+		expect(reopenedSummary?.sessionFile).toBe(sessionPath);
+	});
+
 	it("starts recovery before reusing a persisted recovering worker", async () => {
 		const root = { id: "active-root", activeSessionId: "active-root", sessionId: "session-root", cwd: "/tmp" };
 		const worker = {

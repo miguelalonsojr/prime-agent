@@ -38,6 +38,12 @@ function writeSession(path: string, id: string, cwd: string, message: string): v
 	writeFileSync(path, `${JSON.stringify(header)}\n${JSON.stringify(messageEntry)}\n`);
 }
 
+function writeEmptySession(path: string, id: string, cwd: string): void {
+	const timestamp = "2026-01-01T00:00:00.000Z";
+	const header: SessionHeader = { type: "session", version: 3, id, timestamp, cwd };
+	writeFileSync(path, `${JSON.stringify(header)}\n`);
+}
+
 function appendName(path: string, id: string, name: string): void {
 	appendFileSync(
 		path,
@@ -174,6 +180,24 @@ describe("session metadata catalog", () => {
 					expect(readFileSync(sidecarPath).includes(Buffer.from("private transcript text"))).toBe(false);
 				}
 			}
+		} finally {
+			catalog.close();
+		}
+	});
+
+	it("removes an empty inactive session from catalog metadata after deletion", async () => {
+		const sessionDir = createTemporarySessionDir();
+		const sessionPath = join(sessionDir, "empty-session.jsonl");
+		writeEmptySession(sessionPath, "empty-session", "/tmp/project");
+		const catalog = new SessionMetadataCatalog();
+
+		try {
+			await catalog.list(undefined, sessionDir);
+			await expect(deleteCatalogSessionFile(sessionPath, catalog)).resolves.toMatchObject({ ok: true });
+
+			expect(await catalog.list(undefined, sessionDir)).not.toContainEqual(
+				expect.objectContaining({ id: "empty-session" }),
+			);
 		} finally {
 			catalog.close();
 		}
