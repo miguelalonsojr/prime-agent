@@ -709,6 +709,49 @@ describe("AgentsViewMode persistent catalog state", () => {
 			stopThemeWatcher();
 		}
 	});
+
+	it("renders cached rows while an earlier live list request remains pending", async () => {
+		let resolveLiveList: () => void;
+		const liveList = new Promise<void>((resolve) => {
+			resolveLiveList = resolve;
+		});
+		let liveListSettled = false;
+		void liveList.then(() => {
+			liveListSettled = true;
+		});
+		const cached = summary({ id: "cached-active", activeSessionId: "cached-active", sessionId: "cached-session" });
+		const request = vi.fn((command: { refresh?: boolean }) => {
+			if (command.refresh === false) {
+				return Promise.resolve({ success: true as const, data: { sessions: [cached] } });
+			}
+			return liveList.then(() => ({ success: true as const, data: { sessions: [] } }));
+		});
+		const view = new AgentsViewMode(
+			{ config: {}, uiServices: createUiServices() },
+			createInitialAgentsViewPersistentState({}),
+		);
+		Reflect.set(view, "client", {
+			isConnected: true,
+			request,
+			supportsServerCapability: vi.fn(() => true),
+		});
+		const pendingLiveList = request({});
+
+		try {
+			await expect(invoke("refreshSessions", view, { useCachedSummaries: true })).resolves.toBe(true);
+			expect(liveListSettled).toBe(false);
+			expect(Reflect.get(view, "rows")).toEqual(
+				expect.arrayContaining([
+					expect.objectContaining({ summary: expect.objectContaining({ id: "cached-active" }) }),
+				]),
+			);
+		} finally {
+			resolveLiveList!();
+			await pendingLiveList;
+			stopThemeWatcher();
+		}
+	});
+
 	it("keeps an initial handoff scope when the first live poll fails after both catalogs settle", async () => {
 		const root = summary();
 		const scope = { sessionId: root.sessionId, activeSessionId: root.activeSessionId };

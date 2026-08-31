@@ -2193,14 +2193,7 @@ export class DaemonSupervisor {
 		command: Extract<DaemonCommand, { type: "list" }>,
 	): Promise<DaemonResponse> {
 		const listableWorkers = [...this.workers.values()].filter((worker) => !this.isWorkerStopping(worker));
-		if (command.refresh === false) {
-			await Promise.all(
-				listableWorkers.map((worker) => {
-					const refresh = worker.summaryRefresh;
-					return refresh && refresh.client === worker.client ? refresh.promise.catch(() => undefined) : undefined;
-				}),
-			);
-		} else {
+		if (command.refresh !== false) {
 			await Promise.all(listableWorkers.map((worker) => this.refreshWorkerSummaries(worker).catch(() => undefined)));
 		}
 		const clientOwnedWorkers = [...this.workers.values()].filter((worker) => !this.isVisibleWorker(worker));

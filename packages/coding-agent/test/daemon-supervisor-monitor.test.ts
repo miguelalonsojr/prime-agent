@@ -2034,6 +2034,58 @@ describe("daemon worker supervisor monitoring", () => {
 		]);
 	});
 
+	it("returns cached summaries before an existing worker refresh resolves", async () => {
+		const activeRefresh = createDeferred<void>();
+		const workerClient = {};
+		const worker = {
+			descriptor: {
+				workerId: "worker-live",
+				pid: process.pid,
+				rootActiveSessionId: "worker-live-active",
+				lifecycle: "ready" as const,
+			},
+			client: workerClient,
+			intentionalStop: false,
+			summaries: new Map([
+				[
+					"worker-live-active",
+					{
+						id: "worker-live-active",
+						activeSessionId: "worker-live-active",
+						sessionId: "worker-live-session",
+						cwd: "/tmp",
+					} as unknown as SessionSummary,
+				],
+			]),
+			summaryRefresh: { promise: activeRefresh.promise, client: workerClient, recovery: false, generation: 1 },
+		};
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			workers: new Map([[worker.descriptor.workerId, worker]]),
+			clients: new Set(),
+			log: vi.fn(),
+		}) as {
+			handleList(
+				client: object,
+				command: { id: string; type: "list"; refresh?: boolean },
+			): Promise<{ success: boolean; data?: { sessions: Array<{ id: string }> } }>;
+		};
+
+		const response = supervisor.handleList({}, { id: "list-cached", type: "list", refresh: false });
+		let settled = false;
+		void response.then(() => {
+			settled = true;
+		});
+
+		await Promise.resolve();
+		await Promise.resolve();
+
+		expect(settled).toBe(true);
+		await expect(response).resolves.toMatchObject({
+			success: true,
+			data: { sessions: [{ id: "worker-live-active" }] },
+		});
+	});
+
 	it("coalesces high-frequency summary updates to one refresh per interval", async () => {
 		vi.useFakeTimers();
 		vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
