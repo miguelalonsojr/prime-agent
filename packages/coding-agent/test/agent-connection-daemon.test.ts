@@ -947,6 +947,28 @@ describe("DaemonAgentConnection", () => {
 		routed.close();
 	});
 
+	it("routes set_kernel_cwd through the direct session transport", async () => {
+		const supervisor = new FakeDaemonClient();
+		const directRequests: DaemonCommand[] = [];
+		const direct = {
+			isConnected: true,
+			onMessage: () => () => {},
+			onClose: () => () => {},
+			request: async (command: DaemonCommand) => {
+				directRequests.push(command);
+				return { type: "response" as const, command: command.type, success: true as const };
+			},
+			close: () => {},
+		} as unknown as DaemonWorkerClient;
+		const routed = new DaemonRoutedClient(supervisor as unknown as DaemonTransportClient, direct);
+
+		await routed.request({ type: "set_kernel_cwd", activeSessionId: "active-1", dir: "/tmp/project" });
+
+		expect(directRequests).toEqual([{ type: "set_kernel_cwd", activeSessionId: "active-1", dir: "/tmp/project" }]);
+		expect(supervisor.requests).not.toContainEqual(expect.objectContaining({ type: "set_kernel_cwd" }));
+		routed.close();
+	});
+
 	it("carries an opt-out-only telemetry policy on attach", async () => {
 		const fakeClient = new FakeDaemonClient();
 		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1", {

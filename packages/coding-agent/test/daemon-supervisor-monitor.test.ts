@@ -536,7 +536,9 @@ describe("daemon worker supervisor monitoring", () => {
 			peerAdmissionsFenced: false,
 			peerGrants: new Map([[grant.grantId, grant]]),
 			peerClaims: new Map(),
-			supervisorClaims: new Map(),
+			supervisorClaims: new Map([
+				[{} as DaemonSocketClient, { claim: { supervisorGeneration: grant.issuerGeneration } }],
+			]),
 		}) as unknown as {
 			peerGrants: Map<string, DaemonWorkerPeerGrant>;
 			peerClaims: Map<DaemonSocketClient, DaemonWorkerPeerGrant>;
@@ -591,6 +593,57 @@ describe("daemon worker supervisor monitoring", () => {
 		);
 		expect(replay.socket.end).toHaveBeenCalledOnce();
 		expect(daemon.peerClaims.has(replay)).toBe(false);
+	});
+
+	it("rejects a pending peer grant from a replaced supervisor generation", async () => {
+		const grant: DaemonWorkerPeerGrant = {
+			grantId: "grant-1",
+			token: "peer-token",
+			expiresAt: new Date(Date.now() + 10_000).toISOString(),
+			purpose: "session_client",
+			workerId: "worker-1",
+			workerInstanceId: "instance-1",
+			rootActiveSessionId: "root-1",
+			activeSessionId: "root-1",
+			issuerGeneration: "supervisor-1",
+		};
+		const peer = {
+			id: "peer",
+			authenticated: false,
+			transport: "private-framed",
+			socket: { destroyed: false, write: vi.fn(() => true), end: vi.fn() },
+			attachedActiveSessionIds: new Set(),
+			detachInput: vi.fn(),
+			supportsExtensionUi: false,
+			capabilities: new Set(),
+		} as unknown as DaemonSocketClient;
+		const daemon = Object.assign(Object.create(AgentDaemon.prototype), {
+			options: { worker: { workerId: "worker-1", workerInstanceId: "instance-1" } },
+			promptAdmissions: new Map(),
+			peerAdmissionsFenced: false,
+			peerGrants: new Map([[grant.grantId, grant]]),
+			peerClaims: new Map(),
+			supervisorClaims: new Map([[{} as DaemonSocketClient, { claim: { supervisorGeneration: "supervisor-2" } }]]),
+		}) as unknown as {
+			peerGrants: Map<string, DaemonWorkerPeerGrant>;
+			peerClaims: Map<DaemonSocketClient, DaemonWorkerPeerGrant>;
+			handleLine(client: DaemonSocketClient, line: string): Promise<void>;
+		};
+
+		await daemon.handleLine(
+			peer,
+			JSON.stringify({
+				type: "peer_auth",
+				grantId: grant.grantId,
+				token: grant.token,
+				workerInstanceId: grant.workerInstanceId,
+				purpose: grant.purpose,
+			}),
+		);
+
+		expect(peer.socket.end).toHaveBeenCalledOnce();
+		expect(daemon.peerClaims).toHaveLength(0);
+		expect(daemon.peerGrants).toHaveLength(0);
 	});
 
 	it("admits at most one pipelined delivery and holds it in the worker mutation drain", async () => {

@@ -164,6 +164,7 @@ const DIRECT_SESSION_COMMANDS: ReadonlySet<DaemonCommand["type"]> = new Set([
 	"start_side_question",
 	"abort_side_question",
 	"execute_bash",
+	"set_kernel_cwd",
 	"execute_bash_and_wait",
 	"abort_bash",
 	"cancel_rlm_child",

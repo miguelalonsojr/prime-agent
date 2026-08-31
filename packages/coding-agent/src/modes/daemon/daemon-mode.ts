@@ -3327,6 +3327,7 @@ export class AgentDaemon {
 						typeof parsed.token === "string" ? createHash("sha256").update(parsed.token).digest() : undefined;
 					const expectedTokenHash = grant ? createHash("sha256").update(grant.token).digest() : undefined;
 					const expiresAt = grant ? Date.parse(grant.expiresAt) : Number.NaN;
+					const supervisorGeneration = [...this.supervisorClaims.values()][0]?.claim.supervisorGeneration;
 					if (
 						this.peerAdmissionsFenced ||
 						!grant ||
@@ -3335,6 +3336,7 @@ export class AgentDaemon {
 						!timingSafeEqual(presentedTokenHash, expectedTokenHash) ||
 						parsed.workerInstanceId !== grant.workerInstanceId ||
 						parsed.purpose !== grant.purpose ||
+						grant.issuerGeneration !== supervisorGeneration ||
 						this.options.worker.workerId !== grant.workerId ||
 						this.options.worker.workerInstanceId !== grant.workerInstanceId ||
 						!Number.isFinite(expiresAt) ||
