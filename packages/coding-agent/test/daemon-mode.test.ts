@@ -13,7 +13,7 @@ import {
 import { createServer, type Server, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import type { Api, Model } from "@earendil-works/pi-ai";
+import { type Api, type Model, registerFauxProvider } from "@earendil-works/pi-ai";
 import { describe, expect, it, vi } from "vitest";
 import {
 	AGENT_FAMILY_REACH_ERROR,
@@ -23,8 +23,14 @@ import {
 	sessionNameReservationKey,
 } from "../src/core/agent-messages.js";
 import type { AgentObserveController } from "../src/core/agent-observe.js";
-import type { CreateAgentSessionRuntimeFactory } from "../src/core/agent-session-runtime.js";
+import {
+	type CreateAgentSessionRuntimeFactory,
+	createAgentSessionFromServices,
+	createAgentSessionServices,
+} from "../src/core/agent-session-runtime.js";
+import { AuthStorage } from "../src/core/auth-storage.js";
 import type { AgentCronJob, AgentCronJobStore } from "../src/core/cron-jobs.js";
+import { ModelRegistry } from "../src/core/model-registry.js";
 import {
 	type CreateRlmSubagentRuntimeOptions,
 	createDefaultRlmSubagentSessionName,
@@ -4981,6 +4987,103 @@ describe("daemon mode helpers", () => {
 			expect([...internals.sessions.values()]).toEqual([parentState]);
 			expect(fixture.createRuntime).toHaveBeenCalledOnce();
 		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("rehydrates a persisted child with its explicit model and thinking level", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-model-rehydration-"));
+		const faux = registerFauxProvider({
+			provider: "faux-daemon-rehydration",
+			models: [
+				{ id: "parent-model", reasoning: true },
+				{ id: "child-model", reasoning: true },
+			],
+		});
+		let fixture: ReturnType<typeof makePersistedRlmDaemonFixture> | undefined;
+		try {
+			fixture = makePersistedRlmDaemonFixture(tempDir);
+			const childManager = SessionManager.open(fixture.childSessionFile, fixture.childSessionDir);
+			childManager.appendModelChange(faux.getModel("child-model")!.provider, "child-model");
+			childManager.appendThinkingLevelChange("low");
+			childManager.flushNow();
+
+			const registryPath = join(fixture.parentArtifactDir, "rlm-subagents.jsonl");
+			const registryEntry = JSON.parse(readFileSync(registryPath, "utf8").trim()) as Record<string, unknown>;
+			registryEntry.model = { provider: faux.getModel("child-model")!.provider, modelId: "child-model" };
+			writeFileSync(registryPath, `${JSON.stringify(registryEntry)}\n`);
+
+			fixture.createRuntime.mockImplementation(async (runtimeOptions) => {
+				const authStorage = AuthStorage.inMemory();
+				authStorage.setRuntimeApiKey(faux.getModel().provider, "faux-key");
+				const modelRegistry = ModelRegistry.inMemory(authStorage);
+				modelRegistry.registerProvider(faux.getModel().provider, {
+					baseUrl: faux.getModel().baseUrl,
+					apiKey: "faux-key",
+					api: faux.api,
+					models: faux.models.map((model) => ({
+						id: model.id,
+						name: model.name,
+						api: model.api,
+						reasoning: model.reasoning,
+						input: model.input,
+						cost: model.cost,
+						contextWindow: model.contextWindow,
+						maxTokens: model.maxTokens,
+					})),
+				});
+				const services = await createAgentSessionServices({
+					cwd: runtimeOptions.cwd,
+					agentDir: runtimeOptions.agentDir,
+					authStorage,
+					modelRegistry,
+					resourceLoaderOptions: {
+						noExtensions: true,
+						noSkills: true,
+						noPromptTemplates: true,
+						noThemes: true,
+					},
+					telemetryDisabled: true,
+				});
+				return {
+					...(await createAgentSessionFromServices({
+						services,
+						sessionManager: runtimeOptions.sessionManager,
+						sessionStartEvent: runtimeOptions.sessionStartEvent,
+						model: faux.getModel("parent-model"),
+						...runtimeOptions.sessionOptions,
+						telemetryDisabled: true,
+					})),
+					services,
+					diagnostics: [],
+				};
+			});
+
+			const internals = fixture.daemon as unknown as {
+				sessions: Map<string, ActiveSessionState>;
+				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
+				findPassiveRlmSubagent(id: string): Promise<unknown>;
+				hydratePassiveRlmSubagent(passive: unknown): Promise<ActiveSessionState>;
+			};
+			await internals.createRuntime({ type: "create", sessionPath: fixture.parentSessionFile });
+			const passive = await internals.findPassiveRlmSubagent(fixture.childId);
+			if (!passive) throw new Error("Missing passive child");
+
+			const childState = await internals.hydratePassiveRlmSubagent(passive);
+
+			expect(childState.runtime.session.model).toMatchObject({
+				provider: faux.getModel("child-model")!.provider,
+				id: "child-model",
+			});
+			expect(childState.runtime.session.thinkingLevel).toBe("low");
+		} finally {
+			if (fixture) {
+				const internals = fixture.daemon as unknown as { sessions: Map<string, ActiveSessionState> };
+				for (const state of [...internals.sessions.values()].reverse()) {
+					await state.runtime.dispose().catch(() => undefined);
+				}
+			}
+			faux.unregister();
 			rmSync(tempDir, { recursive: true, force: true });
 		}
 	});

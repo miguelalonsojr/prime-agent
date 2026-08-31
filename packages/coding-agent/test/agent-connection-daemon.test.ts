@@ -1013,33 +1013,47 @@ describe("DaemonAgentConnection", () => {
 			close: () => {},
 		} as unknown as DaemonWorkerClient;
 		const routed = new DaemonRoutedClient(supervisor as unknown as DaemonTransportClient, direct);
+		const timeoutMs = 17_000;
+		const requestOptions = { onProgress: () => {} };
 
-		await routed.request({
-			type: "set_model",
-			activeSessionId: "active-1",
-			provider: "faux-eng-4649",
-			modelId: "child-model",
-		});
-		await routed.request({ type: "set_thinking_level", activeSessionId: "active-1", level: "low" });
-		await routed.request({ type: "set_scoped_models", activeSessionId: "active-1", scopedModels: [] });
+		await routed.request(
+			{
+				type: "set_model",
+				activeSessionId: "active-1",
+				provider: "faux-eng-4649",
+				modelId: "child-model",
+			},
+			timeoutMs,
+			requestOptions,
+		);
+		await routed.request(
+			{ type: "set_thinking_level", activeSessionId: "active-1", level: "low" },
+			timeoutMs,
+			requestOptions,
+		);
+		await routed.request(
+			{ type: "set_scoped_models", activeSessionId: "active-1", scopedModels: [] },
+			timeoutMs,
+			requestOptions,
+		);
 
 		expect(direct.request).toHaveBeenNthCalledWith(
 			1,
 			{ type: "set_model", activeSessionId: "active-1", provider: "faux-eng-4649", modelId: "child-model" },
-			expect.any(Number),
-			expect.any(Object),
+			timeoutMs,
+			requestOptions,
 		);
 		expect(direct.request).toHaveBeenNthCalledWith(
 			2,
 			{ type: "set_thinking_level", activeSessionId: "active-1", level: "low" },
-			expect.any(Number),
-			expect.any(Object),
+			timeoutMs,
+			requestOptions,
 		);
 		expect(direct.request).toHaveBeenNthCalledWith(
 			3,
 			{ type: "set_scoped_models", activeSessionId: "active-1", scopedModels: [] },
-			expect.any(Number),
-			expect.any(Object),
+			timeoutMs,
+			requestOptions,
 		);
 		expect(supervisor.requests).not.toContainEqual(expect.objectContaining({ type: "set_model" }));
 		expect(supervisor.requests).not.toContainEqual(expect.objectContaining({ type: "set_thinking_level" }));
@@ -1058,26 +1072,36 @@ describe("DaemonAgentConnection", () => {
 			close: () => {},
 		} as unknown as DaemonWorkerClient;
 		const routed = new DaemonRoutedClient(supervisor as unknown as DaemonTransportClient, direct);
+		const timeoutMs = 17_000;
+		const requestOptions = { onProgress: () => {} };
 
-		await routed.request({
-			type: "set_model",
-			activeSessionId: "active-1",
-			provider: "faux-eng-4649",
-			modelId: "child-model",
-		});
-		await routed.request({ type: "set_thinking_level", activeSessionId: "active-1", level: "low" });
+		await routed.request(
+			{
+				type: "set_model",
+				activeSessionId: "active-1",
+				provider: "faux-eng-4649",
+				modelId: "child-model",
+			},
+			timeoutMs,
+			requestOptions,
+		);
+		await routed.request(
+			{ type: "set_thinking_level", activeSessionId: "active-1", level: "low" },
+			timeoutMs,
+			requestOptions,
+		);
 
 		expect(supervisorRequest).toHaveBeenNthCalledWith(
 			1,
 			{ type: "set_model", activeSessionId: "active-1", provider: "faux-eng-4649", modelId: "child-model" },
-			expect.any(Number),
-			expect.any(Object),
+			timeoutMs,
+			requestOptions,
 		);
 		expect(supervisorRequest).toHaveBeenNthCalledWith(
 			2,
 			{ type: "set_thinking_level", activeSessionId: "active-1", level: "low" },
-			expect.any(Number),
-			expect.any(Object),
+			timeoutMs,
+			requestOptions,
 		);
 		expect(direct.request).not.toHaveBeenCalled();
 		routed.close();
