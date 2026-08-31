@@ -77,8 +77,8 @@ describe("daemon protocol helpers", () => {
 	it("keeps the advertised schema identity synchronized with the full protocol source", () => {
 		const source = readFileSync(resolve(__dirname, "../src/modes/daemon/daemon-protocol.ts"), "utf8");
 		const normalizedSource = source.replace(
-			/DAEMON_SCHEMA_ID = "protocol-7-schema-24-[^"]+"/,
-			'DAEMON_SCHEMA_ID = "protocol-7-schema-24-SCHEMA"',
+			/DAEMON_SCHEMA_ID = "protocol-7-schema-25-[^"]+"/,
+			'DAEMON_SCHEMA_ID = "protocol-7-schema-25-SCHEMA"',
 		);
 		const digest = createHash("sha256").update(normalizedSource).digest("hex").slice(0, 12);
 		expect(DAEMON_SCHEMA_ID).toBe(`protocol-${DAEMON_PROTOCOL_VERSION}-schema-${DAEMON_SCHEMA_REVISION}-${digest}`);
@@ -128,7 +128,7 @@ describe("daemon protocol helpers", () => {
 	it("capability-gates cached session lists while preserving legacy list behavior", () => {
 		expect(getDaemonCommandCompatibilities({ type: "list" })).toEqual([DAEMON_COMMAND_COMPATIBILITY.list]);
 		expect(getDaemonCommandCompatibilities({ type: "list", refresh: false })).toEqual([
-			{ minProtocol: 7, minSchemaRevision: 24, capability: "cached_session_list" },
+			{ minProtocol: 7, minSchemaRevision: 25, capability: "cached_session_list" },
 			DAEMON_COMMAND_COMPATIBILITY.list,
 		]);
 		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).toContain("cached_session_list");
@@ -160,8 +160,8 @@ describe("daemon protocol helpers", () => {
 		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).toContain("kernel_cwd_propagation");
 	});
 
-	it("uses composite schema revision 24 for supervisor agent-roster queries", () => {
-		expect(DAEMON_SCHEMA_REVISION).toBe(24);
+	it("preserves revision 24 for supervisor agent-roster queries at schema revision 25", () => {
+		expect(DAEMON_SCHEMA_REVISION).toBe(25);
 		expect(getDaemonCommandCompatibilities({ type: "list_agent_peers", workerToken: "worker" })).toContainEqual({
 			minProtocol: 7,
 			minSchemaRevision: 24,
