@@ -2818,6 +2818,95 @@ describe("daemon worker supervisor monitoring", () => {
 		expect(worker.summaries.get("active-root")).toBe(root);
 	});
 
+	it("adopts and reattaches a worker when process-start observation is transiently unavailable", async () => {
+		workerLaunchTestState.forceMissingProcessStartId = true;
+		const activeSessionId = "active-unknown-process-start";
+		const summary = {
+			id: activeSessionId,
+			activeSessionId,
+			lifecycle: "live",
+			activity: "idle",
+			isSessionActive: false,
+			sessionId: "session-unknown-process-start",
+			cwd: "/tmp/project",
+			isStreaming: false,
+			isCompacting: false,
+			attachedClients: 0,
+			messageCount: 0,
+			sessionActions: { queuedCount: 0, steering: [], followUps: [] },
+		} satisfies SessionSummary;
+		const attachResult = {
+			activeSessionId,
+			snapshot: { summary, messages: [] },
+		} as unknown as DaemonAttachResult;
+		const workerClient = { request: vi.fn(), requestWorker: vi.fn() };
+		const worker = {
+			descriptor: {
+				workerId: "worker-unknown-process-start",
+				workerInstanceId: "instance-unknown-process-start",
+				pid: process.pid,
+				processStartId: "persisted-process-start",
+				rootActiveSessionId: activeSessionId,
+				lifecycle: "recovering" as const,
+				consecutiveFailures: 0,
+			},
+			client: undefined as typeof workerClient | undefined,
+			summaries: new Map<string, SessionSummary>(),
+			snapshotCache: new Map<string, DaemonAttachResult>(),
+			transcriptCaches: new Map(),
+			snapshotTransferFrames: new Map(),
+			snapshotLoads: new Map(),
+			intentionalStop: false,
+			stopRevision: 0,
+		};
+		const client = {
+			id: "client-unknown-process-start",
+			capabilities: new Set<string>(),
+			supportsExtensionUi: false,
+			attachedActiveSessionIds: new Set<string>(),
+		};
+		const connectWorker = vi.fn(async (target: typeof worker) => {
+			target.client = workerClient;
+			return workerClient;
+		});
+		const subscribeWorker = vi.fn(async () => undefined);
+		const refreshWorkerSummaries = vi.fn(async (target: typeof worker) => {
+			target.summaries.set(activeSessionId, summary);
+			target.snapshotCache.set(activeSessionId, attachResult);
+		});
+		const recoverWorker = vi.fn(async () => undefined);
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			...createSupervisorSnapshotState(),
+			workers: new Map([[worker.descriptor.workerId, worker]]),
+			clients: new Set([client]),
+			assertRecoveryAllowed: vi.fn(async () => undefined),
+			connectWorker,
+			subscribeWorker,
+			refreshWorkerSummaries,
+			recoverWorker,
+			persistWorker: vi.fn(),
+			broadcastHeartbeatsChanged: vi.fn(),
+			log: vi.fn(),
+			streamReconstructor: { seed: vi.fn() },
+			syncWorkerExtensionUi: vi.fn(async () => undefined),
+		}) as {
+			adoptOrRecoverWorker(target: typeof worker): Promise<void>;
+			attachClient(
+				targetClient: typeof client,
+				command: { type: "attach"; activeSessionId: string },
+			): Promise<unknown>;
+		};
+
+		await supervisor.adoptOrRecoverWorker(worker);
+
+		expect(connectWorker).toHaveBeenCalledWith(worker, 2000);
+		expect(subscribeWorker).toHaveBeenCalledWith(worker, activeSessionId);
+		expect(recoverWorker).not.toHaveBeenCalled();
+		expect(worker.descriptor.lifecycle).toBe("ready");
+		await expect(supervisor.attachClient(client, { type: "attach", activeSessionId })).resolves.toBeDefined();
+		expect(client.attachedActiveSessionIds).toEqual(new Set([activeSessionId]));
+	});
+
 	it("adopts a tombstoned worker through identity-aware stop handling", async () => {
 		const worker = {
 			descriptor: {

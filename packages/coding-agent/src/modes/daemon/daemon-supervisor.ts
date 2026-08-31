@@ -2885,6 +2885,7 @@ export class DaemonSupervisor {
 			const observedProcessStartId = getProcessStartId(worker.descriptor.pid);
 			if (
 				worker.descriptor.processStartId !== undefined &&
+				observedProcessStartId !== undefined &&
 				observedProcessStartId !== worker.descriptor.processStartId
 			) {
 				throw new Error("Session worker process identity no longer matches its persisted descriptor");
