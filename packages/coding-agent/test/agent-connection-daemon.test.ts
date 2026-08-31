@@ -394,7 +394,9 @@ class FakeDaemonClient {
 					},
 				};
 			case "wait_for_idle":
+			case "set_model":
 			case "set_scoped_models":
+			case "set_thinking_level":
 			case "rename_saved_session":
 			case "extension_ui_response":
 			case "detach":
@@ -994,6 +996,90 @@ describe("DaemonAgentConnection", () => {
 		await expect(inFlightMutation).rejects.toBeInstanceOf(DaemonDirectTransportClosedError);
 		expect(direct.request).toHaveBeenCalledTimes(1);
 		expect(supervisor.requests).not.toContainEqual(expect.objectContaining({ type: "prompt" }));
+		routed.close();
+	});
+
+	it("preserves model and thinking payloads over the direct session transport", async () => {
+		const supervisor = new FakeDaemonClient();
+		const direct = {
+			isConnected: true,
+			onMessage: () => () => {},
+			onClose: () => () => {},
+			request: vi.fn(async (command: DaemonCommand) => ({
+				type: "response" as const,
+				command: command.type,
+				success: true as const,
+			})),
+			close: () => {},
+		} as unknown as DaemonWorkerClient;
+		const routed = new DaemonRoutedClient(supervisor as unknown as DaemonTransportClient, direct);
+
+		await routed.request({
+			type: "set_model",
+			activeSessionId: "active-1",
+			provider: "faux-eng-4649",
+			modelId: "child-model",
+		});
+		await routed.request({ type: "set_thinking_level", activeSessionId: "active-1", level: "low" });
+		await routed.request({ type: "set_scoped_models", activeSessionId: "active-1", scopedModels: [] });
+
+		expect(direct.request).toHaveBeenNthCalledWith(
+			1,
+			{ type: "set_model", activeSessionId: "active-1", provider: "faux-eng-4649", modelId: "child-model" },
+			expect.any(Number),
+			expect.any(Object),
+		);
+		expect(direct.request).toHaveBeenNthCalledWith(
+			2,
+			{ type: "set_thinking_level", activeSessionId: "active-1", level: "low" },
+			expect.any(Number),
+			expect.any(Object),
+		);
+		expect(direct.request).toHaveBeenNthCalledWith(
+			3,
+			{ type: "set_scoped_models", activeSessionId: "active-1", scopedModels: [] },
+			expect.any(Number),
+			expect.any(Object),
+		);
+		expect(supervisor.requests).not.toContainEqual(expect.objectContaining({ type: "set_model" }));
+		expect(supervisor.requests).not.toContainEqual(expect.objectContaining({ type: "set_thinking_level" }));
+		expect(supervisor.requests).not.toContainEqual(expect.objectContaining({ type: "set_scoped_models" }));
+		routed.close();
+	});
+
+	it("preserves model and thinking payloads through the supervisor without direct transport", async () => {
+		const supervisor = new FakeDaemonClient();
+		const supervisorRequest = vi.spyOn(supervisor, "request");
+		const direct = {
+			isConnected: false,
+			onMessage: () => () => {},
+			onClose: () => () => {},
+			request: vi.fn(),
+			close: () => {},
+		} as unknown as DaemonWorkerClient;
+		const routed = new DaemonRoutedClient(supervisor as unknown as DaemonTransportClient, direct);
+
+		await routed.request({
+			type: "set_model",
+			activeSessionId: "active-1",
+			provider: "faux-eng-4649",
+			modelId: "child-model",
+		});
+		await routed.request({ type: "set_thinking_level", activeSessionId: "active-1", level: "low" });
+
+		expect(supervisorRequest).toHaveBeenNthCalledWith(
+			1,
+			{ type: "set_model", activeSessionId: "active-1", provider: "faux-eng-4649", modelId: "child-model" },
+			expect.any(Number),
+			expect.any(Object),
+		);
+		expect(supervisorRequest).toHaveBeenNthCalledWith(
+			2,
+			{ type: "set_thinking_level", activeSessionId: "active-1", level: "low" },
+			expect.any(Number),
+			expect.any(Object),
+		);
+		expect(direct.request).not.toHaveBeenCalled();
 		routed.close();
 	});
 
