@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { ENV_AGENT_DIR, getCronJobsPath } from "../src/config.js";
 import { AgentCronJobStore } from "../src/core/cron-jobs.js";
 import { readActiveOrphanProcesses } from "../src/core/orphan-process-journal.js";
@@ -17,8 +17,23 @@ import { DaemonAgentConnection } from "../src/modes/agent-connection/daemon-agen
 import { DaemonClient, getDaemonSocketCloseReason } from "../src/modes/daemon/daemon-client.js";
 import type { DaemonPeerTransportTicket } from "../src/modes/daemon/daemon-protocol.js";
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
+import { DaemonSupervisor } from "../src/modes/daemon/daemon-supervisor.js";
 import { DaemonWorkerClient } from "../src/modes/daemon/daemon-worker-client.js";
 import type { DaemonWorkerDescriptor } from "../src/modes/daemon/daemon-worker-protocol.js";
+
+const processStartObserverTestState = vi.hoisted(() => ({ missingPid: undefined as number | undefined }));
+
+vi.mock("../src/core/session-lease.js", async (importOriginal) => {
+	const actual = (await importOriginal()) as Record<string, unknown> & {
+		getProcessStartId(pid: number): string | undefined;
+	};
+	return {
+		...actual,
+		getProcessStartId(pid: number): string | undefined {
+			return pid === processStartObserverTestState.missingPid ? undefined : actual.getProcessStartId(pid);
+		},
+	};
+});
 
 const cliPath = resolve(__dirname, "../src/cli.ts");
 const tsxPath = resolve(__dirname, "../../../node_modules/tsx/dist/cli.mjs");
@@ -31,6 +46,7 @@ const childDiagnostics = new WeakMap<ChildProcess, { stdout: string; stderr: str
 const PROCESS_STRESS_WORKERS = Number.parseInt(process.env.PRIME_AGENT_STRESS_WORKERS ?? "10", 10);
 
 afterEach(async () => {
+	processStartObserverTestState.missingPid = undefined;
 	for (const socketPath of daemonSockets) {
 		const client = new DaemonClient(socketPath);
 		try {
@@ -1319,6 +1335,100 @@ describe("daemon supervisor resident workers", () => {
 		},
 		30_000,
 	);
+
+	it("adopts and reattaches a live worker when its process-start observation is transiently unavailable", async () => {
+		const root = tempDir();
+		const agentDir = join(root, "agent");
+		const projectDir = join(root, "project");
+		const sessionDir = join(agentDir, "sessions");
+		const socketPath = join(
+			tmpdir(),
+			`prime-supervisor-unknown-process-start-${process.pid}-${randomUUID().slice(0, 8)}.sock`,
+		);
+		mkdirSync(projectDir, { recursive: true });
+		const sessionManager = SessionManager.create(projectDir, sessionDir);
+		sessionManager.appendMessage({ role: "user", content: "unknown process-start fixture", timestamp: 1 });
+		const sessionFile = sessionManager.getSessionFile();
+		if (!sessionFile) throw new Error("Fixture session did not persist");
+
+		const firstSupervisor = spawnSupervisor(agentDir, socketPath, projectDir);
+		const firstClient = await connectEventually(socketPath, firstSupervisor);
+		const created = await firstClient.request({
+			type: "create",
+			sessionPath: sessionFile,
+			config: { cwd: projectDir, agentDir, sessionDir, noTools: true, noExtensions: true },
+		});
+		if (!created.success) throw new Error(created.error);
+		const summary = requireSummary(created.data);
+		const activeSessionId = summary.activeSessionId ?? summary.id;
+		if (!summary.workerPid) throw new Error("Resident worker did not expose its pid");
+		workerPids.add(summary.workerPid);
+		const originalDescriptor = readWorkerDescriptor(agentDir, activeSessionId);
+		expect(originalDescriptor.processStartId).toEqual(expect.any(String));
+		expect(originalDescriptor.workerInstanceId).toEqual(expect.any(String));
+
+		firstSupervisor.kill("SIGTERM");
+		await waitForExit(firstSupervisor);
+		children.delete(firstSupervisor);
+		firstClient.close();
+
+		const replacementSupervisor = new DaemonSupervisor(socketPath, {
+			defaultSessionConfig: { cwd: projectDir, agentDir, sessionDir, noTools: true, noExtensions: true },
+		}) as unknown as {
+			start(): Promise<void>;
+			cleanupSupervisorResources(): Promise<void>;
+		};
+		// Vitest has no CLI entrypoint for the catalog child; catalog behavior is outside this adoption path.
+		Object.assign(replacementSupervisor, {
+			catalog: { start: vi.fn(async () => undefined), stop: vi.fn(async () => undefined) },
+		});
+		let replacementClient: DaemonClient | undefined;
+		try {
+			processStartObserverTestState.missingPid = summary.workerPid;
+			try {
+				await replacementSupervisor.start();
+			} finally {
+				processStartObserverTestState.missingPid = undefined;
+			}
+
+			replacementClient = await connectEventually(socketPath);
+			const listed = await replacementClient.request({ type: "list" });
+			expect(listed.success).toBe(true);
+			const adopted = requireSessionList(listed.success ? listed.data : undefined).find(
+				(candidate) => (candidate.activeSessionId ?? candidate.id) === activeSessionId,
+			);
+			expect(adopted).toMatchObject({
+				activeSessionId,
+				workerPid: summary.workerPid,
+				workerState: "ready",
+			});
+			expect(readWorkerDescriptor(agentDir, activeSessionId)).toMatchObject({
+				rootActiveSessionId: activeSessionId,
+				processStartId: originalDescriptor.processStartId,
+				workerInstanceId: originalDescriptor.workerInstanceId,
+				lifecycle: "ready",
+			});
+			await expect(replacementClient.request({ type: "attach", activeSessionId })).resolves.toMatchObject({
+				success: true,
+			});
+		} finally {
+			processStartObserverTestState.missingPid = undefined;
+			replacementClient?.close();
+			await replacementSupervisor.cleanupSupervisorResources();
+			try {
+				process.kill(-summary.workerPid, "SIGTERM");
+			} catch {
+				try {
+					process.kill(summary.workerPid, "SIGTERM");
+				} catch {
+					// Worker already exited.
+				}
+			}
+			await waitForProcessGone(summary.workerPid);
+			workerPids.delete(summary.workerPid);
+			await waitForSocketGone(socketPath);
+		}
+	}, 60_000);
 
 	it("hosts resident roots in isolated worker processes without a session cap", {
 		tags: ["process-stress"],
