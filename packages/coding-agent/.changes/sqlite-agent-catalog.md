@@ -1,1 +1,2 @@
 - Fixed Agents View startup and refresh overhead by indexing saved-session metadata and coalescing worker summary updates.
+- Fixed daemon stability under concurrent sessions by routing session traffic directly between clients and workers.
