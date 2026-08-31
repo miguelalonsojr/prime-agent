@@ -1055,6 +1055,10 @@ describe("DaemonAgentConnection", () => {
 			timeoutMs,
 			requestOptions,
 		);
+		const directRequestCalls = vi.mocked(direct.request).mock.calls;
+		expect(directRequestCalls[0]?.[2]).toBe(requestOptions);
+		expect(directRequestCalls[1]?.[2]).toBe(requestOptions);
+		expect(directRequestCalls[2]?.[2]).toBe(requestOptions);
 		expect(supervisor.requests).not.toContainEqual(expect.objectContaining({ type: "set_model" }));
 		expect(supervisor.requests).not.toContainEqual(expect.objectContaining({ type: "set_thinking_level" }));
 		expect(supervisor.requests).not.toContainEqual(expect.objectContaining({ type: "set_scoped_models" }));
@@ -1103,6 +1107,8 @@ describe("DaemonAgentConnection", () => {
 			timeoutMs,
 			requestOptions,
 		);
+		expect(supervisorRequest.mock.calls[0]?.[2]).toBe(requestOptions);
+		expect(supervisorRequest.mock.calls[1]?.[2]).toBe(requestOptions);
 		expect(direct.request).not.toHaveBeenCalled();
 		routed.close();
 	});
