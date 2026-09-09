@@ -225,7 +225,7 @@ const SCHEDULED_WAKE_CLIENT_ID = "scheduled-wake";
 const SUPERVISOR_CONFIG_FILE_NAME = "supervisor-config";
 const WORKER_STARTUP_GATE_FD = 3;
 
-const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
+export const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"ack_result",
 	"list",
 	"list_agent_peers",
@@ -292,6 +292,7 @@ const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"heartbeat_set",
 	"heartbeat_update",
 	"set_model",
+	"set_kernel_cwd",
 	"cycle_model",
 	"set_scoped_models",
 	"set_thinking_level",
@@ -3458,6 +3459,13 @@ export class DaemonSupervisor {
 				throw new Error("Session worker process is no longer running");
 			}
 			observedProcessStartId = getProcessStartId(worker.descriptor.pid);
+			if (
+				worker.descriptor.processStartId !== undefined &&
+				observedProcessStartId !== undefined &&
+				observedProcessStartId !== worker.descriptor.processStartId
+			) {
+				throw new Error("Session worker process identity no longer matches its persisted descriptor");
+			}
 			await this.connectWorker(worker, WORKER_CONNECT_TIMEOUT_MS);
 			await this.subscribeWorker(worker, worker.descriptor.rootActiveSessionId);
 			await this.refreshWorkerSummaries(worker, true);

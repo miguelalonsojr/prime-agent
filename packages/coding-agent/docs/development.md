@@ -63,6 +63,14 @@ prime-agent doctor --fix
 prime-agent shutdown
 ```
 
+## Updating the minimal upstream fork
+
+1. Preserve the current fork tip and any uncommitted work.
+2. Fetch the current `upstream/main`, then create an update branch from that exact commit.
+3. Reapply the fork as one consolidated feature commit. Retain upstream implementations when they satisfy the same contract.
+4. Verify that the feature commit's direct parent is the selected upstream commit and that the update branch contains exactly one commit.
+5. Run the focused regressions, repository checks, and isolated manual checks before integration.
+
 ## Validation
 
 After code changes, run the repository check from the root:

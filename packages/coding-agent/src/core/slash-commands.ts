@@ -120,6 +120,10 @@ const CANONICAL_BUILTIN_SLASH_COMMANDS: ReadonlyArray<BuiltinSlashCommand> = [
 	{ name: "system-prompt", description: "Show the exact system prompt sent to the model" },
 	{ name: "logs", description: "Show where daemon and client logs are saved" },
 	{
+		name: "term",
+		description: "Open an interactive shell; cd there to move the agent's working directory",
+	},
+	{
 		name: "traces",
 		description: "Preview, upload, or configure Prime Agent traces",
 		argumentHint: "[status|on|off|preview|upload|upload-current|upload-all|login]",

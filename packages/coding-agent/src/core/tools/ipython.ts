@@ -297,6 +297,7 @@ export interface IpythonToolOptions {
 	 */
 	onRestore?: (result: RestoreResult) => void;
 	onLateSentAgentMessage?: (toolCallId: string, message: KernelSentAgentMessage) => void;
+	onKernelExecutionSettled?: () => void;
 	/** Shared provisioner owning the kernel lifecycle. When provided, the remaining options are ignored. */
 	provisioner?: IpythonKernelProvisioner;
 }
@@ -319,9 +320,40 @@ export class IpythonKernelProvisioner {
 	private disposeSnapshot = true;
 
 	constructor(
-		private readonly cwd: string,
+		private cwd: string,
 		private readonly options?: Omit<IpythonToolOptions, "provisioner">,
 	) {}
+
+	setCwd(dir: string): void {
+		this.cwd = dir;
+	}
+
+	async readCwd(signal?: AbortSignal): Promise<string | null> {
+		const manager = this.startedManager ?? (await this.managerPromise?.catch(() => undefined));
+		if (!manager) return null;
+		try {
+			const result = await manager.execute('__import__("builtins").print(__import__("os").getcwd())', {
+				internal: true,
+				maxOutputChars: 4096,
+				signal,
+			});
+			if (result.status !== "ok") return null;
+			return result.stdout.trim().split("\n").pop() || null;
+		} catch {
+			return null;
+		}
+	}
+
+	async chdir(dir: string, signal?: AbortSignal): Promise<string | null> {
+		const manager = this.startedManager ?? (await this.managerPromise?.catch(() => undefined));
+		if (!manager) return null;
+		const code = `__import__("os").chdir(${JSON.stringify(dir)}); __import__("builtins").print(__import__("os").getcwd())`;
+		const result = await manager.execute(code, { internal: true, maxOutputChars: 4096, signal });
+		if (result.status !== "ok") {
+			throw new Error(result.error?.evalue ?? `could not change kernel directory to ${dir}`);
+		}
+		return result.stdout.trim().split("\n").pop() || dir;
+	}
 
 	/** The kernel manager, once a startup has completed successfully. */
 	get manager(): KernelClient | undefined {
@@ -661,6 +693,11 @@ export function createIpythonToolDefinition(
 					options?.onLateSentAgentMessage,
 					ctx,
 				);
+				try {
+					options?.onKernelExecutionSettled?.();
+				} catch {
+					// A session observer cannot replace settled tool output.
+				}
 
 				let text = r.stdout;
 				if (r.stderr) text += (text ? "\n" : "") + r.stderr;

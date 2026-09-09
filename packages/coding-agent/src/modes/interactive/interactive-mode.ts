@@ -134,6 +134,7 @@ import {
 	captureOnboardingCompleted,
 	type TelemetryOnboardingOutcome,
 } from "../../core/telemetry.js";
+import { shortenPath } from "../../core/tools/render-utils.js";
 import { type TruncationResult, truncateTail } from "../../core/tools/truncate.js";
 import { PRIME_BUTTERFLY_LOGO } from "../../themes/prime-logo.js";
 import { getChangelogPath, parseChangelog } from "../../utils/changelog.js";
@@ -264,6 +265,7 @@ import {
 import type { ClientPromptStashStore, PromptStash, PromptStashState } from "./prompt-stash-state.js";
 import { QueueSelection, type QueueSelectionItem } from "./queue-selection.js";
 import { formatResumeHint } from "./resume-hint.js";
+import { cwdPollingSupported, runShellSession } from "./shell-session.js";
 import {
 	getAvailableThemes,
 	getAvailableThemesWithPaths,
@@ -1399,7 +1401,7 @@ export class InteractiveMode {
 
 		return new CombinedAutocompleteProvider(
 			[...slashCommands, ...templateCommands, ...extensionCommands, ...skillCommandList],
-			this.getCurrentCwd(),
+			this.getDisplayCwd(),
 			this.fdPath,
 		);
 	}
@@ -2559,7 +2561,7 @@ export class InteractiveMode {
 		this.footer.setAutoCompactEnabled(
 			this.connectionState?.autoCompactionEnabled ?? this.settingsManager.getCompactionEnabled(),
 		);
-		this.footerDataProvider.setCwd(this.getCurrentCwd());
+		this.footerDataProvider.setCwd(this.getDisplayCwd());
 		this.hideThinkingBlock = this.settingsManager.getHideThinkingBlock();
 		this.ui.setShowHardwareCursor(this.settingsManager.getShowHardwareCursor());
 		this.ui.setClearOnShrink(this.settingsManager.getClearOnShrink());
@@ -2629,6 +2631,7 @@ export class InteractiveMode {
 	}
 
 	private applyConnectionStateSnapshot(state: AgentConnectionState): void {
+		const previousDisplayCwd = this.getDisplayCwd();
 		this.bindPromptStashSession(state.sessionId);
 		this.connectionState = state;
 		this.scheduleHeartbeatManagerRefresh();
@@ -2640,6 +2643,9 @@ export class InteractiveMode {
 		this.sessionRecap = state.recap;
 		this.renderRecap();
 		this.updateWorkingPulse();
+		if (this.getDisplayCwd() !== previousDisplayCwd) {
+			this.syncDisplayedCwd();
+		}
 	}
 
 	private patchConnectionState(patch: Partial<AgentConnectionState>): void {
@@ -2755,11 +2761,25 @@ export class InteractiveMode {
 			case "bash_end":
 				this.patchConnectionState({ isBashRunning: false });
 				break;
+			case "kernel_cwd_changed":
+				this.patchConnectionState({ kernelCwd: event.cwd });
+				this.syncDisplayedCwd();
+				break;
 		}
 	}
 
 	private getCurrentCwd(): string {
 		return this.connectionState?.cwd ?? this.uiServices.getInitialCwd();
+	}
+
+	private getDisplayCwd(): string {
+		return this.connectionState?.kernelCwd ?? this.getCurrentCwd();
+	}
+
+	private syncDisplayedCwd(): void {
+		this.footerDataProvider.setCwd(this.getDisplayCwd());
+		this.setupAutocompleteProvider();
+		this.ui.requestRender();
 	}
 
 	private getCurrentSessionName(): string | undefined {
@@ -4826,6 +4846,15 @@ export class InteractiveMode {
 					this.echoLocalCommand(text);
 					this.handleLogsCommand();
 					this.editor.setText("");
+					return;
+				}
+				if (commandName === "term") {
+					this.editor.setText("");
+					if (commandArgs) {
+						this.showError("Usage: /term");
+					} else {
+						await this.handleTermCommand(canonicalCommandText);
+					}
 					return;
 				}
 				if (commandName === "heartbeat") {
@@ -7453,6 +7482,61 @@ export class InteractiveMode {
 			}
 			// Force full re-render since external editor uses alternate screen
 			this.ui.requestRender(true);
+		}
+	}
+
+	private async handleTermCommand(commandText: string): Promise<void> {
+		if (process.platform === "win32") {
+			this.showWarning("/term is not supported on Windows.");
+			return;
+		}
+		if (this.hasInterruptibleWork()) {
+			this.showWarning("Wait for the current work to finish before opening a shell.");
+			return;
+		}
+		this.echoLocalCommand(commandText);
+		if (!cwdPollingSupported()) {
+			this.showWarning("The shell can open, but its working directory cannot be propagated on this platform.");
+		}
+		const displayCwd = this.getDisplayCwd();
+		let startCwd = displayCwd;
+		try {
+			if (!fs.statSync(displayCwd).isDirectory()) startCwd = this.getCurrentCwd();
+		} catch {
+			startCwd = this.getCurrentCwd();
+		}
+		const shell = this.settingsManager.getShellPath() ?? process.env.SHELL ?? "/bin/sh";
+		const ignoreSigint = () => {};
+		process.on("SIGINT", ignoreSigint);
+		let result: Awaited<ReturnType<typeof runShellSession>> | undefined;
+		try {
+			await this.ui.terminal.drainInput(1000);
+			this.ui.stop();
+			result = await runShellSession({ shell, cwd: startCwd });
+		} catch (error) {
+			this.showError(error instanceof Error ? error.message : String(error));
+		} finally {
+			process.removeListener("SIGINT", ignoreSigint);
+			this.ui.start();
+			if (this.fullscreenEnabled) this.applyFullscreen(true);
+			this.ui.requestRender(true);
+		}
+		const nextCwd = result?.lastObservedCwd;
+		if (!nextCwd || nextCwd === startCwd) return;
+		try {
+			if (!fs.statSync(nextCwd).isDirectory()) {
+				this.showWarning("The shell working directory no longer exists. Keeping the current working directory.");
+				return;
+			}
+		} catch {
+			this.showWarning("The shell working directory no longer exists. Keeping the current working directory.");
+			return;
+		}
+		try {
+			await this.agentConnection.setKernelCwd(nextCwd);
+			this.showStatus(`Working directory changed to ${shortenPath(nextCwd)}`);
+		} catch {
+			this.showWarning("The shell moved locally but could not be propagated to the agent.");
 		}
 	}
 

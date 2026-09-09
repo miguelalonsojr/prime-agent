@@ -19,7 +19,13 @@ import { syncBuiltinESMExports } from "node:module";
 import { createServer, type Server, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
-import type { Api, Model } from "@earendil-works/pi-ai";
+import {
+	type Api,
+	fauxAssistantMessage,
+	type Model,
+	registerFauxProvider,
+	type SimpleStreamOptions,
+} from "@earendil-works/pi-ai";
 import { describe, expect, it, vi } from "vitest";
 import { ENV_AGENT_DIR } from "../src/config.js";
 import {
@@ -30,7 +36,11 @@ import {
 	sessionNameReservationKey,
 } from "../src/core/agent-messages.js";
 import type { AgentObserveController } from "../src/core/agent-observe.js";
-import type { CreateAgentSessionRuntimeFactory } from "../src/core/agent-session-runtime.js";
+import {
+	type CreateAgentSessionRuntimeFactory,
+	createAgentSessionFromServices,
+	createAgentSessionServices,
+} from "../src/core/agent-session-runtime.js";
 import { installAgentTraceUpload } from "../src/core/agent-traces.js";
 import { AuthStorage } from "../src/core/auth-storage.js";
 import { type AgentCronJob, AgentCronJobStore } from "../src/core/cron-jobs.js";
@@ -5482,6 +5492,120 @@ describe("daemon mode helpers", () => {
 		}
 	});
 
+	it("rehydrates a persisted child with its explicit model and thinking level", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-rlm-model-rehydration-"));
+		const faux = registerFauxProvider({
+			models: [
+				{ id: "parent-model", reasoning: true },
+				{ id: "child-model", reasoning: true },
+			],
+		});
+		let internals:
+			| {
+					sessions: Map<string, ActiveSessionState>;
+					createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
+					findPassiveRlmSubagent(id: string): Promise<object | undefined>;
+					hydratePassiveRlmSubagent(passive: object): Promise<ActiveSessionState>;
+			  }
+			| undefined;
+		try {
+			const seenModels: string[] = [];
+			const seenReasoning: Array<SimpleStreamOptions["reasoning"]> = [];
+			faux.setResponses([
+				(_context, options: SimpleStreamOptions | undefined, _state, model) => {
+					seenModels.push(model.id);
+					seenReasoning.push(options?.reasoning);
+					return fauxAssistantMessage("rehydrated follow-up answer");
+				},
+			]);
+			const authStorage = AuthStorage.inMemory();
+			authStorage.setRuntimeApiKey(faux.getModel("parent-model")!.provider, "faux-key");
+			const fixture = makePersistedRlmDaemonFixture(tempDir, {
+				createRuntime: async (runtimeOptions) => {
+					const { agentDir, cwd, sessionManager, sessionStartEvent } = runtimeOptions;
+					const services = await createAgentSessionServices({
+						cwd,
+						agentDir,
+						authStorage,
+						resourceLoaderOptions: {
+							extensionFactories: [
+								(pi) => {
+									pi.registerProvider(faux.getModel("parent-model")!.provider, {
+										baseUrl: faux.getModel("parent-model")!.baseUrl,
+										apiKey: "faux-key",
+										api: faux.api,
+										models: faux.models.map((model) => ({
+											id: model.id,
+											name: model.name,
+											api: model.api,
+											reasoning: model.reasoning,
+											input: model.input,
+											cost: model.cost,
+											contextWindow: model.contextWindow,
+											maxTokens: model.maxTokens,
+										})),
+									});
+								},
+							],
+							noSkills: true,
+							noPromptTemplates: true,
+							noThemes: true,
+						},
+					});
+					return {
+						...(await createAgentSessionFromServices({
+							services,
+							sessionManager,
+							sessionStartEvent,
+							model: faux.getModel("parent-model"),
+							...runtimeOptions.sessionOptions,
+						})),
+						services,
+						diagnostics: services.diagnostics,
+					};
+				},
+			});
+			const childManager = SessionManager.open(fixture.childSessionFile);
+			childManager.appendModelChange(faux.getModel("child-model")!.provider, "child-model");
+			childManager.appendThinkingLevelChange("low");
+			childManager.flushNow();
+			const registryPath = join(fixture.parentArtifactDir, "rlm-subagents.jsonl");
+			const registryEntry = JSON.parse(readFileSync(registryPath, "utf8").trim()) as Record<string, unknown>;
+			registryEntry.model = {
+				provider: faux.getModel("child-model")!.provider,
+				modelId: "child-model",
+			};
+			writeFileSync(registryPath, `${JSON.stringify(registryEntry)}\n`);
+
+			internals = fixture.daemon as unknown as NonNullable<typeof internals>;
+			await internals.createRuntime({ type: "create", sessionPath: fixture.parentSessionFile });
+			const passive = await internals.findPassiveRlmSubagent(fixture.childId);
+			if (!passive) throw new Error("Missing passive child");
+			const childState = await internals.hydratePassiveRlmSubagent(passive);
+
+			expect(childState.runtime.session.model).toMatchObject({
+				provider: faux.getModel("child-model")!.provider,
+				id: "child-model",
+			});
+			expect(childState.runtime.session.thinkingLevel).toBe("low");
+			await childState.runtime.session.prompt("check the rehydrated child", {
+				expandPromptTemplates: false,
+				source: "extension",
+			});
+			await childState.runtime.session.agent.waitForIdle();
+			expect(seenModels).toEqual(["child-model"]);
+			expect(seenReasoning).toEqual(["low"]);
+			expect(childState.runtime.session.model?.id).toBe("child-model");
+			expect(childState.runtime.session.thinkingLevel).toBe("low");
+		} finally {
+			if (internals) {
+				await Promise.all([...internals.sessions.values()].map((state) => state.runtime.dispose()));
+			}
+			faux.unregister();
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
 	it("rehydrates a legacy child with depth inferred from its session file path", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-legacy-rlm-depth-"));
 		try {
@@ -9694,6 +9818,110 @@ describe("daemon mode helpers", () => {
 			}),
 		).rejects.toThrow("Unknown active session: missing");
 	});
+
+	it("dispatches kernel cwd changes through schema-28 state and event paths used by legacy clients", async () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-kernel-cwd.sock", {
+			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
+			createRuntime: async () => {
+				throw new Error("unexpected runtime creation");
+			},
+		});
+		const setKernelCwd = vi.fn(async () => {});
+		const { state } = makeAgentFamilyState("active-kernel", "Kernel");
+		const session = state.runtime.session as unknown as {
+			kernelCwd?: string;
+			setKernelCwd(dir: string): Promise<void>;
+			getAvailableThinkingLevels(): [];
+			scopedModels: [];
+			getActiveToolNames(): [];
+			getContextUsage(): undefined;
+			sessionManager: {
+				getCwd(): string;
+				getHeader(): { created: string };
+				getSessionDir(): string;
+				getLeafId(): null;
+				getEntries(): [];
+			};
+		};
+		session.kernelCwd = "/kernel/live";
+		session.setKernelCwd = setKernelCwd;
+		session.getAvailableThinkingLevels = () => [];
+		session.scopedModels = [];
+		session.getActiveToolNames = () => [];
+		session.getContextUsage = () => undefined;
+		session.sessionManager = {
+			getCwd: () => "/persisted",
+			getHeader: () => ({ created: new Date(0).toISOString() }),
+			getSessionDir: () => "/tmp",
+			getLeafId: () => null,
+			getEntries: () => [],
+		};
+		state.eventGeneration = "generation-kernel";
+		const writes: string[] = [];
+		const client = makeClient("legacy-client", state.activeSessionId);
+		client.attachedActiveSessionIds.clear();
+		client.socket = {
+			destroyed: false,
+			write: vi.fn((data: string | Uint8Array) => {
+				writes.push(String(data));
+				return true;
+			}),
+		} as unknown as Socket;
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			buildRlmChildSnapshotsWithPassiveRlmSubagents: ReturnType<typeof vi.fn>;
+			handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
+			broadcastToSession(state: ActiveSessionState, message: DaemonOutbound): void;
+		};
+		internals.sessions.set(state.activeSessionId, state);
+		internals.buildRlmChildSnapshotsWithPassiveRlmSubagents = vi.fn(async () => []);
+
+		await expect(
+			internals.handleCommand(client, {
+				id: "kernel-cwd",
+				type: "set_kernel_cwd",
+				activeSessionId: state.activeSessionId,
+				dir: "/tmp/new",
+			}),
+		).resolves.toMatchObject({ success: true, command: "set_kernel_cwd" });
+		expect(setKernelCwd).toHaveBeenCalledWith("/tmp/new");
+
+		const attachResponse = (await internals.handleCommand(client, {
+			type: "attach",
+			activeSessionId: state.activeSessionId,
+		})) as { data: DaemonAttachResult };
+		const stateResponse = (await internals.handleCommand(client, {
+			type: "get_connection_state",
+			activeSessionId: state.activeSessionId,
+		})) as { data: { cwd: string; kernelCwd?: string } };
+		const readLegacyState = (connectionState: { cwd: string }) => ({ cwd: connectionState.cwd });
+
+		expect(attachResponse.data.snapshot.state).toMatchObject({ cwd: "/persisted", kernelCwd: "/kernel/live" });
+		expect(readLegacyState(attachResponse.data.snapshot.state)).toEqual({ cwd: "/persisted" });
+		expect(readLegacyState(stateResponse.data)).toEqual({ cwd: "/persisted" });
+
+		internals.broadcastToSession(state, {
+			type: "session_event",
+			activeSessionId: state.activeSessionId,
+			event: { type: "kernel_cwd_changed", cwd: "/kernel/next" },
+		});
+		const eventOutbound = JSON.parse(writes.at(-1)?.trim() ?? "null") as {
+			type: string;
+			event?: { type: string };
+		};
+		const legacyHandleOutbound = (outbound: { type: string; event?: { type: string } }) => {
+			if (outbound.type !== "session_event" || !outbound.event) return;
+			switch (outbound.event.type) {
+				case "message_update":
+					return "handled";
+			}
+		};
+		expect(eventOutbound).toMatchObject({
+			type: "session_event",
+			event: { type: "kernel_cwd_changed", cwd: "/kernel/next" },
+		});
+		expect(legacyHandleOutbound(eventOutbound)).toBeUndefined();
+	});
 });
 
 type CronAdmissionActivity = Partial<{
@@ -9831,6 +10059,7 @@ function makePersistedRlmDaemonFixture(
 		childDisposeGate?: Promise<void>;
 		childAdmissionStarted?: () => void;
 		childAdmissionGate?: Promise<void>;
+		createRuntime?: CreateAgentSessionRuntimeFactory;
 	} = {},
 ) {
 	const sessionDir = join(tempDir, "sessions");
@@ -9923,6 +10152,7 @@ function makePersistedRlmDaemonFixture(
 	);
 	const runtimeSessions: Array<ReturnType<typeof makeRuntimeSession>> = [];
 	const createRuntime = vi.fn(async (runtimeOptions: Parameters<CreateAgentSessionRuntimeFactory>[0]) => {
+		if (options.createRuntime) return options.createRuntime(runtimeOptions);
 		const sessionFile = runtimeOptions.sessionManager.getSessionFile();
 		const isChild = sessionFile === childSessionFile;
 		const isGrandchild = sessionFile === grandchildSessionFile;

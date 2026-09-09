@@ -215,6 +215,61 @@ describe("DaemonClient", () => {
 		client.close();
 	});
 
+	it("capability-gates kernel cwd propagation against old daemon schemas", async () => {
+		const unsupportedCapability = new DaemonClient("/tmp/prime-agent.sock");
+		const unsupportedCapabilityConnect = unsupportedCapability.connect();
+		const unsupportedCapabilitySocket = netMock.sockets[0]!;
+		unsupportedCapabilitySocket.emit("connect");
+		await unsupportedCapabilityConnect;
+		emitHello(unsupportedCapabilitySocket, DAEMON_PROTOCOL_VERSION, [], 28);
+		unsupportedCapabilitySocket.writes.length = 0;
+		await expect(
+			unsupportedCapability.request({ type: "set_kernel_cwd", activeSessionId: "active-1", dir: "/tmp/new" }),
+		).rejects.toThrow("does not support kernel_cwd_propagation");
+		expect(unsupportedCapabilitySocket.writes).toEqual([]);
+		unsupportedCapability.close();
+
+		const oldSchema = new DaemonClient("/tmp/prime-agent.sock");
+		const oldSchemaConnect = oldSchema.connect();
+		const oldSchemaSocket = netMock.sockets[1]!;
+		oldSchemaSocket.emit("connect");
+		await oldSchemaConnect;
+		emitHello(oldSchemaSocket, DAEMON_PROTOCOL_VERSION, ["kernel_cwd_propagation"], 27);
+		oldSchemaSocket.writes.length = 0;
+		await expect(
+			oldSchema.request({ type: "set_kernel_cwd", activeSessionId: "active-1", dir: "/tmp/new" }),
+		).rejects.toThrow("does not support kernel_cwd_propagation");
+		expect(oldSchemaSocket.writes).toEqual([]);
+		oldSchema.close();
+
+		const current = new DaemonClient("/tmp/prime-agent.sock");
+		const currentConnect = current.connect();
+		const currentSocket = netMock.sockets[2]!;
+		currentSocket.emit("connect");
+		await currentConnect;
+		emitHello(currentSocket, DAEMON_PROTOCOL_VERSION, ["kernel_cwd_propagation"], 28);
+		currentSocket.writes.length = 0;
+		const request = current.request({ type: "set_kernel_cwd", activeSessionId: "active-1", dir: "/tmp/new" });
+		await vi.waitFor(() => expect(currentSocket.writes).toHaveLength(1));
+		expect(currentSocket.writes[0]).toContain('"type":"set_kernel_cwd"');
+		current.close();
+		await expect(request).rejects.toThrow("closed before the operation completed");
+	});
+
+	it("keeps legacy commands available when an optional capability is absent", async () => {
+		const client = new DaemonClient("/tmp/prime-agent.sock");
+		const connect = client.connect();
+		const socket = netMock.sockets[0]!;
+		socket.emit("connect");
+		await connect;
+		emitHello(socket, DAEMON_PROTOCOL_VERSION, [], 27);
+		socket.writes.length = 0;
+		const request = client.request({ type: "get_connection_state", activeSessionId: "active-1" });
+		await vi.waitFor(() => expect(socket.writes).toHaveLength(1));
+		client.close();
+		await expect(request).rejects.toThrow("closed before the operation completed");
+	});
+
 	it("does not send subagent deletion to an old daemon without the capability", async () => {
 		const client = new DaemonClient("/tmp/prime-agent.sock");
 		const connect = client.connect();

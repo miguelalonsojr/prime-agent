@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, 
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { ENV_AGENT_DIR, getCronJobsPath } from "../src/config.js";
 import { AgentCronJobStore } from "../src/core/cron-jobs.js";
 import { readActiveOrphanProcesses } from "../src/core/orphan-process-journal.js";
@@ -17,12 +17,27 @@ import { readSessionInfo, SessionManager } from "../src/core/session-manager.js"
 import { DaemonAgentConnection } from "../src/modes/agent-connection/daemon-agent-connection.js";
 import { DaemonClient, getDaemonSocketCloseReason } from "../src/modes/daemon/daemon-client.js";
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
+import { DaemonSupervisor } from "../src/modes/daemon/daemon-supervisor.js";
 import {
 	type DaemonWorkerDescriptor,
 	type DaemonWorkerFrameHeader,
 	isDaemonWorkerFrameHeader,
 } from "../src/modes/daemon/daemon-worker-protocol.js";
 import { encodePrivateFrame, PrivateFrameDecoder } from "../src/modes/session-worker/private-framing.js";
+
+const processStartIdObserver = vi.hoisted(() => ({ missingPid: undefined as number | undefined }));
+
+vi.mock("../src/core/session-lease.js", async (importOriginal) => {
+	const actual = (await importOriginal()) as Record<string, unknown> & {
+		getProcessStartId(pid: number): string | undefined;
+	};
+	return {
+		...actual,
+		getProcessStartId(pid: number): string | undefined {
+			return pid === processStartIdObserver.missingPid ? undefined : actual.getProcessStartId(pid);
+		},
+	};
+});
 
 const cliPath = resolve(__dirname, "../src/cli.ts");
 const tsxPath = resolve(__dirname, "../../../node_modules/tsx/dist/cli.mjs");
@@ -130,17 +145,22 @@ function readDaemonLogs(agentDir: string): string {
 	}
 }
 
-function readWorkerDescriptor(agentDir: string): DaemonWorkerDescriptor {
+function findWorkerDescriptor(agentDir: string): { path: string; descriptor: DaemonWorkerDescriptor } {
 	const workersRoot = join(agentDir, "daemon-workers");
 	for (const directory of readdirSync(workersRoot)) {
 		const descriptorDirectory = join(workersRoot, directory);
 		for (const name of readdirSync(descriptorDirectory)) {
 			if (name.endsWith(".json")) {
-				return JSON.parse(readFileSync(join(descriptorDirectory, name), "utf8")) as DaemonWorkerDescriptor;
+				const path = join(descriptorDirectory, name);
+				return { path, descriptor: JSON.parse(readFileSync(path, "utf8")) as DaemonWorkerDescriptor };
 			}
 		}
 	}
 	throw new Error("Worker descriptor was not persisted");
+}
+
+function readWorkerDescriptor(agentDir: string): DaemonWorkerDescriptor {
+	return findWorkerDescriptor(agentDir).descriptor;
 }
 
 function countWorkerDescriptors(agentDir: string): number {
@@ -1236,6 +1256,113 @@ describe("daemon supervisor resident workers", () => {
 		replacementClient.close();
 		await waitForSocketGone(socketPath);
 	});
+
+	it("rejects adoption when a persisted descriptor has a mismatched process-start identity", async () => {
+		const root = tempDir();
+		const agentDir = join(root, "agent");
+		const projectDir = join(root, "project");
+		const sessionDir = join(agentDir, "sessions");
+		const socketPath = join(
+			tmpdir(),
+			`prime-supervisor-adoption-mismatch-${process.pid}-${randomUUID().slice(0, 8)}.sock`,
+		);
+		mkdirSync(projectDir, { recursive: true });
+
+		const firstSupervisor = spawnSupervisor(agentDir, socketPath, projectDir);
+		const firstClient = await connectEventually(socketPath, firstSupervisor);
+		const created = await firstClient.request({
+			type: "create",
+			config: { cwd: projectDir, agentDir, sessionDir, noTools: true, noExtensions: true },
+		});
+		if (!created.success) throw new Error(created.error);
+		const summary = requireSummary(created.data);
+		if (!summary.workerPid || !summary.activeSessionId) throw new Error("Worker did not expose its process identity");
+		workerPids.add(summary.workerPid);
+
+		firstSupervisor.kill("SIGTERM");
+		await waitForExit(firstSupervisor);
+		children.delete(firstSupervisor);
+		firstClient.close();
+		const persisted = findWorkerDescriptor(agentDir);
+		if (!persisted.descriptor.processStartId)
+			throw new Error("Worker descriptor did not persist a process-start identity");
+		persisted.descriptor.processStartId = `stale-${persisted.descriptor.processStartId}`;
+		writeFileSync(persisted.path, `${JSON.stringify(persisted.descriptor, null, 2)}\n`);
+
+		const replacementSupervisor = spawnSupervisor(agentDir, socketPath, projectDir);
+		const replacementClient = await connectEventually(socketPath, replacementSupervisor);
+		await waitForCondition(
+			() => readWorkerDescriptor(agentDir).lifecycle === "failed",
+			"Mismatched worker identity was adopted",
+		);
+		expect(readWorkerDescriptor(agentDir)).toMatchObject({ lifecycle: "failed" });
+		expect(
+			await replacementClient.request({ type: "attach", activeSessionId: summary.activeSessionId }),
+		).toMatchObject({
+			success: false,
+		});
+		expect(() => process.kill(summary.workerPid!, 0)).not.toThrow();
+		replacementClient.close();
+	}, 60_000);
+
+	it("adopts and reattaches a live worker when its process-start observation is transiently unavailable", async () => {
+		const root = tempDir();
+		const agentDir = join(root, "agent");
+		const projectDir = join(root, "project");
+		const sessionDir = join(agentDir, "sessions");
+		const socketPath = join(
+			tmpdir(),
+			`prime-supervisor-adoption-unavailable-${process.pid}-${randomUUID().slice(0, 8)}.sock`,
+		);
+		mkdirSync(projectDir, { recursive: true });
+
+		const firstSupervisor = spawnSupervisor(agentDir, socketPath, projectDir);
+		const firstClient = await connectEventually(socketPath, firstSupervisor);
+		const created = await firstClient.request({
+			type: "create",
+			config: { cwd: projectDir, agentDir, sessionDir, noTools: true, noExtensions: true },
+		});
+		if (!created.success) throw new Error(created.error);
+		const summary = requireSummary(created.data);
+		if (!summary.workerPid || !summary.activeSessionId) throw new Error("Worker did not expose its process identity");
+		workerPids.add(summary.workerPid);
+		const persisted = readWorkerDescriptor(agentDir);
+		if (!persisted.processStartId) throw new Error("Worker descriptor did not persist a process-start identity");
+
+		firstSupervisor.kill("SIGTERM");
+		await waitForExit(firstSupervisor);
+		children.delete(firstSupervisor);
+		firstClient.close();
+		processStartIdObserver.missingPid = summary.workerPid;
+		const replacement = new DaemonSupervisor(socketPath, {
+			defaultSessionConfig: { cwd: projectDir, agentDir, sessionDir, noTools: true, noExtensions: true },
+		});
+		daemonSockets.add(socketPath);
+		try {
+			await replacement.start();
+		} finally {
+			processStartIdObserver.missingPid = undefined;
+		}
+		const replacementClient = await connectEventually(socketPath);
+		const listed = await replacementClient.request({ type: "list" });
+		expect(listed.success).toBe(true);
+		expect(requireSessionList(listed.success ? listed.data : undefined)).toContainEqual(
+			expect.objectContaining({
+				activeSessionId: summary.activeSessionId,
+				workerState: "ready",
+				workerPid: summary.workerPid,
+			}),
+		);
+		expect(readWorkerDescriptor(agentDir).processStartId).toBe(persisted.processStartId);
+		expect(
+			await replacementClient.request({ type: "attach", activeSessionId: summary.activeSessionId }),
+		).toMatchObject({
+			success: true,
+		});
+		replacementClient.close();
+		await Reflect.apply(Reflect.get(replacement, "cleanupSupervisorResources"), replacement, []);
+		await waitForSocketGone(socketPath);
+	}, 60_000);
 
 	it("hosts and adopts isolated worker processes", async () => {
 		const root = tempDir();

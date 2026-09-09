@@ -124,6 +124,22 @@ describe("daemon protocol helpers", () => {
 		);
 	});
 
+	it("publishes the capability-gated kernel cwd command in schema 28", () => {
+		expect(DAEMON_PROTOCOL_VERSION).toBe(7);
+		expect(DAEMON_SCHEMA_REVISION).toBe(28);
+		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).toContain("kernel_cwd_propagation");
+		expect(DAEMON_COMMAND_COMPATIBILITY.set_kernel_cwd).toEqual({
+			minProtocol: 7,
+			minSchemaRevision: 28,
+			capability: "kernel_cwd_propagation",
+		});
+		expect(DAEMON_COMMAND_PLANE.set_kernel_cwd).toBe("session");
+		expect(
+			isDaemonMutatingCommand({ type: "set_kernel_cwd", activeSessionId: "a", dir: "/tmp" } as DaemonCommand),
+		).toBe(true);
+		expect(DAEMON_OUTBOUND_COMPATIBILITY.session_event).toEqual({ minProtocol: 7 });
+	});
+
 	it("capability-gates explicit subagent deletion instead of schema-gating it", () => {
 		expect(DAEMON_COMMAND_COMPATIBILITY.delete_rlm_subagent).toEqual({
 			minProtocol: 7,

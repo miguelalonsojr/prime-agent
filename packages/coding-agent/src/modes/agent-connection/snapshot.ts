@@ -28,6 +28,7 @@ export function createAgentConnectionState(
 	return {
 		activeSessionId,
 		cwd: sessionManager.getCwd(),
+		kernelCwd: session.kernelCwd,
 		model: toConnectionModel(session.model),
 		thinkingLevel: session.thinkingLevel,
 		serviceTier: session.serviceTier,

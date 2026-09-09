@@ -462,6 +462,10 @@ export class InProcessAgentConnection implements AgentConnection {
 		return model;
 	}
 
+	async setKernelCwd(dir: string): Promise<void> {
+		await this.session.setKernelCwd(dir);
+	}
+
 	async cycleModel(
 		direction: "forward" | "backward" = "forward",
 	): Promise<AgentConnectionModelCycleResult | undefined> {

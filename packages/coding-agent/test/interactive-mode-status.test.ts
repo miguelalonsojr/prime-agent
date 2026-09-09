@@ -626,6 +626,7 @@ type SubmitHandlerHarness = {
 	patchConnectionState: (patch: Record<string, unknown>) => void;
 	requestAgentsView: () => Promise<void>;
 	handleResumeCommand: (args: string) => Promise<void>;
+	handleTermCommand: (text: string) => Promise<void>;
 	agentConnection: {
 		prompt: (message: string) => Promise<void>;
 		executeBash: (command: string, options?: { excludeFromContext?: boolean }) => Promise<void>;
@@ -646,6 +647,7 @@ function createSubmitHandlerHarness(overrides: Partial<SubmitHandlerHarness> = {
 		promptStashState: {},
 		requestAgentsView: vi.fn(async () => {}),
 		handleResumeCommand: vi.fn(async () => {}),
+		handleTermCommand: vi.fn(async () => {}),
 		promptStash: undefined,
 		pastedImages: new Map(),
 		getPromptStashImages: vi.fn(() => []),
@@ -5553,4 +5555,75 @@ test("session teardown removes a running refine loader without remounting anythi
 	expect(statusContainer.children).toHaveLength(0);
 	expect((fakeThis as unknown as { refineLoader?: unknown }).refineLoader).toBeUndefined();
 	expect((fakeThis as unknown as { syncWorkingLoader: () => void }).syncWorkingLoader).not.toHaveBeenCalled();
+});
+
+describe("InteractiveMode kernel cwd and term commands", () => {
+	test("updates displayed cwd from a kernel event and falls back for old snapshots", () => {
+		const setCwd = vi.fn();
+		const setupAutocompleteProvider = vi.fn();
+		const updateWorkingPulse = vi.fn();
+		const harness = Object.assign(Object.create(InteractiveMode.prototype), {
+			connectionState: createConnectionState(),
+			footerDataProvider: { setCwd },
+			setupAutocompleteProvider,
+			ui: { requestRender: vi.fn() },
+			updateWorkingPulse,
+		});
+		const prototype = InteractiveMode.prototype as unknown as {
+			updateConnectionStateFromEvent(this: typeof harness, event: AgentConnectionSessionEvent): void;
+			getDisplayCwd(this: { connectionState?: AgentConnectionState; getCurrentCwd(): string }): string;
+		};
+		prototype.updateConnectionStateFromEvent.call(harness, { type: "kernel_cwd_changed", cwd: "/kernel/project" });
+		expect(harness.connectionState.kernelCwd).toBe("/kernel/project");
+		expect(setCwd).toHaveBeenCalledWith("/kernel/project");
+		expect(setupAutocompleteProvider).toHaveBeenCalledOnce();
+		expect(
+			prototype.getDisplayCwd.call({
+				connectionState: createConnectionState(),
+				getCurrentCwd: () => "/session/project",
+			}),
+		).toBe("/session/project");
+	});
+
+	test("syncs the effective fallback cwd for consecutive old-daemon snapshots", () => {
+		const setCwd = vi.fn();
+		const setupAutocompleteProvider = vi.fn();
+		const harness = Object.assign(Object.create(InteractiveMode.prototype), {
+			connectionState: createConnectionState({ cwd: "/old" }),
+			getCurrentCwd() {
+				return this.connectionState.cwd;
+			},
+			bindPromptStashSession: vi.fn(),
+			scheduleHeartbeatManagerRefresh: vi.fn(),
+			footer: { setAutoCompactEnabled: vi.fn() },
+			renderRecap: vi.fn(),
+			updateWorkingPulse: vi.fn(),
+			footerDataProvider: { setCwd },
+			setupAutocompleteProvider,
+			ui: { requestRender: vi.fn() },
+		});
+		const prototype = InteractiveMode.prototype as unknown as {
+			applyConnectionStateSnapshot(this: typeof harness, state: AgentConnectionState): void;
+		};
+
+		prototype.applyConnectionStateSnapshot.call(harness, createConnectionState({ cwd: "/old" }));
+		prototype.applyConnectionStateSnapshot.call(harness, createConnectionState({ cwd: "/new" }));
+
+		expect(setCwd).toHaveBeenCalledWith("/new");
+		expect(setupAutocompleteProvider).toHaveBeenCalledOnce();
+
+		prototype.applyConnectionStateSnapshot.call(harness, createConnectionState({ cwd: "/new" }));
+		expect(setupAutocompleteProvider).toHaveBeenCalledOnce();
+	});
+
+	test("handles /term locally and rejects arguments", async () => {
+		const harness = createSubmitHandlerHarness();
+		await harness.defaultEditor.onSubmit?.("/term");
+		expect(harness.handleTermCommand).toHaveBeenCalledOnce();
+		expect(harness.agentConnection.prompt).not.toHaveBeenCalled();
+		await harness.defaultEditor.onSubmit?.("/term extra");
+		expect(harness.showError).toHaveBeenCalledWith("Usage: /term");
+		expect(harness.handleTermCommand).toHaveBeenCalledOnce();
+		expect(harness.agentConnection.prompt).not.toHaveBeenCalled();
+	});
 });

@@ -1202,6 +1202,10 @@ export class DaemonAgentConnection implements AgentConnection {
 		});
 	}
 
+	async setKernelCwd(dir: string): Promise<void> {
+		await this.requestOk({ type: "set_kernel_cwd", activeSessionId: this.activeSessionId, dir });
+	}
+
 	async cycleModel(direction?: "forward" | "backward"): Promise<AgentConnectionModelCycleResult | undefined> {
 		const result = await this.requestData<AgentConnectionModelCycleResult | null>({
 			type: "cycle_model",

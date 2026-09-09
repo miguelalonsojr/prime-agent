@@ -2,10 +2,11 @@ import { visibleWidth } from "@earendil-works/pi-tui";
 import { beforeAll, describe, expect, it } from "vitest";
 import type { ReadonlyFooterDataProvider } from "../src/core/footer-data-provider.js";
 import { FooterComponent } from "../src/modes/interactive/components/footer.js";
-import { initTheme } from "../src/modes/interactive/theme/theme.js";
+import { initTheme, preloadCodeHighlighter, preloadThemeValidator } from "../src/modes/interactive/theme/theme.js";
 
 function createFooterData(providerCount: number): ReadonlyFooterDataProvider {
 	const provider = {
+		getCwd: () => "/work/repo",
 		getGitBranch: () => "main",
 		getExtensionStatuses: () => new Map<string, string>(),
 		getAvailableProviderCount: () => providerCount,
@@ -19,8 +20,9 @@ function createFooterData(providerCount: number): ReadonlyFooterDataProvider {
 }
 
 describe("FooterComponent width handling", () => {
-	beforeAll(() => {
+	beforeAll(async () => {
 		initTheme(undefined, false);
+		await Promise.all([preloadCodeHighlighter(), preloadThemeValidator()]);
 	});
 
 	it("keeps all lines within width for narrow provider data", () => {

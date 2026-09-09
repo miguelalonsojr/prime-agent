@@ -858,7 +858,7 @@ export class ReplKernelManager {
 		const result = await this.enqueueExecute(code, opts);
 		// Refresh the on-disk snapshot after real work so a later resume (or a
 		// crash before graceful shutdown) revives the most recent namespace.
-		if (result.status === "ok") {
+		if (result.status === "ok" && !opts.internal) {
 			this.scheduleSnapshot();
 		}
 		return result;

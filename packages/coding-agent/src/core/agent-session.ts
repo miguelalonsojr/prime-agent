@@ -1,6 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import {
@@ -192,6 +192,7 @@ import {
 	type RefinementSource,
 	RLM_CHILD_FAILURE_CUSTOM_TYPE,
 	RLM_CHILD_TERMINAL_NOTICE_CUSTOM_TYPE,
+	TERM_CWD_CHANGED_CUSTOM_TYPE,
 } from "./messages.js";
 import type { ModelRegistry } from "./model-registry.js";
 import { throwIfPromptAdmissionCancelled } from "./prompt-admission.js";
@@ -417,7 +418,8 @@ export type AgentSessionEvent =
 			runId?: string;
 	  }
 	| { type: "refine_complete"; result: RefinementResult }
-	| { type: "refine_failed"; error: string };
+	| { type: "refine_failed"; error: string }
+	| { type: "kernel_cwd_changed"; cwd: string };
 
 export type AgentSessionEventListener = (event: AgentSessionEvent) => void;
 
@@ -986,6 +988,7 @@ interface RlmSubagentModelSelection {
 }
 
 const KERNEL_STATE_LISTING_TIMEOUT_MS = 5000;
+const KERNEL_CWD_PROBE_TIMEOUT_MS = 5000;
 const RLM_MAX_DEPTH_STATE_CUSTOM_TYPE = "rlm_max_depth_state";
 
 function noopRlmChildAbort(): void {}
@@ -1212,6 +1215,7 @@ export class AgentSession {
 	private _acpMcpTools: ToolDefinition[] = [];
 	private _baseToolDefinitions: Map<string, ToolDefinition> = new Map();
 	private _cwd: string;
+	private _kernelCwd?: string;
 	private _agentDir?: string;
 	private _extensionRunnerRef?: { current?: ExtensionRunner };
 	private _initialActiveToolNames?: string[];
@@ -7476,6 +7480,28 @@ export class AgentSession {
 		return this.model ? (clampThinkingLevel(this.model, level) as ThinkingLevel) : "off";
 	}
 
+	get kernelCwd(): string | undefined {
+		return this._kernelCwd;
+	}
+
+	private async _refreshKernelCwd(): Promise<void> {
+		const provisioner = this._ipythonKernelProvisioner;
+		if (!provisioner?.hasRunningKernel) return;
+		const controller = new AbortController();
+		const timer = setTimeout(() => controller.abort(), KERNEL_CWD_PROBE_TIMEOUT_MS);
+		if (typeof timer === "object" && "unref" in timer) timer.unref();
+		try {
+			const cwd = await provisioner.readCwd(controller.signal);
+			if (!cwd || cwd === this._kernelCwd) return;
+			this._kernelCwd = cwd;
+			this._emit({ type: "kernel_cwd_changed", cwd });
+		} catch {
+			// Kernel cwd observation is best effort.
+		} finally {
+			clearTimeout(timer);
+		}
+	}
+
 	private async _syncKernelStateAfterCompaction(): Promise<void> {
 		const provisioner = this._ipythonKernelProvisioner;
 		if (!provisioner?.hasRunningKernel) return;
@@ -9431,7 +9457,7 @@ export class AgentSession {
 			// build (a genuine resume). A later rebuild (/reload) restores state silently
 			// for continuity — the conversation is unchanged, so there's nothing to flag.
 			const notifyRestore = !this._ipythonRuntimeBuilt;
-			this._ipythonKernelProvisioner = new IpythonKernelProvisioner(this._cwd, {
+			this._ipythonKernelProvisioner = new IpythonKernelProvisioner(this._kernelCwd ?? this._cwd, {
 				env: this._rlmKernelEnv(),
 				commandPrefix: this.settingsManager.getShellCommandPrefix(),
 				shellPath: this.settingsManager.getShellPath(),
@@ -9449,6 +9475,9 @@ export class AgentSession {
 					shellPath: this.settingsManager.getShellPath(),
 					onLateSentAgentMessage: (toolCallId, message) =>
 						this._recordLateIpythonSentAgentMessage(toolCallId, message),
+					onKernelExecutionSettled: () => {
+						void this._refreshKernelCwd();
+					},
 				},
 			});
 		}
@@ -10743,7 +10772,7 @@ export class AgentSession {
 	}
 
 	private async _authenticatedRlmModels(): Promise<Model<Api>[]> {
-		return (await this._modelRegistry.getExecutableModels()).filter((model) => {
+		return (await this._modelRegistry.refreshAvailableModels()).filter((model) => {
 			const status = this._modelRegistry.getProviderAuthStatus(model.provider);
 			return status.source !== "stale" && status.label !== "expired";
 		});
@@ -11615,6 +11644,36 @@ export class AgentSession {
 
 	setAutoRetryEnabled(enabled: boolean): void {
 		this.settingsManager.setRetryEnabled(enabled);
+	}
+
+	async setKernelCwd(dir: string): Promise<void> {
+		const provisioner = this._ipythonKernelProvisioner;
+		if (!provisioner) throw new Error("This session has no IPython kernel");
+		const resolved = resolve(dir);
+		let isDirectory = false;
+		try {
+			isDirectory = statSync(resolved).isDirectory();
+		} catch {
+			// Report one stable validation error below.
+		}
+		if (!isDirectory) throw new Error(`Directory does not exist or is not a directory: ${resolved}`);
+
+		const applied = await provisioner.chdir(resolved);
+		const next = applied ?? resolved;
+		provisioner.setCwd(next);
+		if (next !== this._kernelCwd) {
+			this._kernelCwd = next;
+			this._emit({ type: "kernel_cwd_changed", cwd: next });
+		}
+		await this.sendCustomMessage(
+			{
+				customType: TERM_CWD_CHANGED_CUSTOM_TYPE,
+				content: `Working directory changed to ${next} by the user via /term. Your IPython kernel now runs in this directory.`,
+				display: false,
+				details: { cwd: next },
+			},
+			{ deliverAs: "nextTurn" },
+		);
 	}
 
 	/**

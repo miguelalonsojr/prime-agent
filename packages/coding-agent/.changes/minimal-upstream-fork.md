@@ -1,0 +1,3 @@
+- Added a local installer for a checkout-built Prime Agent bundle.
+- Added kernel working-directory propagation and the `/term` shell command.
+- Changed RLM model discovery to retain authenticated manually available models.

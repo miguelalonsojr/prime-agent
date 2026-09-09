@@ -11,7 +11,7 @@ import { appendRotatingLog, expandTildePath, getClientErrorLogPath, getDaemonLog
 import { ORPHAN_PROCESS_JOURNAL_ENV } from "../core/orphan-process-journal.js";
 import { getProcessStartId, SESSION_LEASE_OWNER_ID_ENV, SESSION_LEASES_ENABLED_ENV } from "../core/session-lease.js";
 import { DaemonClient, type DaemonHello } from "../modes/daemon/daemon-client.js";
-import { DAEMON_PROTOCOL_VERSION, DAEMON_SCHEMA_ID } from "../modes/daemon/daemon-protocol.js";
+import { DAEMON_PROTOCOL_VERSION, DAEMON_SCHEMA_ID, DAEMON_SCHEMA_REVISION } from "../modes/daemon/daemon-protocol.js";
 import { getDaemonRuntimeIdentity } from "../modes/daemon/daemon-runtime-identity.js";
 import { isSessionSummaryBusy, type SessionSummary } from "../modes/daemon/daemon-session-list.js";
 import { defaultDaemonSocketPath, normalizeSocketPath } from "../modes/daemon/daemon-socket.js";
@@ -67,12 +67,11 @@ type DaemonVersionProbe =
 	| { status: "stale"; hello: DaemonHello }
 	| { status: "unresponsive" };
 
-function isCurrentDaemonHello(hello: DaemonHello): boolean {
-	return (
-		hello.protocol.version === DAEMON_PROTOCOL_VERSION &&
-		hello.schemaId === DAEMON_SCHEMA_ID &&
-		hello.appVersion === VERSION
-	);
+function isReusableDaemonHello(hello: DaemonHello): boolean {
+	const hasCompatibleSchema =
+		hello.schemaId === DAEMON_SCHEMA_ID ||
+		(typeof hello.schemaRevision === "number" && hello.schemaRevision > DAEMON_SCHEMA_REVISION);
+	return hello.protocol.version === DAEMON_PROTOCOL_VERSION && hasCompatibleSchema && hello.appVersion === VERSION;
 }
 
 /** Connect to a running daemon and check whether it matches this client's protocol and app version. */
@@ -93,7 +92,7 @@ export async function probeDaemonVersion(socketPath: string, helloTimeoutMs = 20
 	}
 	try {
 		const hello = await client.waitForHello(helloTimeoutMs);
-		const current = isCurrentDaemonHello(hello);
+		const current = isReusableDaemonHello(hello);
 		if (!current) {
 			logDaemonLaunch(
 				`running daemon on ${socketPath} is stale: daemon v${hello.appVersion}/proto${hello.protocol.version}` +
@@ -330,7 +329,7 @@ async function shutdownStaleDaemonIfNotBusy(socketPath: string): Promise<StaleDa
 	}
 
 	const hello = client.hello;
-	if (hello && isCurrentDaemonHello(hello)) {
+	if (hello && isReusableDaemonHello(hello)) {
 		client.close();
 		logDaemonLaunch(`daemon on ${socketPath} finished starting while staleness was being checked; reusing it`);
 		return "current";

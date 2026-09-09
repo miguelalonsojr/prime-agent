@@ -12,7 +12,11 @@ import {
 	shutdownDaemonAndWait,
 } from "../src/cli/daemon-launch.js";
 import { ENV_AGENT_DIR, getDaemonLogPath, VERSION } from "../src/config.js";
-import { DAEMON_PROTOCOL_VERSION, DAEMON_SCHEMA_ID } from "../src/modes/daemon/daemon-protocol.js";
+import {
+	DAEMON_PROTOCOL_VERSION,
+	DAEMON_SCHEMA_ID,
+	DAEMON_SCHEMA_REVISION,
+} from "../src/modes/daemon/daemon-protocol.js";
 
 interface FakeDaemonOptions {
 	/** Sessions returned for a `list` command. */
@@ -25,6 +29,7 @@ interface FakeDaemonOptions {
 	protocolVersion?: number;
 	appVersion?: string;
 	schemaId?: string;
+	schemaRevision?: number | null;
 	firstSchemaId?: string;
 	serverCapabilities?: string[];
 	shouldSendHello?: (connectionIndex: number) => boolean;
@@ -59,6 +64,9 @@ async function startFakeDaemon(options: FakeDaemonOptions = {}): Promise<FakeDae
 					currentConnectionIndex === 0 && options.firstSchemaId
 						? options.firstSchemaId
 						: (options.schemaId ?? DAEMON_SCHEMA_ID),
+				...(options.schemaRevision === null
+					? {}
+					: { schemaRevision: options.schemaRevision ?? DAEMON_SCHEMA_REVISION }),
 				clientId: "fake-client",
 				serverCapabilities: options.serverCapabilities ?? [],
 			});
@@ -254,12 +262,44 @@ describe("ensureInteractiveDaemonRunning", () => {
 		expect(commands).not.toContain("shutdown");
 	});
 
+	it("reuses a same-app daemon with a newer compatible schema revision", async () => {
+		const commands: string[] = [];
+		const daemon = await startFakeDaemon({
+			protocolVersion: DAEMON_PROTOCOL_VERSION,
+			appVersion: VERSION,
+			schemaId: "newer-schema",
+			schemaRevision: DAEMON_SCHEMA_REVISION + 1,
+			onCommand: (command) => commands.push(command.type),
+		});
+		cleanups.push(daemon.close);
+
+		await expect(ensureInteractiveDaemonRunning(daemon.socketPath)).resolves.toBeUndefined();
+		expect(commands).toEqual([]);
+	});
+
+	it.each([
+		["same", DAEMON_SCHEMA_REVISION],
+		["older", DAEMON_SCHEMA_REVISION - 1],
+		["missing", null],
+	])("keeps a %s-revision daemon with a different schema ID stale", async (_label, schemaRevision) => {
+		const daemon = await startFakeDaemon({
+			protocolVersion: DAEMON_PROTOCOL_VERSION,
+			appVersion: VERSION,
+			schemaId: "different-schema",
+			schemaRevision,
+		});
+		cleanups.push(daemon.close);
+
+		await expect(probeDaemonVersion(daemon.socketPath)).resolves.toMatchObject({ status: "stale" });
+	});
+
 	it("does not replace a stale daemon with busy private client sessions", async () => {
 		const commands: string[] = [];
 		const daemon = await startFakeDaemon({
 			protocolVersion: DAEMON_PROTOCOL_VERSION,
 			appVersion: VERSION,
 			schemaId: "stale-schema",
+			schemaRevision: DAEMON_SCHEMA_REVISION,
 			busyClientOwnedSessionCount: 1,
 			onCommand: (command) => commands.push(command.type),
 		});

@@ -86,6 +86,7 @@ function createFakeSession(id: string, messages: AgentMessage[]): FakeSessionCon
 			buildSessionContext,
 		},
 		buildSessionContext,
+		kernelCwd: `/kernel/${id}`,
 		model: undefined,
 		thinkingLevel,
 		getAvailableThinkingLevels: () => ["minimal", "low", "medium", "high", "xhigh"],
@@ -280,6 +281,43 @@ describe("InProcessAgentConnection", () => {
 		});
 		messages.push(userMessage("later context", 2));
 		expect(snapshot.messages).toEqual([userMessage("snapshot context", 1)]);
+	});
+
+	it("exposes kernel cwd separately while preserving the persisted session cwd", async () => {
+		const session = createFakeSession("kernel-cwd", []);
+		const connection = new InProcessAgentConnection(asRuntime(new FakeRuntime(session.session)));
+
+		await expect(connection.getInitialSnapshot()).resolves.toMatchObject({
+			state: { cwd: "/tmp/kernel-cwd", kernelCwd: "/kernel/kernel-cwd" },
+		});
+		Object.assign(session.session, { kernelCwd: undefined });
+		await expect(connection.getInitialSnapshot()).resolves.toMatchObject({
+			state: { cwd: "/tmp/kernel-cwd" },
+		});
+	});
+
+	it("delegates kernel cwd changes to the session", async () => {
+		const session = createFakeSession("kernel-cwd", []);
+		const setKernelCwd = vi.fn(async () => {});
+		Object.assign(session.session, { setKernelCwd });
+		const connection = new InProcessAgentConnection(asRuntime(new FakeRuntime(session.session)));
+
+		await connection.setKernelCwd("/tmp/somewhere");
+
+		expect(setKernelCwd).toHaveBeenCalledWith("/tmp/somewhere");
+	});
+
+	it("forwards kernel cwd session events", () => {
+		const session = createFakeSession("kernel-cwd", []);
+		const connection = new InProcessAgentConnection(asRuntime(new FakeRuntime(session.session)));
+		const events: AgentConnectionEvent[] = [];
+		connection.subscribe((event) => {
+			events.push(event);
+		});
+
+		session.emit({ type: "kernel_cwd_changed", cwd: "/tmp/new" });
+
+		expect(events).toEqual([{ type: "session_event", event: { type: "kernel_cwd_changed", cwd: "/tmp/new" } }]);
 	});
 
 	it("emits replacement snapshots and rebinds events when the runtime replaces its session", async () => {

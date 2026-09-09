@@ -2,7 +2,9 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { createServer, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { getModel } from "@earendil-works/pi-ai";
 import { describe, expect, it, vi } from "vitest";
+import type { DaemonCommandBody } from "../src/modes/daemon/daemon-client.js";
 import {
 	DAEMON_PROTOCOL_INFO,
 	DAEMON_SCHEMA_REVISION,
@@ -23,20 +25,20 @@ const HELLO = {
 	serverCapabilities: ["session_input_admission", "direct_peer_transport"],
 } as const;
 
-function makeFakeEndpoint(hello: unknown = HELLO) {
-	const requests: { type: string }[] = [];
+function makeFakeEndpoint(hello: unknown = HELLO, isConnected = true) {
+	const requests: Array<{ command: DaemonCommandBody; timeoutMs: number }> = [];
 	return {
 		requests,
 		client: {
 			hello,
-			isConnected: true,
+			isConnected,
 			supportsServerCapability: (capability: string) =>
 				Array.isArray((hello as { serverCapabilities?: string[] })?.serverCapabilities) &&
 				(hello as { serverCapabilities: string[] }).serverCapabilities.includes(capability),
 			onMessage: () => () => {},
 			onClose: () => () => {},
-			request: async (command: { type: string }): Promise<DaemonResponse> => {
-				requests.push(command);
+			request: async (command: DaemonCommandBody, timeoutMs = 30_000): Promise<DaemonResponse> => {
+				requests.push({ command, timeoutMs });
 				return { type: "response", command: command.type, success: true };
 			},
 			close: () => {},
@@ -51,14 +53,72 @@ describe("DaemonRoutedClient routing", () => {
 		const routed = new DaemonRoutedClient(supervisor.client as never, direct.client as unknown as DaemonWorkerClient);
 
 		await routed.request({ type: "abort", activeSessionId: "active-1" });
-		expect(direct.requests.map((request) => request.type)).toEqual(["abort"]);
+		expect(direct.requests.map((request) => request.command.type)).toEqual(["abort"]);
 
 		// A worker "list" would mean something different; control-plane commands never go direct.
 		await routed.request({ type: "list" });
 		// The worker hello lacks session_input_admission, so prompt falls back to the supervisor.
 		await routed.request({ type: "prompt", activeSessionId: "active-1", message: "hi" });
-		expect(direct.requests.map((request) => request.type)).toEqual(["abort"]);
-		expect(supervisor.requests.map((request) => request.type)).toEqual(["list", "prompt"]);
+		expect(direct.requests.map((request) => request.command.type)).toEqual(["abort"]);
+		expect(supervisor.requests.map((request) => request.command.type)).toEqual(["list", "prompt"]);
+		routed.close();
+	});
+
+	it("preserves model, thinking, and scoped-model payloads and timeouts on the direct route", async () => {
+		const supervisor = makeFakeEndpoint();
+		const direct = makeFakeEndpoint();
+		const routed = new DaemonRoutedClient(supervisor.client as never, direct.client as unknown as DaemonWorkerClient);
+		await routed.request(
+			{ type: "set_model", activeSessionId: "active-1", provider: "test", modelId: "child-model" },
+			1_001,
+		);
+		await routed.request({ type: "set_thinking_level", activeSessionId: "active-1", level: "high" }, 1_002);
+		const scopedModel = getModel("anthropic", "claude-sonnet-4-5");
+		if (!scopedModel) throw new Error("Test model not found");
+		await routed.request(
+			{
+				type: "set_scoped_models",
+				activeSessionId: "active-1",
+				scopedModels: [{ model: scopedModel, thinkingLevel: "high" }],
+			},
+			1_003,
+		);
+		expect(direct.requests).toEqual([
+			{
+				command: { type: "set_model", activeSessionId: "active-1", provider: "test", modelId: "child-model" },
+				timeoutMs: 1_001,
+			},
+			{ command: { type: "set_thinking_level", activeSessionId: "active-1", level: "high" }, timeoutMs: 1_002 },
+			{
+				command: {
+					type: "set_scoped_models",
+					activeSessionId: "active-1",
+					scopedModels: [{ model: scopedModel, thinkingLevel: "high" }],
+				},
+				timeoutMs: 1_003,
+			},
+		]);
+		expect(supervisor.requests).toEqual([]);
+		routed.close();
+	});
+
+	it("preserves model and thinking payloads and timeouts on supervisor fallback", async () => {
+		const supervisor = makeFakeEndpoint();
+		const direct = makeFakeEndpoint(HELLO, false);
+		const routed = new DaemonRoutedClient(supervisor.client as never, direct.client as unknown as DaemonWorkerClient);
+		await routed.request(
+			{ type: "set_model", activeSessionId: "active-1", provider: "test", modelId: "child-model" },
+			2_001,
+		);
+		await routed.request({ type: "set_thinking_level", activeSessionId: "active-1", level: "high" }, 2_002);
+		expect(supervisor.requests).toEqual([
+			{
+				command: { type: "set_model", activeSessionId: "active-1", provider: "test", modelId: "child-model" },
+				timeoutMs: 2_001,
+			},
+			{ command: { type: "set_thinking_level", activeSessionId: "active-1", level: "high" }, timeoutMs: 2_002 },
+		]);
+		expect(direct.requests).toEqual([]);
 		routed.close();
 	});
 });
