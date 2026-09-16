@@ -7,12 +7,18 @@ import {
 	createDaemonReplayInfo,
 	DAEMON_COMMAND_COMPATIBILITY,
 	DAEMON_COMMAND_PLANE,
+	DAEMON_DEFAULT_CLIENT_CAPABILITIES,
 	DAEMON_DEFAULT_SERVER_CAPABILITIES,
+	DAEMON_OUTBOUND_COMPATIBILITY,
 	DAEMON_PROTOCOL_INFO,
+	DAEMON_PROTOCOL_VERSION,
+	DAEMON_SCHEMA_ID,
+	DAEMON_SCHEMA_REVISION,
 	type DaemonCommand,
 	type DaemonOutbound,
 	getDaemonCommandCompatibilities,
 	isDaemonCommandEnvelope,
+	isDaemonMutatingCommand,
 	isSessionPlaneDaemonCommand,
 	isSessionSummary,
 	salvageDaemonCommandId,
@@ -31,6 +37,7 @@ describe("daemon protocol helpers", () => {
 		["get_model_catalog", { minProtocol: 7, capability: "model_catalog" }, true],
 		["mutate_queued_message", { minProtocol: 7, minSchemaRevision: 15, capability: "queue_message_mutation" }, true],
 		["abort_and_send_queued", { minProtocol: 7, minSchemaRevision: 29, capability: "abort_and_send_queued" }, true],
+		["set_kernel_cwd", { minProtocol: 7, minSchemaRevision: 31, capability: "kernel_cwd_propagation" }, true],
 		["get_rlm_max_depth_status", { minProtocol: 7, minSchemaRevision: 11 }, undefined],
 		["set_rlm_max_depth", { minProtocol: 7, minSchemaRevision: 11 }, undefined],
 		[
@@ -66,6 +73,22 @@ describe("daemon protocol helpers", () => {
 		const capability = (expected as { capability: string }).capability;
 		if (advertised) expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).toContain(capability);
 		else expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).not.toContain(capability);
+	});
+
+	it("publishes the combined schema-31 protocol contract", () => {
+		expect(DAEMON_PROTOCOL_VERSION).toBe(7);
+		expect(DAEMON_SCHEMA_REVISION).toBe(31);
+		expect(DAEMON_SCHEMA_ID).toBe("protocol-7-schema-31-edd03ec5165c");
+		expect(DAEMON_DEFAULT_CLIENT_CAPABILITIES).toEqual(["attach_snapshot", "event_sequence"]);
+		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).toEqual(
+			expect.arrayContaining(["abort_and_send_queued", "kernel_cwd_propagation"]),
+		);
+		expect(DAEMON_COMMAND_PLANE.abort_and_send_queued).toBe("session");
+		expect(DAEMON_COMMAND_PLANE.set_kernel_cwd).toBe("session");
+		expect(
+			isDaemonMutatingCommand({ type: "set_kernel_cwd", activeSessionId: "active-1", dir: "/tmp" } as DaemonCommand),
+		).toBe(true);
+		expect(DAEMON_OUTBOUND_COMPATIBILITY.session_event).toEqual({ minProtocol: 7 });
 	});
 
 	// Field-conditional gates: the same command carries a higher floor only when an opt-in field is present.

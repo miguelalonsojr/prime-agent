@@ -1,6 +1,7 @@
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { describe, expect, it } from "vitest";
 import {
+	type CompactAssistantDelta,
 	CompactAssistantStreamReconstructor,
 	createCompactAssistantDelta,
 } from "../src/modes/daemon/compact-session-stream.js";
@@ -137,6 +138,71 @@ describe("compact daemon assistant streaming", () => {
 		});
 		expect(reconstructor.reconstruct(deltaFrame!)).toMatchObject({
 			event: { message: { content: [{ type: "text", text: "Hello" }] } },
+		});
+	});
+
+	it.each([
+		{ type: "text_start", contentIndex: 2 },
+		{ type: "thinking_start", contentIndex: 2 },
+		{ type: "toolcall_start", contentIndex: 2 },
+		{
+			type: "toolcall_end",
+			contentIndex: 2,
+			toolCall: { type: "toolCall", id: "tool-2", name: "search", arguments: {} },
+		},
+	] as const)("rejects a sparse $type index without creating a hole", (event) => {
+		const reconstructor = new CompactAssistantStreamReconstructor();
+		reconstructor.seed("active-sparse", assistant([{ type: "text", text: "seeded" }]));
+
+		expect(
+			reconstructor.reconstruct({
+				type: "assistant_stream_delta",
+				activeSessionId: "active-sparse",
+				assistantMessageEvent: event,
+				...(event.type === "toolcall_start"
+					? { contentStart: { type: "toolCall", id: "tool-2", name: "search", arguments: {} } }
+					: {}),
+			} as CompactAssistantDelta),
+		).toBeUndefined();
+		const reconstructed = reconstructor.reconstruct({
+			type: "assistant_stream_delta",
+			activeSessionId: "active-sparse",
+			assistantMessageEvent: { type: "text_end", contentIndex: 0, content: "seeded" },
+		} as CompactAssistantDelta);
+		expect(reconstructed).toMatchObject({ event: { message: { content: [{ type: "text", text: "seeded" }] } } });
+		const reconstructedEvent = (reconstructed as Extract<DaemonOutbound, { type: "session_event" }>).event;
+		if (reconstructedEvent.type !== "message_update" || reconstructedEvent.message.role !== "assistant") {
+			throw new Error("Expected an assistant message update");
+		}
+		expect(reconstructedEvent.message.content).toHaveLength(1);
+	});
+
+	it("allows compact stream index replacement and append-at-length", () => {
+		const reconstructor = new CompactAssistantStreamReconstructor();
+		reconstructor.seed("active-bounds", assistant([{ type: "text", text: "seeded" }]));
+
+		expect(
+			reconstructor.reconstruct({
+				type: "assistant_stream_delta",
+				activeSessionId: "active-bounds",
+				assistantMessageEvent: { type: "thinking_start", contentIndex: 0 },
+			} as CompactAssistantDelta),
+		).toMatchObject({ event: { message: { content: [{ type: "thinking", thinking: "" }] } } });
+		expect(
+			reconstructor.reconstruct({
+				type: "assistant_stream_delta",
+				activeSessionId: "active-bounds",
+				assistantMessageEvent: { type: "text_start", contentIndex: 1 },
+			} as CompactAssistantDelta),
+		).toMatchObject({
+			event: {
+				message: {
+					content: [
+						{ type: "thinking", thinking: "" },
+						{ type: "text", text: "" },
+					],
+				},
+			},
 		});
 	});
 

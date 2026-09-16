@@ -159,7 +159,10 @@ describe("InteractiveMode streaming events", () => {
 		const speedLine = (footer: FooterComponent) => stripAnsi(footer.render(200).join("\n"));
 		const makeSpeedThis = (enabled = true) => {
 			const fakeThis = createFakeInteractiveModeThis();
-			const footer = new FooterComponent({ getGitBranch: () => null } as ReadonlyFooterDataProvider);
+			const footer = new FooterComponent({
+				getCwd: () => "/tmp",
+				getGitBranch: () => null,
+			} as ReadonlyFooterDataProvider);
 			footer.setSpeedEnabled(enabled);
 			Object.assign(fakeThis as Record<string, unknown>, { footer, speedDisplayEnabled: enabled });
 			return { fakeThis, footer };
@@ -181,19 +184,23 @@ describe("InteractiveMode streaming events", () => {
 			await speedPrototype.handleEvent.call(fakeThis, { type: "message_end", message: second });
 			expect(speedLine(footer)).toBe("120 tok/s · avg 88.9");
 		});
-		test.each<[string, boolean, number, number, string, Record<string, unknown>]>([
+		test.each<[string, boolean, number, number, string | undefined, Record<string, unknown>]>([
 			["zero output tokens", true, 0, 2_000, "9.9 tok/s", { timestamp: 1_000 }],
 			["zero duration", true, 100, 0, "9.9 tok/s", {}],
 			["aborted message", true, 50, 2_000, "9.9 tok/s", { stopReason: "aborted", timestamp: 1_000 }],
 			["stripped usage and timestamp", true, 100, 2_000, "9.9 tok/s", { usage: undefined, timestamp: undefined }],
-			["display disabled", false, 100, 2_000, "", {}],
+			["display disabled", false, 100, 2_000, undefined, {}],
 		])("skips the sample when %s", (_label, enabled, output, durationMs, expected, overrides) => {
 			const { fakeThis, footer } = makeSpeedThis(enabled);
 			footer.setSpeedText("9.9 tok/s");
 			vi.spyOn(Date, "now").mockReturnValue(1_000 + durationMs);
 			const message = Object.assign(createAssistantMessage("partial", { ...EMPTY_USAGE, output }), overrides);
 			speedPrototype.recordSpeedSample.call(fakeThis, message);
-			expect(speedLine(footer)).toBe(expected);
+			if (expected === undefined) {
+				expect(speedLine(footer)).not.toContain("9.9 tok/s");
+			} else {
+				expect(speedLine(footer)).toBe(expected);
+			}
 		});
 	});
 });

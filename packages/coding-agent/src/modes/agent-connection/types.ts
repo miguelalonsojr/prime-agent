@@ -331,6 +331,7 @@ export interface AgentConnectionModelCycleResult {
 export interface AgentConnectionState {
 	activeSessionId?: string;
 	cwd: string;
+	kernelCwd?: string;
 	model?: AgentConnectionModel;
 	thinkingLevel: ThinkingLevel;
 	serviceTier: ServiceTier;
@@ -637,7 +638,8 @@ export type AgentConnectionSessionEvent =
 			runId?: string;
 	  }
 	| { type: "refine_complete"; result: RefinementResult }
-	| { type: "refine_failed"; error: string };
+	| { type: "refine_failed"; error: string }
+	| { type: "kernel_cwd_changed"; cwd: string };
 
 export type AgentConnectionEvent =
 	| { type: "session_event"; event: AgentConnectionSessionEvent }
@@ -769,6 +771,7 @@ export interface AgentConnection {
 	abortBash(): Promise<void>;
 
 	setModel(provider: string, modelId: string): Promise<AgentConnectionModel>;
+	setKernelCwd(dir: string): Promise<void>;
 	cycleModel(direction?: "forward" | "backward"): Promise<AgentConnectionModelCycleResult | undefined>;
 	setScopedModels(scopedModels: AgentConnectionScopedModel[]): Promise<void>;
 	setThinkingLevel(level: ThinkingLevel): Promise<void>;

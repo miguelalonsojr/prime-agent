@@ -36,6 +36,21 @@ npm ci
 
 The source runner preserves the directory from which it is invoked, so you can also call `/path/to/prime-agent/prime-agent.sh` from another project.
 
+To install the checkout's built bundle as `prime-agent`:
+
+```bash
+./scripts/install-local.sh
+prime-agent
+```
+
+The installer runs `npm run build` and writes `~/.local/bin/prime-agent`. Verify it without changing your home by using an isolated home:
+
+```bash
+HOME="$(mktemp -d)" ./scripts/install-local.sh
+```
+
+It refuses to replace an existing launcher or a directory. Use `./scripts/install-local.sh --force` only to replace an existing launcher. Ensure `~/.local/bin` is on `PATH`; the installer prints the required `export PATH=...` command when it is absent. Re-run the installer after source changes to rebuild the bundle.
+
 ## Authenticate
 
 Prime Agent can use subscription providers through `/login`, or API-key providers through environment variables or its auth file.

@@ -132,6 +132,19 @@ vi.mock("node:child_process", async (importOriginal) => {
 });
 
 import { handleDaemonCommand } from "../src/cli/daemon-command.js";
+import { DAEMON_COMMAND_TYPES as WORKER_COMMAND_TYPES } from "../src/modes/daemon/daemon-mode.js";
+import { DAEMON_COMMAND_COMPATIBILITY } from "../src/modes/daemon/daemon-protocol.js";
+import { DAEMON_COMMAND_TYPES as SUPERVISOR_COMMAND_TYPES } from "../src/modes/daemon/daemon-supervisor.js";
+
+const SUPERVISOR_ONLY_COMMANDS = new Set([
+	"complete_owned_session",
+	"get_direct_worker_transport",
+	"list_agent_peers",
+	"promote_owned_session",
+	"reattach",
+	"roster_subscribe",
+	"roster_unsubscribe",
+]);
 
 describe("daemon command", () => {
 	// Table-driven argv parsing: every row runs `daemon --socket <socket> <argv>` and pins the first
@@ -235,6 +248,21 @@ describe("daemon command", () => {
 	afterEach(() => {
 		process.exitCode = undefined;
 		vi.restoreAllMocks();
+	});
+
+	it("keeps worker and supervisor parser allowlists aligned with protocol metadata", () => {
+		const compatibilityCommands = new Set(Object.keys(DAEMON_COMMAND_COMPATIBILITY));
+		const workerCommands = new Set(WORKER_COMMAND_TYPES);
+		const supervisorCommands = new Set(SUPERVISOR_COMMAND_TYPES);
+
+		expect(supervisorCommands).toEqual(compatibilityCommands);
+		expect(workerCommands).toEqual(
+			new Set([...compatibilityCommands].filter((command) => !SUPERVISOR_ONLY_COMMANDS.has(command))),
+		);
+		expect(new Set([...supervisorCommands].filter((command) => !workerCommands.has(command)))).toEqual(
+			SUPERVISOR_ONLY_COMMANDS,
+		);
+		expect(new Set([...workerCommands].filter((command) => !supervisorCommands.has(command)))).toEqual(new Set());
 	});
 
 	it("ignores stale agent_end events before a daemon prompt starts", async () => {

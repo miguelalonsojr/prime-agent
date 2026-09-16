@@ -77,8 +77,9 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 28 publishes the last recorded model on saved-session rows.
 // Revision 29 adds the capability-gated abort_and_send_queued command.
 // Revision 30 adds structured update_restarting failure info for opens fenced by an update restart.
-export const DAEMON_SCHEMA_REVISION = 30;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-30-f908f493c9e1";
+// Revision 31 adds capability-gated kernel CWD propagation.
+export const DAEMON_SCHEMA_REVISION = 31;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-31-edd03ec5165c";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -128,7 +129,8 @@ export type DaemonServerCapability =
 	| "owned_prompt_cancellation"
 	| "acp_mcp_servers"
 	| "direct_peer_transport"
-	| "abort_and_send_queued";
+	| "abort_and_send_queued"
+	| "kernel_cwd_propagation";
 
 export type DaemonReplayStatus = "complete" | "partial" | "unavailable";
 
@@ -174,6 +176,7 @@ export const DAEMON_DEFAULT_SERVER_CAPABILITIES: readonly DaemonServerCapability
 	"session_input_pause",
 	"acp_mcp_servers",
 	"abort_and_send_queued",
+	"kernel_cwd_propagation",
 ];
 
 /** Single-use short-lived credential for one direct TUI connection to one worker process incarnation. */
@@ -626,6 +629,7 @@ export type DaemonCommand =
 	  }
 	| { id?: string; type: "heartbeat_update"; activeSessionId: string; action: AgentHeartbeatUpdateAction }
 	| { id?: string; type: "set_model"; activeSessionId: string; provider: string; modelId: string }
+	| { id?: string; type: "set_kernel_cwd"; activeSessionId: string; dir: string }
 	| { id?: string; type: "cycle_model"; activeSessionId: string; direction?: "forward" | "backward" }
 	| { id?: string; type: "set_scoped_models"; activeSessionId: string; scopedModels: AgentConnectionScopedModel[] }
 	| { id?: string; type: "set_thinking_level"; activeSessionId: string; level: ThinkingLevel }
@@ -820,6 +824,7 @@ export const DAEMON_COMMAND_COMPATIBILITY = {
 	heartbeat_set: LEGACY_DAEMON_COMMAND,
 	heartbeat_update: LEGACY_DAEMON_COMMAND,
 	set_model: LEGACY_DAEMON_COMMAND,
+	set_kernel_cwd: { minProtocol: 7, minSchemaRevision: 31, capability: "kernel_cwd_propagation" },
 	cycle_model: LEGACY_DAEMON_COMMAND,
 	set_scoped_models: LEGACY_DAEMON_COMMAND,
 	set_thinking_level: LEGACY_DAEMON_COMMAND,
@@ -939,6 +944,7 @@ export const DAEMON_COMMAND_PLANE = {
 	heartbeat_set: "control",
 	heartbeat_update: "control",
 	set_model: "session",
+	set_kernel_cwd: "session",
 	cycle_model: "session",
 	set_scoped_models: "session",
 	set_thinking_level: "session",

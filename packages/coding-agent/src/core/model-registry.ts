@@ -386,9 +386,11 @@ function readOpenAICodexAccountId(token: string): string | undefined {
  *    below intersects the registry with the discovered catalog, so a listed model the catalog omits is
  *    dropped.
  *
- * Skipping step 2 fails silently and asymmetrically: `rlm` subagent delegation and `find_models()` resolve
- * through `getExecutableModels()` and lose the model, while `/model` reads the unfiltered `getAvailable()`
- * and keeps offering it.
+ * Skipping step 2 silently removes the model from `getExecutableModels()`. Manual `rlm` subagent delegation
+ * and `find_models()` instead use `refreshAvailableModels()`, which retains authenticated manually available
+ * models without intersecting the account `/codex/models` catalog. Its normal refresh may still start public
+ * provider/default catalog requests in the background. `/model` likewise reads the unfiltered `getAvailable()`
+ * catalog.
  *
  * Catalog behaviour measured 2026-08-13; see #702.
  */

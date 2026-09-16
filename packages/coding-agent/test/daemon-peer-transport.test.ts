@@ -144,6 +144,37 @@ describe("daemon worker peer transport", () => {
 		expect(replay.endMock).toHaveBeenCalled();
 	});
 
+	it("burns a pending grant issued by a replaced supervisor generation", async () => {
+		const internals = makeWorkerDaemon();
+		const supervisor = makeSupervisor(internals);
+		internals.sessions.set("active-1", {} as ActiveSessionState);
+		expect(await registerGrant(internals, supervisor, makeGrant())).toMatchObject({ success: true });
+		internals.supervisorClaims.set(supervisor.client, {
+			claim: { supervisorGeneration: "gen-2" },
+			ownerFingerprint: "fp-2",
+		});
+
+		const peer = makeSocketClient("peer-1", false);
+		expect(await authenticatePeer(internals, peer)).toMatchObject({ success: false });
+		expect(peer.endMock).toHaveBeenCalled();
+		expect(internals.peerGrants.size).toBe(0);
+		expect(internals.peerClaims.has(peer.client)).toBe(false);
+	});
+
+	it("burns a pending grant when no current supervisor claim exists", async () => {
+		const internals = makeWorkerDaemon();
+		const supervisor = makeSupervisor(internals);
+		internals.sessions.set("active-1", {} as ActiveSessionState);
+		expect(await registerGrant(internals, supervisor, makeGrant())).toMatchObject({ success: true });
+		internals.supervisorClaims.clear();
+
+		const peer = makeSocketClient("peer-1", false);
+		expect(await authenticatePeer(internals, peer)).toMatchObject({ success: false });
+		expect(peer.endMock).toHaveBeenCalled();
+		expect(internals.peerGrants.size).toBe(0);
+		expect(internals.peerClaims.has(peer.client)).toBe(false);
+	});
+
 	it("rejects invalid grants at registration time", async () => {
 		const internals = makeWorkerDaemon();
 		const supervisor = makeSupervisor(internals);
@@ -196,7 +227,9 @@ describe("daemon worker peer transport", () => {
 
 	it("scopes an authenticated peer to the session plane of its granted session", async () => {
 		const internals = makeWorkerDaemon();
-		internals.peerGrants.set("grant-1", makeGrant());
+		const supervisor = makeSupervisor(internals);
+		internals.sessions.set("active-1", {} as ActiveSessionState);
+		expect(await registerGrant(internals, supervisor, makeGrant())).toMatchObject({ success: true });
 		const peer = makeSocketClient("peer-1", false);
 		expect(await authenticatePeer(internals, peer)).toMatchObject({ success: true });
 
