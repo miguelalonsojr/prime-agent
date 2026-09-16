@@ -76,39 +76,34 @@ describe("ENG-4649 subagent model selection", () => {
 		}
 	});
 
-	it("limits ChatGPT discovery and execution to the account model catalog", async () => {
+	it("discovers and selects manually available Codex models without requesting the account catalog", async () => {
 		const codexProvider = "openai-codex";
 		const harness = await createHarness({
 			provider: codexProvider,
-			models: [{ id: "parent-model" }, { id: "unsupported-model" }],
+			models: [{ id: "parent-model" }, { id: "child-model" }],
 		});
-		const fetchModels = vi.fn(
-			async () =>
-				new Response(JSON.stringify({ models: [{ slug: "parent-model" }] }), {
+		const fetchModels = vi.fn(async (input: string | URL | Request) => {
+			if (String(input).includes("/codex/models")) {
+				return new Response(JSON.stringify({ models: [{ slug: "parent-model" }] }), {
 					status: 200,
 					headers: { "content-type": "application/json" },
-				}),
-		);
+				});
+			}
+			throw new Error("background catalog refresh offline");
+		});
 		vi.stubGlobal("fetch", fetchModels);
 		try {
 			harness.authStorage.setRuntimeApiKey(codexProvider, openAICodexToken("account-1"));
 			const discovered = await harness.session.findRlmModels("", 20);
-			expect(discovered.models.map((model) => model.selector)).toEqual([`${codexProvider}/parent-model`]);
-			expect(fetchModels).toHaveBeenCalledWith(
-				expect.stringMatching(/\/codex\/models\?client_version=/),
-				expect.objectContaining({
-					headers: expect.objectContaining({ "chatgpt-account-id": "account-1" }),
-				}),
-			);
-
+			expect(discovered.models.map((model) => model.selector)).toContain(`${codexProvider}/child-model`);
+			harness.setResponses([fauxAssistantMessage("manual child answer")]);
 			await expect(
-				harness.session.runRlmChild("reject unsupported account model", {
-					model: `${codexProvider}/unsupported-model`,
-				}),
-			).rejects.toThrow(
-				`Requested subagent model "${codexProvider}/unsupported-model" is unavailable, unauthenticated, or expired`,
-			);
-			expect((await harness.session.listRlmSubagents()).subagents).toEqual([]);
+				harness.session.runRlmChild("manual child", { model: `${codexProvider}/child-model` }),
+			).resolves.toMatchObject({ model: `${codexProvider}/child-model` });
+			await harness.session.waitForRlmQuiescence();
+			expect((await harness.session.listRlmSubagents()).subagents[0]?.status).toBe("completed");
+			const codexCatalogCalls = fetchModels.mock.calls.filter((call) => String(call[0]).includes("/codex/models"));
+			expect(codexCatalogCalls).toHaveLength(0);
 		} finally {
 			vi.unstubAllGlobals();
 			harness.cleanup();
@@ -144,64 +139,34 @@ describe("ENG-4649 subagent model selection", () => {
 		}
 	});
 
-	it("does not reuse an expired ChatGPT model catalog after a refresh failure", async () => {
+	it("keeps an exact parent selector without requesting the account catalog", async () => {
 		const codexProvider = "openai-codex";
 		const harness = await createHarness({ provider: codexProvider, models: [{ id: "parent-model" }] });
-		const codexCatalogCalls = vi
-			.fn()
-			.mockResolvedValueOnce(
-				new Response(JSON.stringify({ models: [{ slug: "parent-model" }] }), {
+		const fetchModels = vi.fn(async (input: string | URL | Request) => {
+			if (String(input).includes("/codex/models")) {
+				return new Response(JSON.stringify({ models: [{ slug: "parent-model" }] }), {
 					status: 200,
 					headers: { "content-type": "application/json" },
-				}),
-			)
-			.mockRejectedValueOnce(new Error("offline"));
-		const fetchModels = vi.fn((input: string | URL | Request) => {
-			const url = String(input);
-			// Catalog refreshes (provider catalog, default-model pointer) run in the
-			// background; reject them so the codex discovery under test is the only
-			// source of codex models.
-			if (url.includes("prime-agent-catalog/main/")) {
-				return Promise.reject(new Error("catalog refresh offline"));
+				});
 			}
-			return codexCatalogCalls();
+			throw new Error("background catalog refresh offline");
 		});
 		vi.stubGlobal("fetch", fetchModels);
-		let now = Date.now();
-		const dateNow = vi.spyOn(Date, "now").mockImplementation(() => now);
 		try {
 			harness.authStorage.setRuntimeApiKey(codexProvider, openAICodexToken("account-1"));
 			await expect(harness.session.findRlmModels("parent", 8)).resolves.toMatchObject({
 				models: [{ selector: `${codexProvider}/parent-model` }],
 			});
-
-			now += 300_001;
-			await expect(harness.session.findRlmModels("parent", 8)).resolves.toEqual({ models: [] });
-			expect(codexCatalogCalls).toHaveBeenCalledTimes(2);
-		} finally {
-			dateNow.mockRestore();
-			vi.unstubAllGlobals();
-			harness.cleanup();
-		}
-	});
-
-	it("does not warn when an unavailable selector is already the parent model", async () => {
-		const codexProvider = "openai-codex";
-		const harness = await createHarness({ provider: codexProvider, models: [{ id: "parent-model" }] });
-		const fetchModels = vi.fn().mockRejectedValue(new Error("offline"));
-		vi.stubGlobal("fetch", fetchModels);
-		try {
-			harness.authStorage.setRuntimeApiKey(codexProvider, openAICodexToken("account-1"));
-			await expect(harness.session.findRlmModels("parent", 8)).resolves.toEqual({ models: [] });
+			const codexCatalogCalls = fetchModels.mock.calls.filter((call) => String(call[0]).includes("/codex/models"));
+			expect(codexCatalogCalls).toHaveLength(0);
 			harness.setResponses([fauxAssistantMessage("same parent answer")]);
 
 			const result = await harness.session.runRlmChild("keep the parent model", {
 				model: `${codexProvider}/parent-model`,
 			});
 			expect(result.model).toBe(`${codexProvider}/parent-model`);
-			await vi.waitFor(async () => {
-				expect((await harness.session.listRlmSubagents()).subagents[0]?.status).toBe("completed");
-			});
+			await harness.session.waitForRlmQuiescence();
+			expect((await harness.session.listRlmSubagents()).subagents[0]?.status).toBe("completed");
 		} finally {
 			vi.unstubAllGlobals();
 			harness.cleanup();
@@ -211,11 +176,30 @@ describe("ENG-4649 subagent model selection", () => {
 	it("resolves the parent model as its own short form when the catalog lacks it", async () => {
 		const codexProvider = "openai-codex";
 		const harness = await createHarness({ provider: codexProvider, models: [{ id: "parent-model" }] });
-		const fetchModels = vi.fn().mockRejectedValue(new Error("offline"));
+		const fetchModels = vi.fn(async (input: string | URL | Request) => {
+			if (String(input).includes("/codex/models")) {
+				return new Response(JSON.stringify({ models: [{ slug: "parent-model" }] }), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				});
+			}
+			throw new Error("background catalog refresh offline");
+		});
 		vi.stubGlobal("fetch", fetchModels);
 		try {
 			harness.authStorage.setRuntimeApiKey(codexProvider, openAICodexToken("account-1"));
-			await expect(harness.session.findRlmModels("parent", 8)).resolves.toEqual({ models: [] });
+			await expect(harness.session.findRlmModels("parent", 8)).resolves.toEqual({
+				models: [
+					{
+						provider: codexProvider,
+						id: "parent-model",
+						name: "parent-model",
+						selector: `${codexProvider}/parent-model`,
+					},
+				],
+			});
+			const codexCatalogCalls = fetchModels.mock.calls.filter((call) => String(call[0]).includes("/codex/models"));
+			expect(codexCatalogCalls).toHaveLength(0);
 			harness.setResponses([fauxAssistantMessage("short form parent answer")]);
 
 			const result = await harness.session.runRlmChild("keep the parent model by short form", {

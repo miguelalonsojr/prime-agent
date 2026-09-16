@@ -1,5 +1,6 @@
 import { type Component, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { ReadonlyFooterDataProvider } from "../../../core/footer-data-provider.js";
+import { shortenPath } from "../../../core/tools/render-utils.js";
 import { theme } from "../theme/theme.js";
 
 /**
@@ -53,10 +54,14 @@ export class FooterComponent implements Component {
 	}
 
 	render(width: number): string[] {
-		if (!this.speedEnabled || !this.speedText) {
-			return [];
+		if (this.speedEnabled && this.speedText) {
+			const text =
+				visibleWidth(this.speedText) > width ? truncateToWidth(this.speedText, width, "") : this.speedText;
+			return [theme.fg("dim", text)];
 		}
-		const text = visibleWidth(this.speedText) > width ? truncateToWidth(this.speedText, width, "") : this.speedText;
-		return [theme.fg("dim", text)];
+		const branch = this.footerData.getGitBranch();
+		const path = shortenPath(this.footerData.getCwd());
+		const line = branch ? `${path} (${branch})` : path;
+		return [truncateToWidth(theme.fg("dim", ` ${line}`), width)];
 	}
 }

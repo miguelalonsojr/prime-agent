@@ -3733,6 +3733,13 @@ export class DaemonSupervisor {
 				throw new Error("Session worker process is no longer running");
 			}
 			observedProcessStartId = getProcessStartId(worker.descriptor.pid);
+			if (
+				worker.descriptor.processStartId !== undefined &&
+				observedProcessStartId !== undefined &&
+				observedProcessStartId !== worker.descriptor.processStartId
+			) {
+				throw new Error("Session worker process identity no longer matches its persisted descriptor");
+			}
 			await this.connectWorker(worker, WORKER_CONNECT_TIMEOUT_MS);
 			await this.subscribeWorker(worker, worker.descriptor.rootActiveSessionId);
 			await this.refreshWorkerSummaries(worker, true);

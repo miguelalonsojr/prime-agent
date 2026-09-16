@@ -3705,6 +3705,7 @@ export class AgentDaemon {
 					// Single use: the grant is burned before its token is checked.
 					const grant = typeof parsed.grantId === "string" ? this.peerGrants.get(parsed.grantId) : undefined;
 					if (typeof parsed.grantId === "string") this.peerGrants.delete(parsed.grantId);
+					const supervisorGeneration = [...this.supervisorClaims.values()][0]?.claim.supervisorGeneration;
 					const presentedTokenHash =
 						typeof parsed.token === "string" ? createHash("sha256").update(parsed.token).digest() : undefined;
 					const expectedTokenHash = grant ? createHash("sha256").update(grant.token).digest() : undefined;
@@ -3712,6 +3713,8 @@ export class AgentDaemon {
 					if (
 						this.peerAdmissionsFenced ||
 						!grant ||
+						!supervisorGeneration ||
+						grant.issuerGeneration !== supervisorGeneration ||
 						!presentedTokenHash ||
 						!expectedTokenHash ||
 						!timingSafeEqual(presentedTokenHash, expectedTokenHash) ||
@@ -5154,6 +5157,12 @@ export class AgentDaemon {
 				const state = this.getSessionState(command.activeSessionId);
 				state.runtime.session.setServiceTier(command.serviceTier);
 				return success(command.id, "set_service_tier");
+			}
+
+			case "set_kernel_cwd": {
+				const state = this.getSessionState(command.activeSessionId);
+				await state.runtime.session.setKernelCwd(command.dir);
+				return success(command.id, "set_kernel_cwd");
 			}
 
 			case "cycle_thinking_level": {

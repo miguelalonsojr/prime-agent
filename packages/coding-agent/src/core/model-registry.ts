@@ -384,9 +384,10 @@ function readOpenAICodexAccountId(token: string): string | undefined {
  * Codex CLI release whose catalog includes that model: `getExecutableModels()` below intersects the
  * registry with the discovered catalog, so a catalog model the backend omits is dropped.
  *
- * A stale constant fails silently and asymmetrically: `rlm` subagent delegation and `find_models()`
- * resolve through `getExecutableModels()` and lose the model, while `/model` reads the unfiltered
- * `getAvailable()` and keeps offering it.
+ * A stale constant silently drops a catalog model from `getExecutableModels()`. Manual `rlm` subagent
+ * delegation and `find_models()` use `refreshAvailableModels()` instead, which retains authenticated manually
+ * available models without intersecting the account `/codex/models` catalog. Its normal refresh can still
+ * start public provider/default catalog requests in the background. `/model` reads the unfiltered `getAvailable()`.
  *
  * Catalog behaviour measured 2026-08-13 (#702: 0.153.x lists GPT-6 Astra) and 2026-09-24 (#2544: 0.155.x
  * and up also lists GPT-6 Sol and Luna); the constant tracks the current stable Codex CLI release.

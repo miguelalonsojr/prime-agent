@@ -6,6 +6,7 @@ import type { AgentSessionRuntime } from "../src/core/agent-session-runtime.js";
 import { AuthStorage } from "../src/core/auth-storage.js";
 import { emptyGoalState } from "../src/core/goals.js";
 import type { ModelRegistry } from "../src/core/model-registry.js";
+import { SettingsManager } from "../src/core/settings-manager.js";
 import { InProcessAgentConnection } from "../src/modes/agent-connection/in-process-agent-connection.js";
 import type {
 	AgentConnectionExtensionUiRequest,
@@ -13,6 +14,7 @@ import type {
 	AgentConnectionModel,
 	AgentConnectionModelCatalog,
 	AgentConnectionSessionContext,
+	AgentConnectionSessionEvent,
 	AgentConnectionSnapshot,
 	AgentConnectionState,
 } from "../src/modes/agent-connection/types.js";
@@ -1362,5 +1364,102 @@ describe("InteractiveMode Fast mode concurrency", () => {
 			expect(context.patchConnectionState).not.toHaveBeenCalled();
 			expect(context.showError).toHaveBeenCalledOnce();
 		}
+	});
+});
+
+describe("InteractiveMode kernel cwd", () => {
+	test("updates displayed cwd from a kernel event and falls back for old snapshots", () => {
+		const setCwd = vi.fn();
+		const setupAutocompleteProvider = vi.fn();
+		const updateWorkingPulse = vi.fn();
+		const harness = Object.assign(Object.create(InteractiveMode.prototype), {
+			connectionState: createConnectionState(),
+			footerDataProvider: { setCwd },
+			setupAutocompleteProvider,
+			ui: { requestRender: vi.fn() },
+			updateWorkingPulse,
+		});
+		const prototype = InteractiveMode.prototype as unknown as {
+			updateConnectionStateFromEvent(this: typeof harness, event: AgentConnectionSessionEvent): void;
+			getDisplayCwd(this: { connectionState?: AgentConnectionState; getCurrentCwd(): string }): string;
+		};
+		prototype.updateConnectionStateFromEvent.call(harness, { type: "kernel_cwd_changed", cwd: "/kernel/project" });
+		expect(harness.connectionState.kernelCwd).toBe("/kernel/project");
+		expect(setCwd).toHaveBeenCalledWith("/kernel/project");
+		expect(setupAutocompleteProvider).toHaveBeenCalledOnce();
+		expect(
+			prototype.getDisplayCwd.call({
+				connectionState: createConnectionState(),
+				getCurrentCwd: () => "/session/project",
+			}),
+		).toBe("/session/project");
+	});
+
+	test("syncs the effective fallback cwd for consecutive old-daemon snapshots", () => {
+		const setCwd = vi.fn();
+		const setupAutocompleteProvider = vi.fn();
+		const harness = Object.assign(Object.create(InteractiveMode.prototype), {
+			connectionState: createConnectionState({ cwd: "/old" }),
+			getCurrentCwd() {
+				return this.connectionState.cwd;
+			},
+			bindPromptStashSession: vi.fn(),
+			scheduleHeartbeatManagerRefresh: vi.fn(),
+			footer: { setAutoCompactEnabled: vi.fn() },
+			renderRecap: vi.fn(),
+			updateWorkingPulse: vi.fn(),
+			footerDataProvider: { setCwd },
+			setupAutocompleteProvider,
+			ui: { requestRender: vi.fn() },
+		});
+		const prototype = InteractiveMode.prototype as unknown as {
+			applyConnectionStateSnapshot(this: typeof harness, state: AgentConnectionState): void;
+		};
+
+		prototype.applyConnectionStateSnapshot.call(harness, createConnectionState({ cwd: "/old" }));
+		prototype.applyConnectionStateSnapshot.call(harness, createConnectionState({ cwd: "/new" }));
+
+		expect(setCwd).toHaveBeenCalledWith("/new");
+		expect(setupAutocompleteProvider).toHaveBeenCalledOnce();
+
+		prototype.applyConnectionStateSnapshot.call(harness, createConnectionState({ cwd: "/new" }));
+		expect(setupAutocompleteProvider).toHaveBeenCalledOnce();
+	});
+
+	test("routes /term locally and rejects arguments", async () => {
+		const handleTermCommand = vi.fn(async () => {});
+		const showError = vi.fn();
+		const harness = Object.assign(Object.create(InteractiveMode.prototype), {
+			defaultEditor: { onSubmit: undefined as ((text: string) => Promise<void>) | undefined },
+			editor: { getText: () => "", setText: vi.fn() },
+			uiServices: { settingsManager: SettingsManager.inMemory() },
+			submittedInputBehavior: "steer",
+			queueSelection: undefined,
+			pendingQueueEdit: undefined,
+			inputSubmissionGeneration: 0,
+			inputSubmissionsPending: 0,
+			promptStashState: {},
+			promptStashSessionId: "session-1",
+			promptStash: undefined,
+			pendingSubmittedPromptStash: undefined,
+			latestEditorPromptStash: undefined,
+			pendingPromptStashReleases: [],
+			connectionCommands: [],
+			sideQuestionComponent: undefined,
+			clearShortcutGuide: vi.fn(),
+			handleTermCommand,
+			showError,
+		});
+		(
+			InteractiveMode.prototype as unknown as {
+				setupEditorSubmitHandler(this: typeof harness): void;
+			}
+		).setupEditorSubmitHandler.call(harness);
+
+		await harness.defaultEditor.onSubmit?.("/term");
+		await harness.defaultEditor.onSubmit?.("/term extra");
+
+		expect(handleTermCommand).toHaveBeenCalledOnce();
+		expect(showError).toHaveBeenCalledWith("Usage: /term");
 	});
 });

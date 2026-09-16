@@ -133,6 +133,8 @@ class FakeDaemonClient {
 				options.onResponse?.(response);
 				return response;
 			}
+			case "set_kernel_cwd":
+				return { type: "response", command: command.type, success: true };
 			case "get_queue":
 				return {
 					type: "response",
@@ -4135,6 +4137,37 @@ describe("DaemonAgentConnection deferred session events", () => {
 		} finally {
 			await connection.dispose();
 		}
+	});
+
+	it("sends kernel cwd changes through the capability-gated daemon command", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("kernel_cwd_propagation");
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-original");
+
+		await connection.setKernelCwd("/tmp/elsewhere");
+
+		expect(fakeClient.requests).toContainEqual({
+			type: "set_kernel_cwd",
+			activeSessionId: "active-original",
+			dir: "/tmp/elsewhere",
+		});
+	});
+
+	it("preserves kernel cwd when converting daemon snapshots", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.attachResultFactory = (command) =>
+			createAttachResult(command.activeSessionId, command.clientId, command.capabilities, 12, {
+				state: {
+					...createConnectionState(command.activeSessionId, "session-kernel"),
+					kernelCwd: "/kernel/current",
+				},
+			});
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+
+		await connection.attach();
+		await expect(connection.getInitialSnapshot()).resolves.toMatchObject({
+			state: { cwd: "/tmp/project", kernelCwd: "/kernel/current" },
+		});
 	});
 
 	it("sends abort_and_send_queued only behind the advertised daemon capability", async () => {
