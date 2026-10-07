@@ -1,4 +1,5 @@
-import { mkdtemp, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import fileSystem, { mkdtemp, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Api, Model } from "@earendil-works/pi-ai";
@@ -47,6 +48,45 @@ async function fixture(messages: AuditMessage[] = [user("obsolete"), user("curre
 }
 
 describe("CLM live context", () => {
+	it.each([false, true])(
+		"reports durable acceptance after mirror publication failure (persistent=%s)",
+		async (persistent) => {
+			const f = await fixture();
+			await f.prepare();
+			await f.change((text) => text.replace("obsolete", "summary"));
+			let committed = false;
+			let failures = 0;
+			const unsubscribe = f.manager.onPersist(() => {
+				committed = true;
+			});
+			const originalRename = fileSystem.rename;
+			const fault = vi.spyOn(fileSystem, "rename").mockImplementation(async (source, destination) => {
+				if (committed && destination === f.path && (++failures === 1 || persistent))
+					throw new Error("injected mirror publication failure");
+				return originalRename(source, destination);
+			});
+			syncBuiltinESMExports();
+			try {
+				if (persistent) {
+					await expect(f.settle()).rejects.toThrow(/revision 1.*accepted.*mirror.*repair/i);
+					await expect(f.project()).rejects.toThrow(/revision 1.*accepted.*mirror.*repair/i);
+				} else {
+					expect((await f.settle())?.revision).toBe(1);
+					expect(JSON.stringify(await f.project())).toContain("summary");
+				}
+				expect(f.controller.getClmStatus().revision).toBe(1);
+				const durable = SessionManager.open(f.manager.getSessionFile()!).getClmBranchState();
+				expect(durable.revision).toBe(1);
+				expect(JSON.stringify(durable.snapshot)).toContain("summary");
+				expect((await readdir(join(f.dir, "clm"))).filter((name) => name.includes(".rejected-"))).toEqual([]);
+			} finally {
+				fault.mockRestore();
+				syncBuiltinESMExports();
+				unsubscribe();
+			}
+		},
+	);
+
 	it("estimates an unknown model window without a hard gate", async () => {
 		const f = await fixture();
 		const unknown = { ...model };

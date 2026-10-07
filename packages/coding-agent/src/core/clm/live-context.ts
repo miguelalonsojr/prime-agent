@@ -117,9 +117,10 @@ export class LiveContextController {
 				this.conflict = "CLM session changed during tool action; settle persistence before importing";
 				throw new Error(this.conflict);
 			}
-			let text: string;
+			let committedId: string;
+			let protectedIds: Set<string>;
 			try {
-				text = await this.readMirror();
+				const text = await this.readMirror();
 				if (this.hash(text) === this.publishedHash) {
 					this.action = undefined;
 					return null;
@@ -127,7 +128,7 @@ export class LiveContextController {
 				if (action.pending.length > 0 && action.watermark === null)
 					throw new Error("CLM cannot safely watermark an edit before this pending tool group");
 				const candidate = parseContextDocument(text, action.base);
-				const protectedIds = this.validateProtection(candidate, originals);
+				protectedIds = this.validateProtection(candidate, originals);
 				for (const id of protectedIds) {
 					if (!text.split("\n").includes(`[[CTX_PROTECTED id=${encodeURIComponent(id)}]]`))
 						throw new Error("CLM protected reference was relabelled");
@@ -137,27 +138,12 @@ export class LiveContextController {
 				this.checkDocumentSize(renderContextDocument(candidate, new Set()));
 				// No awaited work between branch validation and the durable commit.
 				if (this.sessionManager.getLeafId() !== action.leafId) throw new Error("CLM session changed before import");
-				const id = this.sessionManager.appendClmRevision(candidate, action.watermark, actionId);
-				const entry = this.sessionManager.getEntry(id);
-				if (entry?.type !== "clm_revision") throw new Error("CLM revision was not durably accepted");
-				this.status.revision = entry.revision;
-				this.status.error = undefined;
-				this.action = undefined;
-				await this.publish(candidate, protectedIds);
-				return structuredClone(entry);
+				committedId = this.sessionManager.appendClmRevision(candidate, action.watermark, actionId);
 			} catch (error) {
-				// Preserve rejected bytes; repair only from the confirmed accepted revision.
-				try {
-					this.sessionManager.getClmBranchState();
-					await rename(this.status.path, `${this.status.path}.rejected-${randomUUID()}`);
-					const { snapshot } = this.acceptedContext();
-					await this.publish(snapshot, this.validateProtection(snapshot, originals));
-					this.action = undefined;
-				} catch {
-					this.conflict = "CLM repair failed or commit is uncertain; reopen and verify the session";
-				}
+				await this.repairRejectedMirror(originals);
 				throw error;
 			}
+			return this.publishAcceptedRevision(committedId, protectedIds);
 		});
 	}
 
@@ -179,6 +165,45 @@ export class LiveContextController {
 			this.checkBudget(projected, inputs);
 			return structuredClone(projected.blocks.map((block) => block.message));
 		});
+	}
+
+	private async repairRejectedMirror(originals: ProtectedActions): Promise<void> {
+		try {
+			// An uncertain append makes this read fail before any bytes are classified as rejected.
+			this.sessionManager.getClmBranchState();
+			await rename(this.status.path, `${this.status.path}.rejected-${randomUUID()}`);
+			const { snapshot } = this.acceptedContext();
+			await this.publish(snapshot, this.validateProtection(snapshot, originals));
+			this.action = undefined;
+		} catch {
+			this.conflict = "CLM repair failed or commit is uncertain; reopen and verify the session";
+		}
+	}
+
+	private async publishAcceptedRevision(
+		entryId: string,
+		protectedIds: ReadonlySet<string>,
+	): Promise<ClmRevisionEntry> {
+		const entry = this.sessionManager.getEntry(entryId);
+		if (entry?.type !== "clm_revision") {
+			this.conflict = `CLM accepted entry ${entryId} cannot be verified; reopen and verify the session`;
+			throw new Error(this.conflict);
+		}
+		this.status.revision = entry.revision;
+		this.status.error = undefined;
+		this.action = undefined;
+		try {
+			await this.publish(entry.snapshot, protectedIds);
+		} catch {
+			// Repair a disposable mirror from the confirmed commit, never from rejected bytes.
+			try {
+				await this.publish(entry.snapshot, protectedIds);
+			} catch (error) {
+				this.conflict = `CLM revision ${entry.revision} was accepted, but its mirror requires repair; reopen and verify the session`;
+				throw new Error(this.conflict, { cause: error });
+			}
+		}
+		return structuredClone(entry);
 	}
 
 	private enqueue<T>(operation: () => Promise<T>): Promise<T> {
