@@ -1,0 +1,345 @@
+import { mkdtemp, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import type { Api, Model } from "@earendil-works/pi-ai";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { LiveContextController } from "../../src/core/clm/live-context.js";
+import { type ClmBlock, SessionManager } from "../../src/core/session-manager.js";
+import { emptyUsage } from "../../src/core/usage.js";
+
+const model: Model<Api> = {
+	id: "local",
+	name: "Local",
+	api: "openai-responses",
+	provider: "openai",
+	baseUrl: "http://unused.invalid",
+	reasoning: false,
+	input: ["text"],
+	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+	contextWindow: 1000,
+	maxTokens: 300,
+};
+const budget = { systemPrompt: "fixed", tools: [], model };
+const directories: string[] = [];
+afterEach(async () => {
+	await Promise.all(directories.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
+});
+type AuditMessage = Parameters<SessionManager["appendMessage"]>[0];
+const user = (content: string): AuditMessage => ({ role: "user", content, timestamp: 1 });
+async function fixture(messages: AuditMessage[] = [user("obsolete"), user("current request")]) {
+	const dir = await mkdtemp(join(tmpdir(), "clm-controller-"));
+	directories.push(dir);
+	const manager = SessionManager.create(dir, join(dir, "sessions"));
+	const blocks = messages.map((message) => ({ id: manager.appendMessage(message), message }));
+	manager.appendClmOn({ blocks }, blocks.at(-1)!.id);
+	const controller = await LiveContextController.open(manager, dir);
+	const protectedActions = new Map<string, readonly ClmBlock[]>([["request", [blocks.at(-1)!]]]);
+	const request = { ...budget, protectedActions };
+	const project = () => controller.projectRequest(new Set(protectedActions.keys()), request);
+	const prepare = () => controller.prepareToolAction("tool", protectedActions);
+	const settle = () => controller.settleToolAction("tool", protectedActions, budget);
+	const path = controller.getClmStatus().path;
+	const change = async (edit: (text: string) => string) => {
+		await writeFile(`${path}.tmp`, edit(await readFile(path, "utf8")));
+		await rename(`${path}.tmp`, path);
+	};
+	return { dir, manager, blocks, controller, protectedActions, request, project, prepare, settle, path, change };
+}
+
+describe("CLM live context", () => {
+	it("estimates an unknown model window without a hard gate", async () => {
+		const f = await fixture();
+		const unknown = { ...model };
+		Reflect.deleteProperty(unknown, "contextWindow");
+		await f.prepare();
+		await f.change((text) => text.replace("obsolete", "x".repeat(4000)));
+		await f.controller.settleToolAction("tool", f.protectedActions, { ...budget, model: unknown });
+		expect((await f.controller.projectRequest(new Set(["request"]), { ...f.request, model: unknown })).length).toBe(
+			2,
+		);
+		expect(f.controller.getClmStatus().estimatedOccupancy?.maxInputTokens).toBeNull();
+	});
+
+	it("refuses to cover a pending suffix with a null watermark", async () => {
+		const f = await fixture();
+		f.manager.appendClmOffBoundary({ blocks: f.blocks }, f.blocks[1].id);
+		f.manager.appendClmOn({ blocks: f.blocks }, null);
+		const call: AuditMessage = {
+			role: "assistant",
+			content: [{ type: "toolCall", id: "pending", name: "edit", arguments: {} }],
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			usage: emptyUsage(),
+			stopReason: "toolUse",
+			timestamp: 2,
+		};
+		f.manager.appendMessage(call);
+		const manager = SessionManager.open(f.manager.getSessionFile()!);
+		const controller = await LiveContextController.open(manager, join(f.dir, "new-epoch"));
+		await controller.prepareToolAction("edit", f.protectedActions);
+		const path = controller.getClmStatus().path;
+		await writeFile(path, (await readFile(path, "utf8")).replace("obsolete", "summary"));
+		await expect(controller.settleToolAction("edit", f.protectedActions, budget)).rejects.toThrow(/watermark/);
+		expect(manager.getClmBranchState().revision).toBe(0);
+		expect(await controller.projectRequest(new Set(["request"]), f.request)).toEqual([
+			...f.blocks.map((block) => block.message),
+			call,
+		]);
+	});
+
+	it.each([1, 2])("keeps a %s-call in-flight group outside revisions across reopen", async (count) => {
+		const f = await fixture();
+		const calls = Array.from({ length: count }, (_, index) => ({
+			type: "toolCall" as const,
+			id: `active-${index}`,
+			name: "edit",
+			arguments: { path: f.path },
+		}));
+		const call: AuditMessage = {
+			role: "assistant",
+			content: calls,
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			usage: emptyUsage(),
+			stopReason: "toolUse",
+			timestamp: 2,
+		};
+		const receipts: AuditMessage[] = calls.map((item) => ({
+			role: "toolResult",
+			toolCallId: item.id,
+			toolName: "edit",
+			content: [{ type: "text", text: "saved" }],
+			isError: false,
+			timestamp: 3,
+		}));
+		f.manager.appendMessage(call);
+		if (count === 2) f.manager.appendMessage(receipts[0]);
+		await f.prepare();
+		expect(await readFile(f.path, "utf8")).not.toContain("active-");
+		await f.change((text) => text.replace("obsolete", "summary"));
+		await f.settle();
+		expect(f.manager.getClmBranchState().auditWatermark).toBe(f.blocks[1].id);
+		expect(JSON.stringify(f.manager.getClmBranchState().snapshot)).not.toContain("active-");
+		expect(f.manager.buildSessionContext().messages.slice(2)).toEqual([call, ...receipts.slice(0, count - 1)]);
+		const manager = SessionManager.open(f.manager.getSessionFile()!);
+		expect(manager.buildSessionContext().messages.slice(2)).toEqual([call, ...receipts.slice(0, count - 1)]);
+		const reopened = await LiveContextController.open(manager, join(f.dir, "reopened"));
+		manager.appendMessage(receipts[count - 1]);
+		const projection = await reopened.projectRequest(new Set(["request"]), f.request);
+		expect(projection.slice(2)).toEqual([call, ...receipts]);
+		expect(JSON.stringify(projection)).not.toContain("obsolete");
+		await reopened.prepareToolAction("next", f.protectedActions);
+		expect(await readFile(reopened.getClmStatus().path, "utf8")).toContain("active-");
+		await reopened.settleToolAction("next", f.protectedActions, budget);
+	});
+
+	it.each(["missing", "reordered", "orphan", "accepted"])("fails closed on %s native group history", async (kind) => {
+		const f = await fixture();
+		const call: AuditMessage = {
+			role: "assistant",
+			content: [0, 1, 2].map((index) => ({ type: "toolCall", id: `call-${index}`, name: "edit", arguments: {} })),
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			usage: emptyUsage(),
+			stopReason: "toolUse",
+			timestamp: 2,
+		};
+		const receipt: AuditMessage = {
+			role: "toolResult",
+			toolCallId: kind === "reordered" ? "call-1" : "call-0",
+			toolName: "edit",
+			content: [],
+			isError: false,
+			timestamp: 3,
+		};
+		if (kind !== "orphan") f.manager.appendMessage(call);
+		f.manager.appendMessage(receipt);
+		if (kind === "missing") f.manager.appendMessage(user("unrelated request"));
+		if (kind === "accepted") {
+			f.manager.appendClmRevision(
+				{ blocks: [...f.blocks, { id: "bad-call", message: call }] },
+				f.manager.getLeafId(),
+				"invalid-tail",
+			);
+			await expect(
+				LiveContextController.open(SessionManager.open(f.manager.getSessionFile()!), join(f.dir, "reopened")),
+			).rejects.toThrow();
+		} else await expect(f.prepare()).rejects.toThrow();
+	});
+
+	it("rejects a document above 32 MiB without advancing the revision", async () => {
+		const f = await fixture();
+		await f.prepare();
+		await f.change((text) => text.replace("obsolete", "x".repeat(32 * 1024 * 1024)));
+		await expect(
+			f.controller
+				.settleToolAction("tool", f.protectedActions, {
+					...budget,
+					model: { ...model, contextWindow: 0 },
+				})
+				.then(() => undefined),
+		).rejects.toThrow(/32 MiB/);
+		expect(f.controller.getClmStatus().revision).toBe(0);
+	});
+
+	it("rejects the session snapshot cap before durable acceptance", async () => {
+		const f = await fixture();
+		await f.prepare();
+		await f.change((text) => text.replace("obsolete", "summary"));
+		const accepted = f.manager.getEntries().find((entry) => entry.type === "clm_on")!;
+		// Bound memory while simulating a session with large older snapshot payloads.
+		const oldSnapshot = { blocks: [{ id: "old", message: user("x".repeat(32 * 1024 * 1024)) }] };
+		const read = vi
+			.spyOn(f.manager, "getEntries")
+			.mockReturnValue(Array.from({ length: 16 }, () => ({ ...accepted, snapshot: oldSnapshot })));
+		try {
+			await expect(f.settle()).rejects.toThrow(/512 MiB/);
+			expect(f.manager.getClmBranchState().revision).toBe(0);
+		} finally {
+			read.mockRestore();
+		}
+	});
+
+	it("accepts a cooperative edit durably and never replays the removed audit on reopen", async () => {
+		const f = await fixture();
+		await f.prepare();
+		expect(await readFile(f.path, "utf8")).not.toContain("current request");
+		await f.change((text) => text.replace("obsolete", "summary"));
+		const revision = await f.settle();
+		expect(revision?.revision).toBe(1);
+		expect(JSON.stringify(await f.project())).toContain("summary");
+		expect(JSON.stringify(await f.project())).not.toContain("obsolete");
+		expect(JSON.stringify(f.manager.getEntries())).toContain("obsolete");
+		await writeFile(f.path, "unaccepted bytes");
+		const reopened = await LiveContextController.open(SessionManager.open(f.manager.getSessionFile()!), f.dir);
+		expect(JSON.stringify(await reopened.projectRequest(new Set(["request"]), f.request))).toContain("summary");
+		expect(JSON.stringify(await reopened.projectRequest(new Set(["request"]), f.request))).not.toContain(
+			"unaccepted",
+		);
+	});
+
+	it("preserves native tools without creating a revision when unchanged", async () => {
+		const native: AuditMessage[] = [
+			{
+				role: "assistant",
+				content: [{ type: "toolCall", id: "call", name: "read", arguments: { path: "a" } }],
+				api: model.api,
+				provider: model.provider,
+				model: model.id,
+				usage: emptyUsage(),
+				stopReason: "toolUse",
+				timestamp: 1,
+			},
+			{
+				role: "toolResult",
+				toolCallId: "call",
+				toolName: "read",
+				content: [{ type: "text", text: "loaded skill" }],
+				isError: false,
+				timestamp: 2,
+			},
+			user("current request"),
+		];
+		const f = await fixture(native);
+		await f.prepare();
+		expect(await f.settle()).toBeNull();
+		expect(await f.project()).toEqual(native);
+		expect(f.controller.getClmStatus().revision).toBe(0);
+	});
+
+	it.each(["missing", "relabelled", "edited", "malformed"])(
+		"rejects %s protected references without accepting or losing rejected bytes",
+		async (kind) => {
+			const f = await fixture();
+			await f.prepare();
+			const marker = `[[CTX_PROTECTED id=${f.blocks[1].id}]]`;
+			await f.change((text) =>
+				kind === "missing"
+					? text.replace(marker, "")
+					: kind === "malformed"
+						? `${text}junk`
+						: text.replace(
+								marker,
+								`[[CTX_TURN id=${f.blocks[1].id} role=user]]\n${kind === "edited" ? "changed request" : "current request"}\n[[CTX_END]]`,
+							),
+			);
+			const rejectedText = await readFile(f.path, "utf8");
+			await expect(f.settle()).rejects.toThrow();
+			const rejected = (await readdir(join(f.dir, "clm"))).find((name) => name.startsWith("context.txt.rejected-"));
+			expect(rejected).toBeDefined();
+			expect(await readFile(join(f.dir, "clm", rejected!), "utf8")).toBe(rejectedText);
+			expect(f.controller.getClmStatus().revision).toBe(0);
+			expect(await f.project()).toEqual(f.blocks.map((block) => block.message));
+			expect(f.controller.getClmStatus().error).toBeTruthy();
+		},
+	);
+
+	it("rejects an over-budget edit without advancing accepted revision", async () => {
+		const f = await fixture();
+		await f.prepare();
+		await f.change((text) => text.replace("obsolete", "x".repeat(4000)));
+		await expect(f.settle()).rejects.toThrow(/budget/i);
+		expect(f.controller.getClmStatus().revision).toBe(0);
+		expect(await f.project()).toEqual(f.blocks.map((block) => block.message));
+	});
+
+	it("rejects over-budget requests and keeps a nonaccumulating near-budget status", async () => {
+		const f = await fixture();
+		const near = { ...f.request, systemPrompt: "x".repeat(2700) };
+		const first = await f.controller.projectRequest(new Set(["request"]), near);
+		expect(f.controller.getClmStatus().warning).toBeTruthy();
+		expect(await f.controller.projectRequest(new Set(["request"]), near)).toEqual(first);
+		await expect(
+			f.controller.projectRequest(new Set(["request"]), { ...near, systemPrompt: "x".repeat(4000) }),
+		).rejects.toThrow(/budget/i);
+		expect(f.controller.getClmStatus().revision).toBe(0);
+		await f.project();
+		expect(f.controller.getClmStatus().warning).toBeUndefined();
+	});
+
+	it.each(["external", "bom"])("fails closed on %s pre-action drift and refuses later projection", async (kind) => {
+		const f = await fixture();
+		await writeFile(f.path, kind === "bom" ? `\uFEFF${await readFile(f.path, "utf8")}` : "external bytes");
+		await expect(f.prepare()).rejects.toThrow(/drift|conflict/i);
+		await expect(f.project()).rejects.toThrow(/drift|conflict/i);
+		expect(f.controller.getClmStatus().revision).toBe(0);
+	});
+
+	it("pins action ownership across queued prepare and mismatched settlement", async () => {
+		const f = await fixture();
+		const results = await Promise.allSettled([f.prepare(), f.prepare()]);
+		expect(results.map((result) => result.status)).toEqual(["fulfilled", "rejected"]);
+		await expect(f.project()).rejects.toThrow(/action|writer/i);
+		await expect(f.controller.settleToolAction("other", f.protectedActions, budget)).rejects.toThrow(/action/i);
+		await expect(f.controller.settleToolAction("tool", new Map(), budget)).rejects.toThrow(/protect|action/i);
+		expect(f.controller.getClmStatus().revision).toBe(0);
+	});
+
+	it.each(["unknown", "payload", "missing-budget"])("fails closed for %s request inputs", async (kind) => {
+		const f = await fixture();
+		const request =
+			kind === "payload"
+				? { ...f.request, protectedActions: new Map([["request", [{ ...f.blocks[1], message: user("changed") }]]]) }
+				: f.request;
+		if (kind === "missing-budget") Reflect.deleteProperty(request, "model");
+		await expect(
+			f.controller.projectRequest(new Set([kind === "unknown" ? "unknown" : "request"]), request),
+		).rejects.toThrow();
+	});
+
+	it("includes uncovered audit messages exactly once after committing an edit", async () => {
+		const f = await fixture();
+		const next = user("new delivered action");
+		const id = f.manager.appendMessage(next);
+		f.protectedActions.set("next", [{ id, message: next }]);
+		await f.prepare();
+		await f.change((text) => text.replace("obsolete", "summary"));
+		await f.settle();
+		const projection = await f.project();
+		expect(projection.filter((message) => JSON.stringify(message) === JSON.stringify(next))).toHaveLength(1);
+		expect(f.manager.getClmBranchState().auditWatermark).toBe(id);
+	});
+});
