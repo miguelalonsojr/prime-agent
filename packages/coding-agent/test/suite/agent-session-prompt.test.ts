@@ -1197,7 +1197,6 @@ describe("CLM provider projection", () => {
 			}
 		},
 	);
-
 	it.each(["unchanged", "in-place", "returned", "null", "hidden", "disabled", "over-budget"])(
 		"checks final payload hook: %s",
 		async (mutation) => {
@@ -1253,7 +1252,6 @@ describe("CLM provider projection", () => {
 			}
 		},
 	);
-
 	it.each(["missing entry", "corrupt recovery"])("does not dispatch with %s", async (failure) => {
 		const harness = await createHarness({ persistSession: true });
 		try {
@@ -1279,4 +1277,77 @@ describe("CLM provider projection", () => {
 			harness.cleanup();
 		}
 	});
+	it.each(["retry", "before insertion", "after insertion", "disabled"])(
+		"fences failed CLM provider work: %s",
+		async (failure) => {
+			let toolRuns = 0;
+			const retry = failure === "retry";
+			const harness = await createHarness({
+				persistSession: true,
+				settings: { retry: { enabled: retry, baseDelayMs: 0, maxRetries: 1 } },
+				tools: [
+					{
+						name: "inspect",
+						label: "inspect",
+						description: "Inspect",
+						parameters: Type.Object({}),
+						execute: async () => {
+							toolRuns++;
+							return { content: [{ type: "text", text: "external effect completed" }], details: {} };
+						},
+					},
+				],
+			});
+			try {
+				if (failure !== "disabled") harness.sessionManager.appendClmOn({ blocks: [] }, null);
+				let failed = false;
+				if (failure === "before insertion") {
+					const append = harness.sessionManager.appendMessage.bind(harness.sessionManager);
+					vi.spyOn(harness.sessionManager, "appendMessage").mockImplementation((message) => {
+						if (!failed && message.role === "toolResult") {
+							failed = true;
+							throw new Error("injected receipt persistence failure");
+						}
+						return append(message);
+					});
+				} else if (!retry) {
+					const persist = harness.sessionManager._persist.bind(harness.sessionManager);
+					vi.spyOn(harness.sessionManager, "_persist").mockImplementation((entry) => {
+						if (!failed && entry.type === "message" && entry.message.role === "toolResult") {
+							failed = true;
+							throw new Error("injected receipt persistence failure");
+						}
+						persist(entry);
+					});
+				}
+				const requests: string[] = [];
+				const success = (context: { messages: unknown[] }) => {
+					requests.push(JSON.stringify(context.messages));
+					return fauxAssistantMessage("done");
+				};
+				harness.setResponses([
+					fauxAssistantMessage(fauxToolCall("inspect", {}, { id: "failed" }), {
+						stopReason: retry ? "error" : "toolUse",
+						errorMessage: retry ? "503 temporarily unavailable" : undefined,
+					}),
+					success,
+					success,
+				]);
+				await harness.session.prompt("request U");
+				if (retry) await harness.session.prompt("request V");
+				expect(harness.faux.state.callCount).toBe(retry ? 3 : failure === "disabled" ? 2 : 1);
+				expect(toolRuns).toBe(retry ? 0 : 1);
+				expect(failed).toBe(!retry);
+				if (retry) {
+					expect(requests[0]).toContain("request U");
+					expect(requests[1]).toContain("request V");
+					expect(requests.join()).not.toContain('"id":"failed"');
+				} else if (failure !== "disabled")
+					expect(harness.session.agent.state.errorMessage).toMatch(/CLM.*persist/i);
+			} finally {
+				vi.restoreAllMocks();
+				harness.cleanup();
+			}
+		},
+	);
 });

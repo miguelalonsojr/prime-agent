@@ -147,6 +147,35 @@ export class LiveContextController {
 		});
 	}
 
+	discardFailedProviderEntry(
+		failedEntry: ClmBlock,
+		protectedActions: ProtectedActions,
+		requestBudget: ClmRequestInputs,
+	): Promise<ClmRevisionEntry> {
+		const failed = structuredClone(failedEntry);
+		const originals = structuredClone(protectedActions);
+		const request = structuredClone(requestBudget);
+		return this.enqueue(async () => {
+			this.assertIdle();
+			const leafId = this.sessionManager.getLeafId();
+			await this.checkDrift();
+			if (!(originals instanceof Map) || originals.size === 0)
+				throw new Error("CLM failed provider cleanup requires an owned protected request");
+			const { snapshot, pending, watermark } = this.acceptedContext(failed);
+			if (pending.length > 0 || watermark !== failed.id)
+				throw new Error("CLM failed provider cleanup cannot cover another pending tool group");
+			const protectedIds = this.validateProtection(snapshot, originals);
+			this.checkBudget(snapshot, request);
+			this.checkSnapshotCap(snapshot);
+			this.checkDocumentSize(renderContextDocument(snapshot, protectedIds));
+			this.assertHealthy();
+			if (this.sessionManager.getLeafId() !== leafId)
+				throw new Error("CLM session changed before failed provider cleanup");
+			const entryId = this.sessionManager.appendClmRevision(snapshot, failed.id, `failed-provider:${failed.id}`);
+			return this.publishAcceptedRevision(entryId, protectedIds);
+		});
+	}
+
 	projectRequest(
 		protectedActionIds: ReadonlySet<string>,
 		request: ClmRequestInputs & { protectedActions: ProtectedActions },
@@ -227,7 +256,11 @@ export class LiveContextController {
 		if (this.action) throw new Error("CLM tool action writer has not settled");
 	}
 
-	private acceptedContext(): { snapshot: ClmSnapshot; pending: ClmBlock[]; watermark: string | null } {
+	private acceptedContext(failedEntry?: ClmBlock): {
+		snapshot: ClmSnapshot;
+		pending: ClmBlock[];
+		watermark: string | null;
+	} {
 		const state: ClmBranchState = this.sessionManager.getClmBranchState();
 		if (state.mode !== "on" || !state.snapshot) throw new Error("CLM requires an accepted on snapshot");
 		const branch = this.sessionManager.getBranch();
@@ -247,16 +280,27 @@ export class LiveContextController {
 			);
 		const messages = this.sessionManager.buildSessionContext().messages.slice(state.snapshot.blocks.length);
 		if (messages.length !== uncovered.length) throw new Error("CLM audit projection cannot be mapped safely");
-		const snapshot = {
-			blocks: [
-				...state.snapshot.blocks,
-				...uncovered.map((entry, index) => ({ id: entry.id, message: messages[index] })),
-			],
-		};
+		const suffix = uncovered.map((entry, index) => ({ id: entry.id, message: messages[index] }));
+		if (failedEntry) {
+			const last = suffix.at(-1);
+			if (
+				!last ||
+				!isDeepStrictEqual(last, failedEntry) ||
+				last.message.role !== "assistant" ||
+				last.message.stopReason !== "error" ||
+				state.snapshot.blocks.some((block) => block.id === failedEntry.id)
+			)
+				throw new Error("CLM failed provider cleanup requires the exact last uncovered failed entry");
+			suffix.pop();
+		}
+		if (suffix.some((block) => block.message.role === "assistant" && block.message.stopReason === "error"))
+			throw new Error("CLM uncovered failed provider entry requires owned cleanup; repair the session");
+		const snapshot = { blocks: [...state.snapshot.blocks, ...suffix] };
 		const { editable, pending } = this.splitPendingToolGroup(snapshot, state.snapshot.blocks.length);
 		const rendered = renderContextDocument(editable, new Set());
 		this.checkDocumentSize(rendered);
 		parseContextDocument(rendered, editable);
+		// A failed-provider cleanup still covers its removed raw audit tail in the watermark.
 		const completeCount = uncovered.length - pending.length;
 		return {
 			snapshot: structuredClone(editable),

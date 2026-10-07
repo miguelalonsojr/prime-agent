@@ -2206,7 +2206,6 @@ describe("AgentSession queue regressions", () => {
 		expect(harness.eventsOfType("agent_start")).toHaveLength(1);
 	});
 });
-
 describe("CLM action identity", () => {
 	it.each(["user", "custom", "steering", "retry"])(
 		"pins distinct identical %s deliveries to their append IDs",

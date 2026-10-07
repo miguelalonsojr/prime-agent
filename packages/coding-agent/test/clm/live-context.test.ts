@@ -2,7 +2,7 @@ import fileSystem, { mkdtemp, readdir, readFile, rename, rm, writeFile } from "n
 import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { Api, Model } from "@earendil-works/pi-ai";
+import { type Api, fauxAssistantMessage, fauxToolCall, type Model } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { LiveContextController } from "../../src/core/clm/live-context.js";
 import { type ClmBlock, SessionManager } from "../../src/core/session-manager.js";
@@ -381,5 +381,38 @@ describe("CLM live context", () => {
 		const projection = await f.project();
 		expect(projection.filter((message) => JSON.stringify(message) === JSON.stringify(next))).toHaveLength(1);
 		expect(f.manager.getClmBranchState().auditWatermark).toBe(id);
+	});
+
+	it("durably removes only the exact failed provider entry and reopens its accepted revision", async () => {
+		const f = await fixture();
+		await f.prepare();
+		await f.change((text) => text.replace("obsolete", "edited note"));
+		await f.settle();
+		const message = fauxAssistantMessage(fauxToolCall("inspect", {}, { id: "partial" }), { stopReason: "error" });
+		const id = f.manager.appendMessage(message);
+		f.manager.appendModelChange(model.provider, model.id);
+		await f.controller.discardFailedProviderEntry({ id, message }, f.protectedActions, budget);
+		const state = f.manager.getClmBranchState();
+		expect(state).toMatchObject({ revision: 2, auditWatermark: id });
+		expect(f.manager.getEntry(id)).toMatchObject({ message });
+		expect(f.manager.getBranch().at(-1)).toMatchObject({ observedActionId: `failed-provider:${id}` });
+		const reopened = await LiveContextController.open(
+			SessionManager.open(f.manager.getSessionFile()!),
+			join(f.dir, "reopened"),
+		);
+		const projected = JSON.stringify(await reopened.projectRequest(new Set(["request"]), f.request));
+		expect(projected).toContain("edited note");
+		expect(projected).toContain("current request");
+		expect(projected).not.toContain("partial");
+	});
+	it("fails closed on an uncovered failed provider entry without ownership proof, including reopen", async () => {
+		const f = await fixture();
+		f.manager.appendMessage(fauxAssistantMessage(fauxToolCall("inspect", {}), { stopReason: "error" }));
+		await expect(f.project()).rejects.toThrow(/failed provider.*cleanup/i);
+		await expect(f.prepare()).rejects.toThrow(/failed provider.*cleanup/i);
+		const reopened = SessionManager.open(f.manager.getSessionFile()!);
+		await expect(LiveContextController.open(reopened, join(f.dir, "reopened"))).rejects.toThrow(
+			/failed provider.*cleanup/i,
+		);
 	});
 });

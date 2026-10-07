@@ -1535,7 +1535,12 @@ export class ClmRecoveryError extends Error {
 /** Validation failures are local recovery state, never permission to replay audit context. */
 export function getClmRecoveryError(sessionManager: SessionManager): ClmRecoveryError | undefined {
 	try {
-		sessionManager.getClmBranchState();
+		const state = sessionManager.getClmBranchState();
+		if (state.mode === "on") {
+			const uncovered = sessionManager.buildSessionContext().messages.slice(state.snapshot?.blocks.length ?? 0);
+			if (uncovered.some((message) => message.role === "assistant" && message.stopReason === "error"))
+				throw new Error("CLM uncovered failed provider entry requires owned cleanup");
+		}
 		return undefined;
 	} catch (cause) {
 		return new ClmRecoveryError(cause);
@@ -1553,6 +1558,7 @@ export class AgentSession {
 	private _clmPrompt = "";
 	private readonly _clmDeliveryBlocks = new WeakMap<DeliveryRecord, ClmBlock>();
 	private _clmBindingError?: Error;
+	private _clmPersistenceError?: Error;
 	private readonly _unguardedStreamFn: Agent["streamFn"];
 
 	private _scopedModels: Array<{
@@ -2007,6 +2013,7 @@ export class AgentSession {
 	}
 
 	private async _getClmController(): Promise<LiveContextController> {
+		this.assertModelContextAvailable();
 		if (!this._clmController) {
 			const artifactDir = this.sessionManager.getSessionArtifactDir();
 			if (!artifactDir) throw new Error("CLM requires a persistent session artifact directory");
@@ -2072,6 +2079,24 @@ export class AgentSession {
 				? entry.message
 				: createCustomMessage(entry.customType, entry.content, entry.display, entry.details, entry.timestamp);
 		this._clmDeliveryBlocks.set(records[0], { id: entryId, message: structuredClone(canonical) });
+	}
+
+	private async _discardClmFailedProviderEntry(id: string, message: AssistantMessage): Promise<void> {
+		if (message.stopReason !== "error" || this.sessionManager.getClmBranchState().mode !== "on") return;
+		try {
+			if (!this._clmController) throw new Error("CLM failed provider entry has no owned request controller");
+			await this._clmController.discardFailedProviderEntry(
+				{ id, message },
+				this._clmProtectedActions(),
+				this._clmRequestInputs(),
+			);
+		} catch (cause) {
+			this._clmPersistenceError ??= new Error(
+				"CLM failed provider cleanup failed; repair the session before requesting model work",
+				{ cause },
+			);
+			throw this._clmPersistenceError;
+		}
 	}
 
 	async projectClmContext(messages: AgentMessage[]): Promise<AgentMessage[]> {
@@ -4887,22 +4912,37 @@ export class AgentSession {
 		this._emit(event);
 
 		if (event.type === "message_end") {
+			const clm = this.sessionManager.getClmBranchState().mode === "on";
+			if (clm && this._clmPersistenceError) throw this._clmPersistenceError;
 			let entryId: string | undefined;
-			if (event.message.role === "custom") {
-				entryId = this.sessionManager.appendCustomMessageEntry(
-					event.message.customType,
-					event.message.content,
-					event.message.display,
-					event.message.details,
-				);
-			} else if (
-				event.message.role === "user" ||
-				event.message.role === "assistant" ||
-				event.message.role === "toolResult"
-			) {
-				entryId = this.sessionManager.appendMessage(event.message);
+			try {
+				if (event.message.role === "custom") {
+					entryId = this.sessionManager.appendCustomMessageEntry(
+						event.message.customType,
+						event.message.content,
+						event.message.display,
+						event.message.details,
+					);
+				} else if (
+					event.message.role === "user" ||
+					event.message.role === "assistant" ||
+					event.message.role === "toolResult"
+				) {
+					entryId = this.sessionManager.appendMessage(event.message);
+				}
+			} catch (cause) {
+				if (clm) {
+					this._clmPersistenceError ??= new Error(
+						"CLM audit persistence failed; repair the session before requesting model work",
+						{ cause },
+					);
+				}
+				throw cause;
 			}
-			if (entryId) this._bindClmDelivery(event.message, entryId);
+			if (entryId) {
+				this._bindClmDelivery(event.message, entryId);
+				if (event.message.role === "assistant") await this._discardClmFailedProviderEntry(entryId, event.message);
+			}
 
 			if (event.message.role === "assistant") {
 				this._lastAssistantMessage = event.message;
@@ -5563,6 +5603,7 @@ export class AgentSession {
 	}
 
 	assertModelContextAvailable(): void {
+		if (this._clmPersistenceError) throw this._clmPersistenceError;
 		this._clmRecoveryError ??= getClmRecoveryError(this.sessionManager);
 		if (this._clmRecoveryError) throw this._clmRecoveryError;
 	}
