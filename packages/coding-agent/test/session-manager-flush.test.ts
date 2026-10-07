@@ -3,6 +3,7 @@ import {
 	chmodSync,
 	type chownSync,
 	existsSync,
+	fstatSync,
 	type fsyncSync,
 	lstatSync,
 	mkdirSync,
@@ -27,6 +28,7 @@ type WriteFileSync = typeof writeFileSync;
 type WriteSync = typeof writeSyncFs;
 
 const fsMocks = vi.hoisted(() => ({
+	actualRenameSync: undefined as RenameSync | undefined,
 	actualFsyncSync: undefined as typeof fsyncSync | undefined,
 	fsyncSync: vi.fn<typeof fsyncSync>(),
 	actualWriteFileSync: undefined as WriteFileSync | undefined,
@@ -39,6 +41,7 @@ const fsMocks = vi.hoisted(() => ({
 }));
 vi.mock("node:fs", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("node:fs")>();
+	fsMocks.actualRenameSync = actual.renameSync;
 	fsMocks.actualFsyncSync = actual.fsyncSync;
 	fsMocks.fsyncSync.mockImplementation(actual.fsyncSync);
 	fsMocks.actualWriteFileSync = actual.writeFileSync;
@@ -487,8 +490,9 @@ describe("SessionManager durable CLM entries", () => {
 		if (type !== "clm_on") mgr.appendClmOn({ blocks: [] }, watermark);
 		const file = mgr.getSessionFile()!;
 		const before = readFileSync(file);
-		fsMocks.fsyncSync.mockImplementationOnce(() => {
-			throw new Error("sync failed");
+		fsMocks.fsyncSync.mockImplementation((fd) => {
+			if (!fstatSync(fd).isDirectory()) throw new Error("sync failed");
+			fsMocks.actualFsyncSync!(fd);
 		});
 		const append = () =>
 			type === "clm_on"
@@ -502,18 +506,70 @@ describe("SessionManager durable CLM entries", () => {
 		expect(SessionManager.open(file).getClmBranchState().mode).toBe(type === "clm_on" ? "off" : "on");
 	});
 
-	it("verifies committed bytes before accepting a revision", () => {
+	it("verifies committed bytes before notifying persist listeners", () => {
 		const dir = createTempDir();
 		const mgr = SessionManager.create(dir, join(dir, "sessions"));
 		mgr.appendClmOn({ blocks: [] }, null);
 		const file = mgr.getSessionFile()!;
-		const unsubscribe = mgr.onPersist(() => appendFileSync(file, '{"type":"clm_revision","snapshot":'));
+		const notifications: string[] = [];
+		const unsubscribe = mgr.onPersist((path) => notifications.push(path));
+		fsMocks.renameSync.mockImplementationOnce((from, to) => {
+			fsMocks.actualRenameSync!(from, to);
+			appendFileSync(to, '{"type":"clm_revision","snapshot":');
+		});
 		try {
 			expect(() => mgr.appendClmRevision({ blocks: [] }, null, "a")).toThrow(/CLM/);
+			expect(notifications).toEqual([]);
 			expect(() => mgr.buildSessionContext()).toThrow(/CLM/);
 			expect(() => SessionManager.open(file).buildSessionContext()).toThrow(/CLM/);
 		} finally {
 			unsubscribe();
 		}
+	});
+
+	it("rejects CLM enable without persistent storage", () => {
+		const mgr = SessionManager.inMemory();
+		expect(() => mgr.appendClmOn({ blocks: [] }, null)).toThrow(/CLM.*persist/i);
+		expect(mgr.getEntries()).toEqual([]);
+		expect(mgr.getClmBranchState().mode).toBe("off");
+	});
+
+	it("preflights directory sync support before writing a CLM transition", () => {
+		const dir = createTempDir();
+		const mgr = SessionManager.create(dir, join(dir, "sessions"));
+		mgr.flushNow();
+		const file = mgr.getSessionFile()!;
+		const before = readFileSync(file);
+		fsMocks.fsyncSync.mockImplementation((fd) => {
+			if (fstatSync(fd).isDirectory()) throw Object.assign(new Error("unsupported"), { code: "EINVAL" });
+			fsMocks.actualFsyncSync!(fd);
+		});
+		expect(() => mgr.appendClmOn({ blocks: [] }, null)).toThrow(/CLM.*directory.*sync/i);
+		expect(readFileSync(file)).toEqual(before);
+		expect(mgr.getClmBranchState().mode).toBe("off");
+		expect(SessionManager.open(file).getClmBranchState().mode).toBe("off");
+	});
+
+	it.each(["branch", "fork"])("does not report a %s whose directory commit fails", (method) => {
+		const dir = createTempDir();
+		const mgr = SessionManager.create(dir, join(dir, "sessions"));
+		mgr.appendClmOn({ blocks: [] }, null);
+		const leaf = mgr.appendClmOffBoundary({ blocks: [] }, null);
+		const file = mgr.getSessionFile()!;
+		fsMocks.fsyncSync.mockImplementation((fd) => {
+			if (
+				fstatSync(fd).isDirectory() &&
+				readdirSync(mgr.getSessionDir()).filter((name) => name.endsWith(".jsonl")).length > 1
+			)
+				throw new Error("directory commit failed");
+			fsMocks.actualFsyncSync!(fd);
+		});
+		expect(() =>
+			method === "branch"
+				? mgr.createBranchedSession(leaf)
+				: SessionManager.forkFrom(file, dir, mgr.getSessionDir()),
+		).toThrow("directory commit failed");
+		expect(mgr.getSessionFile()).toBe(file);
+		expect(mgr.getClmBranchState()).toMatchObject({ mode: "off", revision: 1 });
 	});
 });

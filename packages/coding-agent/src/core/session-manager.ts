@@ -66,6 +66,28 @@ const CONTENT_ENTRY_TYPES = new Set([
 	"clm_off_boundary",
 ]);
 
+function syncDirectory(path: string): void {
+	const descriptor = openSync(path, "r");
+	try {
+		fsyncSync(descriptor);
+	} finally {
+		closeSync(descriptor);
+	}
+}
+
+class ClmDirectorySyncUnavailableError extends Error {}
+
+function preflightClmDirectory(path: string): void {
+	try {
+		syncDirectory(path);
+	} catch (cause) {
+		throw new ClmDirectorySyncUnavailableError(
+			`CLM requires directory fsync support at ${path}: ${cause instanceof Error ? cause.message : String(cause)}`,
+			{ cause },
+		);
+	}
+}
+
 function statMetadataIfPresent(path: string): { mode: number; uid: number; gid: number } | undefined {
 	try {
 		const { mode, uid, gid } = statSync(path);
@@ -2105,13 +2127,17 @@ export class SessionManager {
 		this._writeFileEntries(this.fileEntries);
 	}
 
-	private _writeFileEntries(entries: FileEntry[], durable = false): void {
+	private _writeFileEntries(entries: FileEntry[], durable = false, sessionFile = this.sessionFile): void {
 		if (this.clmRecoveryError) throw new Error(this.clmRecoveryError);
-		if (!this.persist || !this.sessionFile) return;
+		if (!this.persist || !sessionFile) {
+			if (durable) throw new Error("CLM requires a persistent session file");
+			return;
+		}
 		const content = `${entries.map((e) => JSON.stringify(e)).join("\n")}\n`;
-		const targetPath = realpathIfPresentSync(this.sessionFile);
+		const targetPath = realpathIfPresentSync(sessionFile);
 		const directory = dirname(targetPath);
 		mkdirSync(directory, { recursive: true });
+		if (durable) preflightClmDirectory(directory);
 		const metadata = statMetadataIfPresent(targetPath);
 		writeFileAtomicSync(targetPath, content, {
 			fsync: durable,
@@ -2120,27 +2146,20 @@ export class SessionManager {
 				if (metadata !== undefined) chownSync(tempPath, metadata.uid, metadata.gid);
 			},
 		});
-		if (durable) {
-			const descriptor = openSync(directory, "r");
-			try {
-				fsyncSync(descriptor);
-			} finally {
-				closeSync(descriptor);
-			}
-		}
-		this._notifyPersistListeners();
+		if (durable) syncDirectory(directory);
 		if (durable && readFileSync(targetPath, "utf8") !== content) {
 			throw new Error("CLM committed bytes could not be verified");
 		}
+		this._notifyPersistListeners(sessionFile);
 	}
 
-	private _notifyPersistListeners(): void {
-		if (!this.sessionFile) {
+	private _notifyPersistListeners(sessionFile = this.sessionFile): void {
+		if (!sessionFile) {
 			return;
 		}
 		for (const listener of this.persistListeners) {
 			try {
-				listener(this.sessionFile);
+				listener(sessionFile);
 			} catch {
 				// Persistence observers must not break session writes.
 			}
@@ -2356,12 +2375,15 @@ export class SessionManager {
 	}
 
 	private _commitClmEntry(entry: ClmEntry): string {
+		if (!this.persist || !this.sessionFile) throw new Error("CLM requires a persistent session file");
 		validateClmBranch([...this.getBranch(), entry]);
 		try {
 			this._writeFileEntries([...this.fileEntries, entry], true);
 		} catch (error) {
 			// An I/O error may occur after rename. Do not guess which revision won.
-			this.clmRecoveryError = "CLM commit is uncertain; reopen and verify the session log";
+			if (!(error instanceof ClmDirectorySyncUnavailableError)) {
+				this.clmRecoveryError = "CLM commit is uncertain; reopen and verify the session log";
+			}
 			throw error;
 		}
 		this.fileEntries.push(entry);
@@ -2924,7 +2946,10 @@ export class SessionManager {
 				parentId = labelEntry.id;
 			}
 
-			this.fileEntries = [header, ...pathWithoutLabels, ...labelEntries];
+			const entries = [header, ...pathWithoutLabels, ...labelEntries];
+			const hasClm = path.some(isClmEntry);
+			if (hasClm) this._writeFileEntries(entries, true, newSessionFile);
+			this.fileEntries = entries;
 			this._refreshHasAssistantEntry();
 			this.sessionId = newSessionId;
 			this.sessionFile = newSessionFile;
@@ -2932,12 +2957,8 @@ export class SessionManager {
 
 			// CLM boundaries must survive reopen even before an assistant response.
 			// Ordinary pre-assistant branches still defer their first write.
-			if (this.hasAssistantEntry || path.some(isClmEntry)) {
-				this._writeFileEntries(this.fileEntries, path.some(isClmEntry));
-				this.flushed = true;
-			} else {
-				this.flushed = false;
-			}
+			if (this.hasAssistantEntry && !hasClm) this._rewriteFile();
+			this.flushed = this.hasAssistantEntry || hasClm;
 
 			return newSessionFile;
 		}
@@ -3063,6 +3084,8 @@ export class SessionManager {
 		// counts so every JSONL line lands whole, and "w" creates the target
 		// fresh because createUniqueSessionFileTarget guarantees it does not
 		// exist yet.
+		const hasClm = sourceEntries.some(isClmEntry);
+		if (hasClm) preflightClmDirectory(dir);
 		const descriptor = openSync(newSessionFile, "w");
 		try {
 			writeAllSync(descriptor, `${JSON.stringify(newHeader)}\n`, newSessionFile);
@@ -3084,11 +3107,12 @@ export class SessionManager {
 				const out = parentId === entry.parentId ? entry : { ...entry, parentId };
 				writeAllSync(descriptor, `${JSON.stringify(out)}\n`, newSessionFile);
 			}
-			if (sourceEntries.some(isClmEntry)) fsyncSync(descriptor);
+			if (hasClm) fsyncSync(descriptor);
 		} finally {
 			closeSync(descriptor);
 		}
 
+		if (hasClm) syncDirectory(dir);
 		return new SessionManager(targetCwd, dir, newSessionFile, true);
 	}
 
