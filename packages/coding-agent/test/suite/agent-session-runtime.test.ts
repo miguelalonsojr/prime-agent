@@ -181,21 +181,32 @@ describe("AgentSessionRuntime characterization", () => {
 		return { runtime, disposeSession };
 	}
 
-	it.each(["corrupt", "on", "off"] as const)("attaches CLM %s without replaying discarded audit", async (mode) => {
+	it.each(["corrupt", "malformed-on", "on", "off"] as const)("attaches %s CLM without audit replay", async (mode) => {
 		const harness = await createHarness({ persistSession: true });
 		cleanups.push(harness.cleanup);
 		const manager = harness.sessionManager;
-		const watermark = manager.appendMessage(userMsg("original audit only"));
+		const watermark =
+			mode === "malformed-on"
+				? manager.appendThinkingLevelChange("off")
+				: manager.appendMessage(userMsg("original audit only"));
 		const accepted = { blocks: [{ id: "accepted", message: userMsg("accepted context") }] };
-		manager.appendClmOn(accepted, watermark);
-		manager.appendClmRevision(accepted, watermark, "settled-action");
-		if (mode === "off") manager.appendClmOffBoundary(accepted, watermark);
+		if (mode === "malformed-on") {
+			manager.flushNow();
+		} else {
+			manager.appendClmOn(accepted, watermark);
+			manager.appendClmRevision(accepted, watermark, "settled-action");
+			if (mode === "off") manager.appendClmOffBoundary(accepted, watermark);
+		}
 		const path = manager.getSessionFile()!;
 		if (mode === "corrupt") {
 			writeFileSync(path, readFileSync(path, "utf8").replace(/"checksum":"[^"]+"/, '"checksum":"damaged"'));
 		}
+		if (mode === "malformed-on") writeFileSync(path, `${readFileSync(path, "utf8")}{"type":"clm_on",\n`);
 		const before = readFileSync(path, "utf8");
-		const startup = createRuntimeForTest(() => {}, { sessionManager: SessionManager.open(path) });
+		const startup = createRuntimeForTest(() => {}, {
+			sessionManager: SessionManager.open(path),
+			sessionOptions: { initialGoal: { objective: "must not seed" } },
+		});
 		await expect(startup).resolves.toHaveProperty("runtime");
 		const { runtime, faux } = await startup;
 		const connection = new InProcessAgentConnection(runtime);
@@ -208,23 +219,26 @@ describe("AgentSessionRuntime characterization", () => {
 			},
 		]);
 		const snapshot = await connection.getInitialSnapshot();
-		if (mode === "corrupt") {
-			expect(snapshot.messages.map(getMessageText)).toContain("original audit only");
-			expect((await connection.getMessages()).map(getMessageText)).toContain("original audit only");
+		if (mode === "corrupt" || mode === "malformed-on") {
+			expect(readFileSync(path, "utf8")).toBe(before);
+			expect(runtime.session.goalState.status).toBe("idle");
+			expect(() => SessionManager.open(path).buildSessionContext()).toThrow();
+			const audit = mode === "malformed-on" ? [] : ["original audit only"];
+			expect(snapshot.messages.map(getMessageText)).toEqual(audit);
+			expect((await connection.getMessages()).map(getMessageText)).toEqual(audit);
 			expect(snapshot.sessionTree?.tree.length).toBeGreaterThan(0);
 			expect(snapshot.sessionContext).toBeUndefined();
 			expect(runtime.session.agent.state.messages).toEqual([]);
 			await expect(connection.getSessionContext()).rejects.toMatchObject({ name: "ClmRecoveryError" });
-			await expect(connection.prompt("new request")).rejects.toMatchObject({ name: "ClmRecoveryError" });
-			await expect(connection.compact()).rejects.toMatchObject({ name: "ClmRecoveryError" });
-			await expect(connection.refine()).rejects.toMatchObject({ name: "ClmRecoveryError" });
-			await expect(connection.startSideQuestion("side", "question")).rejects.toMatchObject({
-				name: "ClmRecoveryError",
-			});
-			await expect(runtime.session.runRlmChild("child")).rejects.toMatchObject({ name: "ClmRecoveryError" });
-			await expect(runtime.session.navigateTree(watermark, { summarize: true })).rejects.toMatchObject({
-				name: "ClmRecoveryError",
-			});
+			for (const request of [
+				() => connection.prompt("new request"),
+				() => connection.compact(),
+				() => connection.refine(),
+				() => connection.startSideQuestion("side", "question"),
+				() => runtime.session.runRlmChild("child"),
+				() => runtime.session.navigateTree(watermark, { summarize: true }),
+			])
+				await expect(request()).rejects.toMatchObject({ name: "ClmRecoveryError" });
 			expect(requests).toEqual([]);
 			expect(readFileSync(path, "utf8")).toBe(before);
 			runtime.session.setAutoRetryEnabled(false);

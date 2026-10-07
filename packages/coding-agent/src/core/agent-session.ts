@@ -1877,7 +1877,7 @@ export class AgentSession {
 		// thinking_level_change, service_tier_change) and no persisted
 		// thread_goal_state. This prevents reseeding after clear/complete/error
 		// or restart/rehydration of a session that already has messages or a goal.
-		if (this._rlmDepth === 0 && config.initialGoal && this._isBranchSeedable()) {
+		if (!this._clmRecoveryError && this._rlmDepth === 0 && config.initialGoal && this._isBranchSeedable()) {
 			this._goalState = this._startGoal(config.initialGoal.objective, config.initialGoal.tokenBudget);
 			// Goal context is the model's only source of goal visibility; action
 			// admission is unavailable mid-construction, so ride the next turn.
