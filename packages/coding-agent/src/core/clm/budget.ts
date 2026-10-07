@@ -1,5 +1,13 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { Api, Model, Tool } from "@earendil-works/pi-ai";
+import type { Api, ImageContent, Model, TextContent, Tool } from "@earendil-works/pi-ai";
+import {
+	BRANCH_SUMMARY_PREFIX,
+	BRANCH_SUMMARY_SUFFIX,
+	COMPACTION_SUMMARY_PREFIX,
+	COMPACTION_SUMMARY_SUFFIX,
+	HARNESS_DIGEST_PREFIX,
+	HARNESS_DIGEST_SUFFIX,
+} from "../messages.js";
 
 export interface ClmRequestBudget {
 	estimatedInputTokens: number;
@@ -43,29 +51,35 @@ function estimateImage(data: string): number {
 	return Math.max(1200, Math.ceil(data.length / 4));
 }
 
-function estimateContent(
-	content: string | Array<{ type: string; text?: string; data?: string; mimeType?: string }>,
-): number {
+function estimateContent(content: string | (TextContent | ImageContent)[]): number {
 	if (typeof content === "string") return Math.ceil(content.length / 4);
-	return content.reduce((total, block) => {
-		if (block.type === "image") return total + estimateImage(block.data ?? "");
-		return total + Math.ceil((block.text?.length ?? 0) / 4);
-	}, 0);
+	return content.reduce((total, block) => total + estimateContentBlock(block), 0);
+}
+
+function estimateContentBlock(block: TextContent | ImageContent): number {
+	switch (block.type) {
+		case "text":
+			return Math.ceil(block.text.length / 4);
+		case "image":
+			return estimateImage(block.data);
+	}
 }
 
 function estimateMessage(message: AgentMessage): number {
 	switch (message.role) {
 		case "user":
-		case "toolResult":
 		case "custom":
 			return estimateContent(message.content);
+		case "toolResult":
+			return Math.ceil((message.toolCallId.length + message.toolName.length) / 4) + estimateContent(message.content);
 		case "assistant":
 			return message.content.reduce((total, block) => total + estimateAssistantBlock(block), 0);
 		case "bashExecution":
 			return Math.ceil((message.command.length + message.output.length) / 4);
 		case "branchSummary":
+			return estimateBranchSummary(message.summary);
 		case "compactionSummary":
-			return Math.ceil(message.summary.length / 4);
+			return estimateCompactionSummary(message.summary, message.harnessDigest);
 	}
 	return 0;
 }
@@ -77,6 +91,19 @@ function estimateAssistantBlock(block: Extract<AgentMessage, { role: "assistant"
 		case "thinking":
 			return Math.ceil(block.thinking.length / 4);
 		case "toolCall":
-			return Math.ceil((block.name.length + JSON.stringify(block.arguments).length) / 4);
+			return Math.ceil((block.id.length + block.name.length + JSON.stringify(block.arguments).length) / 4);
 	}
+}
+
+function estimateBranchSummary(summary: string): number {
+	return Math.ceil((BRANCH_SUMMARY_PREFIX.length + summary.length + BRANCH_SUMMARY_SUFFIX.length) / 4);
+}
+
+function estimateCompactionSummary(summary: string, harnessDigest?: string): number {
+	const digestLength = harnessDigest
+		? HARNESS_DIGEST_PREFIX.length + harnessDigest.length + HARNESS_DIGEST_SUFFIX.length + 2
+		: 0;
+	return Math.ceil(
+		(digestLength + COMPACTION_SUMMARY_PREFIX.length + summary.length + COMPACTION_SUMMARY_SUFFIX.length) / 4,
+	);
 }
