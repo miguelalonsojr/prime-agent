@@ -669,41 +669,45 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 			return beforeResult;
 		}
 
-		this.session.assertClmOperationAllowed("session import");
-		const previousSessionFile = this.session.sessionFile;
-		const lease = this.acquireReplacementLease(destinationPath);
-		let sessionManager: SessionManager;
+		const releaseClmReservation = this.session.reserveClmSessionReplacement();
 		try {
-			if (resolve(destinationPath) !== resolvedPath) {
-				copyFileSync(resolvedPath, destinationPath);
-			}
+			const previousSessionFile = this.session.sessionFile;
+			const lease = this.acquireReplacementLease(destinationPath);
+			let sessionManager: SessionManager;
+			try {
+				if (resolve(destinationPath) !== resolvedPath) {
+					copyFileSync(resolvedPath, destinationPath);
+				}
 
-			sessionManager = SessionManager.open(destinationPath, sessionDir, cwdOverride);
-			assertSessionCwdExists(sessionManager, this.cwd);
-		} catch (error) {
-			this.releaseUncommittedLease(lease);
-			throw error;
+				sessionManager = SessionManager.open(destinationPath, sessionDir, cwdOverride);
+				assertSessionCwdExists(sessionManager, this.cwd);
+			} catch (error) {
+				this.releaseUncommittedLease(lease);
+				throw error;
+			}
+			await this.teardownForReplacement("resume", sessionManager.getSessionFile(), lease);
+			await this.buildAndApplyReplacement(
+				() =>
+					this.scopedBuild(() =>
+						this.createRuntime({
+							cwd: sessionManager.getCwd(),
+							agentDir: this.services.agentDir,
+							sessionManager,
+							sessionStartEvent: {
+								type: "session_start",
+								reason: "resume",
+								previousSessionFile,
+							},
+							sessionConfig: this.sessionConfig,
+						}),
+					),
+				lease,
+			);
+			await this.finishSessionReplacement();
+			return { cancelled: false };
+		} finally {
+			releaseClmReservation();
 		}
-		await this.teardownForReplacement("resume", sessionManager.getSessionFile(), lease);
-		await this.buildAndApplyReplacement(
-			() =>
-				this.scopedBuild(() =>
-					this.createRuntime({
-						cwd: sessionManager.getCwd(),
-						agentDir: this.services.agentDir,
-						sessionManager,
-						sessionStartEvent: {
-							type: "session_start",
-							reason: "resume",
-							previousSessionFile,
-						},
-						sessionConfig: this.sessionConfig,
-					}),
-				),
-			lease,
-		);
-		await this.finishSessionReplacement();
-		return { cancelled: false };
 	}
 
 	private async disposeOnce(options: AgentSessionRuntimeDisposeOptions): Promise<void> {
