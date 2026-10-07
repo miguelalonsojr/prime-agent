@@ -429,37 +429,41 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 			return beforeResult;
 		}
 
-		this.session.assertClmOperationAllowed("session switching");
-		const previousSessionFile = this.session.sessionFile;
-		const lease = this.acquireReplacementLease(sessionPath);
-		let sessionManager: SessionManager;
+		const releaseClmReservation = this.session.reserveClmSessionReplacement();
 		try {
-			sessionManager = SessionManager.open(sessionPath, undefined, options?.cwdOverride);
-			assertSessionCwdExists(sessionManager, this.cwd);
-		} catch (error) {
-			this.releaseUncommittedLease(lease);
-			throw error;
+			const previousSessionFile = this.session.sessionFile;
+			const lease = this.acquireReplacementLease(sessionPath);
+			let sessionManager: SessionManager;
+			try {
+				sessionManager = SessionManager.open(sessionPath, undefined, options?.cwdOverride);
+				assertSessionCwdExists(sessionManager, this.cwd);
+			} catch (error) {
+				this.releaseUncommittedLease(lease);
+				throw error;
+			}
+			await this.teardownForReplacement("resume", sessionManager.getSessionFile(), lease);
+			await this.buildAndApplyReplacement(
+				() =>
+					this.scopedBuild(() =>
+						this.createRuntime({
+							cwd: sessionManager.getCwd(),
+							agentDir: this.services.agentDir,
+							sessionManager,
+							sessionStartEvent: {
+								type: "session_start",
+								reason: "resume",
+								previousSessionFile,
+							},
+							sessionConfig: this.sessionConfig,
+						}),
+					),
+				lease,
+			);
+			await this.finishSessionReplacement(options?.withSession);
+			return { cancelled: false };
+		} finally {
+			releaseClmReservation();
 		}
-		await this.teardownForReplacement("resume", sessionManager.getSessionFile(), lease);
-		await this.buildAndApplyReplacement(
-			() =>
-				this.scopedBuild(() =>
-					this.createRuntime({
-						cwd: sessionManager.getCwd(),
-						agentDir: this.services.agentDir,
-						sessionManager,
-						sessionStartEvent: {
-							type: "session_start",
-							reason: "resume",
-							previousSessionFile,
-						},
-						sessionConfig: this.sessionConfig,
-					}),
-				),
-			lease,
-		);
-		await this.finishSessionReplacement(options?.withSession);
-		return { cancelled: false };
 	}
 
 	async newSession(options?: {

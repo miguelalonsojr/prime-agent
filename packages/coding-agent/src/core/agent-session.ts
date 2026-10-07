@@ -1989,6 +1989,18 @@ export class AgentSession {
 			throw new Error(`CLM is on or changing; turn CLM off before ${operation}`);
 	}
 
+	/** Reserve the old session before a replacement manager can read its log. */
+	reserveClmSessionReplacement(): () => void {
+		this.assertClmOperationAllowed("session replacement");
+		this._clmTransition = true;
+		let released = false;
+		return () => {
+			if (released) return;
+			released = true;
+			this._clmTransition = false;
+		};
+	}
+
 	private _assertClmTransitionIdle(): void {
 		this.assertModelContextAvailable();
 		if (

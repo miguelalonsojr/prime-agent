@@ -388,6 +388,49 @@ describe("AgentSessionRuntime characterization", () => {
 		}
 	});
 
+	it("reserves same-path replacement against a CLM enable during shutdown", async () => {
+		const entered = createDeferred();
+		const release = createDeferred();
+		const { runtime, faux } = await createRuntimeForTest((pi) => {
+			pi.on("session_shutdown", async (event) => {
+				if (event.reason !== "resume") return;
+				entered.resolve();
+				await release.promise;
+			});
+		});
+		const oldSession = runtime.session;
+		await oldSession.prompt("persisted off context");
+		const path = oldSession.sessionFile!;
+		const replacing = runtime.switchSession(path);
+		try {
+			await entered.promise;
+			await expect(oldSession.setClmMode(true)).rejects.toThrow(/CLM/);
+			expect(SessionManager.open(path).getClmBranchState().mode).toBe("off");
+		} finally {
+			release.resolve();
+			await replacing;
+		}
+		expect((await runtime.session.getClmStatus()).mode).toBe("off");
+		faux.setResponses([
+			(context) => {
+				expect(JSON.stringify(context.messages)).toContain("persisted off context");
+				return fauxAssistantMessage("normal replacement reply");
+			},
+		]);
+		await runtime.session.prompt("first replacement request");
+		expect(getMessageText(runtime.session.messages.at(-1))).toBe("normal replacement reply");
+		expect(SessionManager.open(path).getClmBranchState().mode).toBe("off");
+		runtime.setBeforeSessionInvalidate(() => {
+			throw new Error("held teardown failure");
+		});
+		try {
+			await expect(runtime.switchSession(path)).rejects.toThrow("held teardown failure");
+		} finally {
+			runtime.setBeforeSessionInvalidate(undefined);
+		}
+		await expect(runtime.session.setClmMode(true)).resolves.toMatchObject({ mode: "on" });
+	});
+
 	it("rejects enabling CLM during an action or over malformed context before mode persistence", async () => {
 		const h = await createHarness({ persistSession: true });
 		cleanups.push(h.cleanup);
