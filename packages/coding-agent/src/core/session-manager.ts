@@ -484,6 +484,43 @@ export function getLatestCompactionEntry(entries: SessionEntry[]): CompactionEnt
 	return null;
 }
 
+function clmWatermarkIndex(
+	path: SessionEntry[],
+	accepted: ClmOnEntry | ClmRevisionEntry | ClmOffBoundaryEntry,
+): number {
+	const boundaryIndex = path.indexOf(accepted);
+	if (accepted.auditWatermark === null) return boundaryIndex;
+	const index = path.findIndex((entry) => entry.id === accepted.auditWatermark);
+	const watermark = path[index];
+	if (
+		index < 0 ||
+		index >= boundaryIndex ||
+		(watermark.type !== "message" &&
+			watermark.type !== "custom_message" &&
+			watermark.type !== "branch_summary" &&
+			watermark.type !== "compaction")
+	)
+		throw new Error(`CLM audit watermark invalid on selected branch: ${accepted.auditWatermark}`);
+	return index;
+}
+
+function frozenClmEntries(accepted: ClmOnEntry | ClmRevisionEntry | ClmOffBoundaryEntry): SessionMessageEntry[] {
+	return accepted.snapshot.blocks.map((block) => ({
+		type: "message",
+		id: block.id,
+		parentId: null,
+		timestamp: accepted.timestamp,
+		message: block.message,
+	}));
+}
+
+function latestCompactionAfter(path: SessionEntry[], start: number): CompactionEntry | null {
+	for (let i = path.length - 1; i >= start; i--) {
+		if (path[i].type === "compaction") return path[i] as CompactionEntry;
+	}
+	return null;
+}
+
 export function buildSessionContext(
 	entries: SessionEntry[],
 	leafId?: string | null,
@@ -512,7 +549,7 @@ export function buildSessionContext(
 	}
 
 	// push+reverse, not unshift-per-entry: unshift is O(n), making this O(n^2) on long sessions.
-	const path: SessionEntry[] = [];
+	let path: SessionEntry[] = [];
 	let current: SessionEntry | undefined = leaf;
 	while (current) {
 		path.push(current);
@@ -543,39 +580,33 @@ export function buildSessionContext(
 		}
 	}
 
+	let clm: ClmBranchState | undefined;
 	if (clmEntry) {
-		const watermarkIndex =
-			clmEntry.auditWatermark === null
-				? path.indexOf(clmEntry)
-				: path.findIndex((entry) => entry.id === clmEntry.auditWatermark);
-		if (watermarkIndex < 0) {
-			throw new Error(`CLM audit watermark not found on selected branch: ${clmEntry.auditWatermark}`);
-		}
-		const messages = clmEntry.snapshot.blocks.map((block) => block.message);
-		for (let i = watermarkIndex + 1; i < path.length; i++) {
-			const entry = path[i];
-			if (entry.type === "message") messages.push(entry.message);
-			else if (entry.type === "custom_message") {
-				messages.push(
-					createCustomMessage(entry.customType, entry.content, entry.display, entry.details, entry.timestamp),
-				);
-			} else if (entry.type === "branch_summary" && entry.summary) {
-				messages.push(createBranchSummaryMessage(entry.summary, entry.fromId, entry.timestamp));
-			}
-		}
-		return {
-			messages,
-			thinkingLevel,
-			serviceTier,
-			model,
-			clm: {
-				mode: clmEntry.type === "clm_off_boundary" ? "off" : "on",
-				epochId: clmEntry.epochId,
-				revision: clmEntry.revision,
-				snapshot: clmEntry.snapshot,
-				auditWatermark: clmEntry.auditWatermark,
-			},
+		const watermarkIndex = clmWatermarkIndex(path, clmEntry);
+		clm = {
+			mode: clmEntry.type === "clm_off_boundary" ? "off" : "on",
+			epochId: clmEntry.epochId,
+			revision: clmEntry.revision,
+			snapshot: clmEntry.snapshot,
+			auditWatermark: clmEntry.auditWatermark,
 		};
+		const frozen = frozenClmEntries(clmEntry);
+		path = [...frozen, ...path.slice(watermarkIndex + 1)];
+		if (clm.mode === "on") {
+			const messages = frozen.map((entry) => entry.message);
+			for (const entry of path.slice(frozen.length)) {
+				if (entry.type === "message") messages.push(entry.message);
+				else if (entry.type === "custom_message") {
+					messages.push(
+						createCustomMessage(entry.customType, entry.content, entry.display, entry.details, entry.timestamp),
+					);
+				} else if (entry.type === "branch_summary" && entry.summary) {
+					messages.push(createBranchSummaryMessage(entry.summary, entry.fromId, entry.timestamp));
+				}
+			}
+			return { messages, thinkingLevel, serviceTier, model, clm };
+		}
+		compaction = latestCompactionAfter(path, frozen.length);
 	}
 
 	// Harness digests are regenerable snapshots of persistent state, so only the
@@ -587,7 +618,12 @@ export function buildSessionContext(
 	let newestDigestIdx = -1;
 	for (let i = path.length - 1; i >= 0; i--) {
 		const entry = path[i];
-		if (entry.type === "custom_message" && entry.customType === HARNESS_DIGEST_CUSTOM_TYPE) {
+		if (
+			(entry.type === "custom_message" && entry.customType === HARNESS_DIGEST_CUSTOM_TYPE) ||
+			(entry.type === "message" &&
+				entry.message.role === "custom" &&
+				entry.message.customType === HARNESS_DIGEST_CUSTOM_TYPE)
+		) {
 			newestDigestEntryId = entry.id;
 			newestDigestIdx = i;
 			break;
@@ -609,6 +645,12 @@ export function buildSessionContext(
 
 	const appendMessage = (entry: SessionEntry, target = messages) => {
 		if (entry.type === "message") {
+			if (
+				entry.message.role === "custom" &&
+				entry.message.customType === HARNESS_DIGEST_CUSTOM_TYPE &&
+				entry.id !== keepDigestEntryId
+			)
+				return;
 			target.push(entry.message);
 		} else if (entry.type === "custom_message") {
 			if (entry.customType === HARNESS_DIGEST_CUSTOM_TYPE && entry.id !== keepDigestEntryId) {
@@ -661,7 +703,7 @@ export function buildSessionContext(
 		}
 	}
 
-	return { messages, thinkingLevel, serviceTier, model };
+	return { messages, thinkingLevel, serviceTier, model, ...(clm ? { clm } : {}) };
 }
 
 export function getDefaultSessionDir(_cwd: string, agentDir: string = getDefaultAgentDir()): string {

@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { HARNESS_DIGEST_CUSTOM_TYPE } from "../../src/core/messages.js";
+import { createCustomMessage, HARNESS_DIGEST_CUSTOM_TYPE } from "../../src/core/messages.js";
 import {
 	type BranchSummaryEntry,
 	buildSessionContext,
+	type ClmOnEntry,
+	type ClmSnapshot,
 	type CustomMessageEntry,
 	type SessionEntry,
 	type SessionMessageEntry,
@@ -38,6 +40,16 @@ function msg(id: string, parentId: string | null, role: "user" | "assistant", te
 
 function branchSummary(id: string, parentId: string | null, summary: string, fromId: string): BranchSummaryEntry {
 	return { type: "branch_summary", id, parentId, timestamp: T, summary, fromId };
+}
+
+function clmOn(
+	id: string,
+	parentId: string,
+	auditWatermark: string,
+	blocks: ClmSnapshot["blocks"],
+	epochId = "epoch-a",
+): ClmOnEntry {
+	return { type: "clm_on", id, parentId, timestamp: T, epochId, revision: 0, auditWatermark, snapshot: { blocks } };
 }
 
 function digestEntry(id: string, parentId: string | null, digest: string): CustomMessageEntry {
@@ -201,14 +213,12 @@ describe("buildSessionContext", () => {
 		const base = { timestamp: T, epochId: "epoch-a", auditWatermark: "2" };
 		const entries: SessionEntry[] = [
 			...audit,
-			{
-				type: "clm_on",
-				id: "3",
-				parentId: "2",
-				...base,
-				revision: 0,
-				snapshot: { blocks: audit.map((entry) => ({ id: entry.id, message: entry.message })) },
-			},
+			clmOn(
+				"3",
+				"2",
+				"2",
+				audit.map((entry) => ({ id: entry.id, message: entry.message })),
+			),
 			{
 				type: "clm_revision",
 				id: "4",
@@ -232,49 +242,81 @@ describe("buildSessionContext", () => {
 		expect(alternate.clm).toBeUndefined();
 	});
 
-	it("does not replay an audit message covered by the off boundary watermark", () => {
-		const retained = msg("1", null, "user", "retained");
-		const covered = msg("2", "1", "user", "covered");
-		const base = { timestamp: T, epochId: "epoch-a", auditWatermark: "2" };
-		const entries: SessionEntry[] = [
-			retained,
-			covered,
+	it("applies normal compaction and digest rules after the frozen off boundary", () => {
+		const entries = chain("u obsolete", "u retained");
+		entries.push(
 			{
-				type: "clm_on",
-				id: "3",
-				parentId: "2",
-				...base,
-				revision: 0,
-				snapshot: { blocks: [{ id: "1", message: retained.message }] },
-			},
-			{
-				type: "clm_off_boundary",
-				id: "4",
-				parentId: "3",
-				...base,
+				...clmOn(
+					"3",
+					"2",
+					"2",
+					[
+						{ id: "kept", message: (entries[1] as SessionMessageEntry).message },
+						{
+							id: "old",
+							message: createCustomMessage(
+								HARNESS_DIGEST_CUSTOM_TYPE,
+								"frozen digest",
+								false,
+								{ digest: "frozen digest" },
+								T,
+							),
+						},
+					],
+					"e",
+				),
+				type: "clm_off_boundary" as const,
 				revision: 1,
-				snapshot: { blocks: [{ id: "1", message: retained.message }] },
 			},
-			msg("5", "4", "user", "continued"),
-		];
-		const context = buildSessionContext(entries);
-		expect(context.clm).toMatchObject({ mode: "off", epochId: "epoch-a", revision: 1 });
-		expect(context.messages.map(textOf)).toEqual(["retained", "continued"]);
+			digestEntry("4", "3", "old digest"),
+		);
+		expect(digestOf(buildSessionContext(entries).messages)).toEqual(["old digest"]);
+		entries.push(
+			msg("5", "4", "user", "covered by summary"),
+			{
+				type: "compaction",
+				id: "6",
+				parentId: "5",
+				timestamp: T,
+				summary: "post-off summary",
+				firstKeptEntryId: "7",
+				tokensBefore: 100,
+				harnessDigest: "snapshot digest",
+			},
+			msg("7", "6", "user", "after summary"),
+		);
+		const compacted = buildSessionContext(entries);
+		expect(compacted.clm?.mode).toBe("off");
+		expect(compacted.messages.map(textOf)).toEqual(["", "after summary"]);
+		expect(compacted.messages[0] as { summary: string; harnessDigest?: string }).toMatchObject({
+			summary: "post-off summary",
+			harnessDigest: "snapshot digest",
+		});
+		expect(JSON.stringify(compacted.messages)).not.toContain("obsolete");
+	});
+
+	it("rejects forward or non-audit CLM watermarks but accepts a prior compaction", () => {
+		const entries = chain("u obsolete", "c safe summary|1", "t high");
+		entries.push(clmOn("4", "3", "2", [], "e"), msg("5", "4", "user", "future"));
+		expect(buildSessionContext(entries, "4").clm?.auditWatermark).toBe("2");
+		for (const invalidId of ["3", "4", "5"]) {
+			entries[3] = { ...entries[3], auditWatermark: invalidId } as SessionEntry;
+			expect(() => buildSessionContext(entries, "5")).toThrow(/CLM audit watermark/);
+		}
 	});
 
 	it("enables from the already-compacted model context instead of old audit", () => {
 		const entries = chain("u obsolete", "u retained", "c compacted|2", "u recent");
 		const initial = buildSessionContext(entries).messages;
-		entries.push({
-			type: "clm_on",
-			id: "5",
-			parentId: "4",
-			timestamp: T,
-			epochId: "epoch-b",
-			revision: 0,
-			snapshot: { blocks: initial.map((message, index) => ({ id: `block-${index}`, message })) },
-			auditWatermark: "4",
-		});
+		entries.push(
+			clmOn(
+				"5",
+				"4",
+				"4",
+				initial.map((message, index) => ({ id: `block-${index}`, message })),
+				"epoch-b",
+			),
+		);
 		const context = buildSessionContext(entries);
 		expect(context.clm).toMatchObject({ mode: "on", epochId: "epoch-b", revision: 0 });
 		expect(context.messages).toEqual(initial);
