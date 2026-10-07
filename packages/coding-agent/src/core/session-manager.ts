@@ -607,6 +607,18 @@ function frozenClmEntries(accepted: ClmOnEntry | ClmRevisionEntry | ClmOffBounda
 	}));
 }
 
+/** Project accepted bodies without exposing covered audit entries to compaction helpers. */
+export function getCompactionContextEntries(path: SessionEntry[]): SessionEntry[] {
+	validateClmBranch(path);
+	const accepted = path.slice().reverse().find(isClmEntry);
+	if (!accepted) return path;
+	if (accepted.type !== "clm_off_boundary") throw new Error("CLM is on; turn CLM off before compaction");
+	const projected = [...frozenClmEntries(accepted), ...path.slice(clmWatermarkIndex(path, accepted) + 1)].filter(
+		(entry) => !isClmEntry(entry),
+	);
+	return projected.map((entry, index) => ({ ...entry, parentId: projected[index - 1]?.id ?? null }));
+}
+
 function latestCompactionAfter(path: SessionEntry[], start: number): CompactionEntry | null {
 	for (let i = path.length - 1; i >= start; i--) {
 		if (path[i].type === "compaction") return path[i] as CompactionEntry;
@@ -1967,6 +1979,7 @@ export class SessionManager {
 	private leafBranchCache: { leafId: string | null; entries: SessionEntry[] } | null = null;
 	private persistListeners = new Set<SessionPersistListener>();
 	private clmRecoveryError: string | undefined;
+	private clmDefaultEligible = false;
 
 	private constructor(
 		cwd: string,
@@ -1999,6 +2012,7 @@ export class SessionManager {
 		this.sessionFile = resolve(sessionFile);
 		if (existsSync(this.sessionFile)) {
 			if (this.persist && preloadedEntries === undefined) repairJsonlDamage(this.sessionFile);
+			this.clmDefaultEligible = false;
 			this.fileEntries = preloadedEntries ?? loadEntriesFromFile(this.sessionFile);
 			this.clmRecoveryError = clmParseError(this.fileEntries);
 			this._refreshHasAssistantEntry();
@@ -2008,6 +2022,7 @@ export class SessionManager {
 			if (this.fileEntries.length === 0) {
 				const explicitPath = this.sessionFile;
 				this.newSession();
+				this.clmDefaultEligible = false;
 				this.sessionFile = explicitPath;
 				this._rewriteFile();
 				this.flushed = true;
@@ -2061,6 +2076,7 @@ export class SessionManager {
 		}
 
 		this.clmRecoveryError = undefined;
+		this.clmDefaultEligible = true;
 		this.sessionId = sessionId;
 		const timestamp = new Date().toISOString();
 		const git = this.persist ? (captureGitContext(this.cwd) ?? undefined) : undefined;
@@ -2323,6 +2339,83 @@ export class SessionManager {
 					auditWatermark: entry.auditWatermark,
 				}
 			: { mode: "off", auditWatermark: null };
+	}
+
+	/** Defaults are consumed once, and never applied to a loaded or seeded transcript. */
+	consumeClmDefaultEligibility(): boolean {
+		const eligible = this.clmDefaultEligible;
+		this.clmDefaultEligible = false;
+		return (
+			eligible &&
+			this.getEntries().every(
+				(entry) =>
+					entry.type === "model_change" ||
+					entry.type === "thinking_level_change" ||
+					entry.type === "service_tier_change",
+			)
+		);
+	}
+
+	captureClmContext(): { snapshot: ClmSnapshot; watermark: string | null } {
+		const messages = this.buildSessionContext().messages;
+		const branch = this.getBranch();
+		const accepted = branch.slice().reverse().find(isClmEntry);
+		const candidates = accepted
+			? [...frozenClmEntries(accepted), ...branch.slice(clmWatermarkIndex(branch, accepted) + 1)]
+			: branch;
+		const nativeIds = new Map<AgentMessage, string[]>();
+		const generatedIds = new Map<string, string[]>();
+		let summaryId = getLatestCompactionEntry(candidates)?.id;
+		// Reverse stacks preserve distinct durable IDs even for repeated identical messages.
+		for (let index = candidates.length - 1; index >= 0; index--) {
+			const entry = candidates[index];
+			if (entry.type === "message") {
+				const ids = nativeIds.get(entry.message) ?? [];
+				ids.push(entry.id);
+				nativeIds.set(entry.message, ids);
+				continue;
+			}
+			let message: AgentMessage;
+			if (entry.type === "custom_message") {
+				message = createCustomMessage(
+					entry.customType,
+					entry.content,
+					entry.display,
+					entry.details,
+					entry.timestamp,
+				);
+			} else if (entry.type === "branch_summary") {
+				message = createBranchSummaryMessage(entry.summary, entry.fromId, entry.timestamp);
+			} else {
+				continue;
+			}
+			const key = JSON.stringify(message);
+			const ids = generatedIds.get(key) ?? [];
+			ids.push(entry.id);
+			generatedIds.set(key, ids);
+		}
+		const blocks = messages.map((message): ClmBlock => {
+			let id = nativeIds.get(message)?.pop();
+			if (id === undefined && message.role === "compactionSummary") {
+				id = summaryId;
+				summaryId = undefined;
+			}
+			id ??= generatedIds.get(JSON.stringify(message))?.pop();
+			if (!id) throw new Error("CLM context cannot be mapped to durable entries");
+			return { id, message: structuredClone(message) };
+		});
+		const watermark =
+			branch
+				.slice()
+				.reverse()
+				.find(
+					(entry) =>
+						entry.type === "message" ||
+						entry.type === "custom_message" ||
+						entry.type === "branch_summary" ||
+						entry.type === "compaction",
+				)?.id ?? null;
+		return { snapshot: { blocks }, watermark };
 	}
 
 	appendClmOn(snapshot: ClmSnapshot, watermark: string | null): string {

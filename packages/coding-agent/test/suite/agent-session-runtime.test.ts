@@ -1,7 +1,8 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { fauxAssistantMessage, registerFauxProvider } from "@earendil-works/pi-ai";
+import { fauxAssistantMessage, fauxToolCall, registerFauxProvider } from "@earendil-works/pi-ai";
+import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AgentSession } from "../../src/core/agent-session.js";
 import type { AgentSessionRuntimeConfig } from "../../src/core/agent-session-config.js";
@@ -14,6 +15,8 @@ import {
 	createAgentSessionServices,
 } from "../../src/core/agent-session-runtime.js";
 import { AuthStorage } from "../../src/core/auth-storage.js";
+import { renderContextDocument } from "../../src/core/clm/context-document.js";
+import { LiveContextController } from "../../src/core/clm/live-context.js";
 import type { SubagentRuntimeHost } from "../../src/core/rlm-runtime.js";
 import { createAgentSession } from "../../src/core/sdk.js";
 import {
@@ -36,6 +39,8 @@ import { createDefaultRuntimeFactory } from "../../src/main.js";
 import { InProcessAgentConnection } from "../../src/modes/agent-connection/in-process-agent-connection.js";
 import { assistantMsg, createTestResourceLoader, userMsg } from "../utilities.js";
 import { conversationMessages, createHarness, getMessageText, type Harness } from "./harness.js";
+
+import { createDeferred } from "./scheduling.js";
 
 type RecordedSessionEvent =
 	| SessionBeforeSwitchEvent
@@ -250,6 +255,183 @@ describe("AgentSessionRuntime characterization", () => {
 			expect(requests[0]).toContain("accepted context");
 			expect(requests[0]).not.toContain("original audit only");
 		}
+	});
+
+	it("keeps forgotten audit text out after CLM turns off and opens a fresh epoch", async () => {
+		const { runtime, faux } = await createRuntimeForTest(() => {});
+		const session = runtime.session;
+		await session.prompt("obsolete");
+		const on = await session.setClmMode(true);
+		const manager = session.sessionManager;
+		const controller = await LiveContextController.open(manager, manager.getSessionArtifactDir()!);
+		await controller.prepareToolAction("forget", new Map());
+		const snapshot = manager.getClmBranchState().snapshot!;
+		snapshot.blocks = snapshot.blocks.filter((block) => !JSON.stringify(block).includes("obsolete"));
+		writeFileSync(on.path, renderContextDocument(snapshot, new Set()));
+		await controller.settleToolAction("forget", new Map(), { model: faux.getModel(), tools: [], systemPrompt: "" });
+		await session.setClmMode(false);
+		expect(JSON.stringify(manager.buildSessionContext().messages)).not.toContain("obsolete");
+		faux.setResponses([
+			(context) => {
+				expect(JSON.stringify(context.messages)).not.toContain("obsolete");
+				return fauxAssistantMessage("after off");
+			},
+		]);
+		await session.prompt("continue");
+		const reopened = await session.setClmMode(true);
+		expect(reopened.epochId).not.toBe(on.epochId);
+		expect(reopened.revision).toBe(0);
+		expect(readFileSync(reopened.path, "utf8")).not.toContain("obsolete");
+		await session.restoreClmRevision(reopened.epochId!, 0);
+		expect((await session.getClmStatus()).revision).toBe(1);
+		await expect(session.restoreClmRevision(on.epochId!, 0)).rejects.toThrow(/CLM/);
+	});
+
+	it("uses defaults only for new sessions and persists explicit mode across reload and resume", async () => {
+		const h = await createHarness({ persistSession: true, settings: { clm: { enabled: true } } });
+		cleanups.push(h.cleanup);
+		expect(h.sessionManager.getClmBranchState().mode).toBe("on");
+		h.settingsManager.applyOverrides({ clm: { enabled: false } });
+		await h.settingsManager.reload();
+		expect((await h.session.getClmStatus()).mode).toBe("on");
+		const path = h.session.sessionFile!;
+		await h.session.disposeAsync();
+		const { runtime, tempDir } = await createRuntimeForTest(() => {}, { sessionManager: SessionManager.open(path) });
+		expect((await runtime.session.getClmStatus()).mode).toBe("on");
+		await runtime.session.setClmMode(false);
+		writeFileSync(join(tempDir, "settings.json"), JSON.stringify({ clm: { enabled: true } }));
+		await runtime.services.settingsManager.reload();
+		expect((await runtime.session.getClmStatus()).mode).toBe("off");
+		await runtime.switchSession(path);
+		expect((await runtime.session.getClmStatus()).mode).toBe("off");
+		await runtime.newSession();
+		expect((await runtime.session.getClmStatus()).mode).toBe("on");
+	});
+
+	it("restores only active-epoch ancestor revisions with the current watermark", async () => {
+		const { runtime } = await createRuntimeForTest(() => {});
+		const s = runtime.session;
+		await s.prompt("first");
+		const on = await s.setClmMode(true);
+		await s.prompt("later");
+		const watermark = s.sessionManager
+			.getBranch()
+			.filter((e) => e.type === "message")
+			.at(-1)!.id;
+		await s.restoreClmRevision(on.epochId!, 0);
+		expect(s.sessionManager.getClmBranchState()).toMatchObject({ revision: 1, auditWatermark: watermark });
+		expect(JSON.stringify(s.buildSessionContext().messages)).not.toContain("later");
+		const ancestor = s.sessionManager.getLeafId()!;
+		s.sessionManager.appendClmRevision({ blocks: [] }, watermark, "abandoned");
+		s.sessionManager.branch(ancestor);
+		const before = readFileSync(s.sessionFile!, "utf8");
+		await expect(s.restoreClmRevision(on.epochId!, 2)).rejects.toThrow(/CLM/);
+		expect(readFileSync(s.sessionFile!, "utf8")).toBe(before);
+		await s.setClmMode(false);
+		await expect(s.restoreClmRevision(on.epochId!, 0)).rejects.toThrow(/CLM/);
+	});
+
+	it("rejects mode changes and same-path switching before opening an active or cancelled CLM writer", async () => {
+		const started = createDeferred();
+		const release = createDeferred();
+		const settled = createDeferred();
+		const { runtime, faux } = await createRuntimeForTest(() => {}, {
+			sessionOptions: {
+				customTools: [
+					{
+						name: "held",
+						label: "held",
+						description: "held writer",
+						parameters: Type.Object({}),
+						execute: async () => {
+							started.resolve();
+							await release.promise;
+							settled.resolve();
+							return { content: [], details: {} };
+						},
+					},
+				],
+			},
+		});
+		const s = runtime.session;
+		const on = await s.setClmMode(true);
+		faux.setResponses([fauxAssistantMessage(fauxToolCall("held", {}), { stopReason: "toolUse" })]);
+		const run = s.prompt("hold");
+		try {
+			await started.promise;
+			const open = vi.spyOn(SessionManager, "open");
+			try {
+				const before = readFileSync(s.sessionFile!, "utf8");
+				for (const operation of [
+					() => s.setClmMode(true),
+					() => s.setClmMode(false),
+					() => s.restoreClmRevision(on.epochId!, 0),
+					() => runtime.switchSession(s.sessionFile!),
+				])
+					await expect(operation()).rejects.toThrow(/CLM/);
+				expect(open).not.toHaveBeenCalled();
+				expect(readFileSync(s.sessionFile!, "utf8")).toBe(before);
+				await s.abort();
+				await run;
+				const aborted = readFileSync(s.sessionFile!, "utf8");
+				await expect(runtime.switchSession(s.sessionFile!)).rejects.toThrow(/CLM/);
+				await expect(s.setClmMode(false)).rejects.toThrow(/CLM/);
+				expect(open).not.toHaveBeenCalled();
+				expect(readFileSync(s.sessionFile!, "utf8")).toBe(aborted);
+			} finally {
+				open.mockRestore();
+			}
+		} finally {
+			release.resolve();
+			await settled.promise;
+			await run;
+		}
+	});
+
+	it("rejects enabling CLM during an action or over malformed context before mode persistence", async () => {
+		const h = await createHarness({ persistSession: true });
+		cleanups.push(h.cleanup);
+		const started = createDeferred();
+		const release = createDeferred();
+		h.setResponses([
+			async () => {
+				started.resolve();
+				await release.promise;
+				return fauxAssistantMessage("done");
+			},
+		]);
+		const run = h.session.prompt("active");
+		try {
+			await started.promise;
+			const before = h.sessionManager.getEntries();
+			await expect(h.session.setClmMode(true)).rejects.toThrow(/CLM.*idle/);
+			expect(h.sessionManager.getEntries()).toEqual(before);
+		} finally {
+			release.resolve();
+			await run;
+		}
+		h.sessionManager.appendMessage({
+			role: "toolResult",
+			toolCallId: "orphan",
+			toolName: "missing",
+			content: [],
+			isError: false,
+			timestamp: 1,
+		});
+		const before = h.sessionManager.getEntries();
+		await expect(h.session.setClmMode(true)).rejects.toThrow();
+		expect(h.sessionManager.getEntries()).toEqual(before);
+	});
+
+	it("guards on-mode navigation before audit mutation", async () => {
+		const { runtime } = await createRuntimeForTest(() => {});
+		await runtime.session.prompt("seed");
+		const target = runtime.session.sessionManager.getLeafId()!;
+		await runtime.session.setClmMode(true);
+		const before = readFileSync(runtime.session.sessionFile!, "utf8");
+		await expect(runtime.fork(target, { position: "at" })).rejects.toThrow(/CLM/);
+		await expect(runtime.session.navigateTree(target)).rejects.toThrow(/CLM/);
+		expect(readFileSync(runtime.session.sessionFile!, "utf8")).toBe(before);
 	});
 
 	it("passes session config to replacement runtimes", async () => {

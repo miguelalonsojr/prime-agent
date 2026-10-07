@@ -423,11 +423,13 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 			withSession?: (ctx: ReplacedSessionContext) => Promise<void>;
 		},
 	): Promise<{ cancelled: boolean }> {
+		this.session.assertClmOperationAllowed("session switching");
 		const beforeResult = await this.emitBeforeSwitch("resume", sessionPath);
 		if (beforeResult.cancelled) {
 			return beforeResult;
 		}
 
+		this.session.assertClmOperationAllowed("session switching");
 		const previousSessionFile = this.session.sessionFile;
 		const lease = this.acquireReplacementLease(sessionPath);
 		let sessionManager: SessionManager;
@@ -514,11 +516,13 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 			withSession?: (ctx: ReplacedSessionContext) => Promise<void>;
 		},
 	): Promise<{ cancelled: boolean; selectedText?: string }> {
+		this.session.assertClmOperationAllowed("forking");
 		const position = options?.position ?? "before";
 		const beforeResult = await this.emitBeforeFork(entryId, { position });
 		if (beforeResult.cancelled) {
 			return { cancelled: true };
 		}
+		this.session.assertClmOperationAllowed("forking");
 		let targetLeafId: string | null;
 		let selectedText: string | undefined;
 
@@ -644,6 +648,7 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 	 * @throws {MissingSessionCwdError} When the imported session cwd cannot be resolved and no override is provided.
 	 */
 	async importFromJsonl(inputPath: string, cwdOverride?: string): Promise<{ cancelled: boolean }> {
+		this.session.assertClmOperationAllowed("session import");
 		const resolvedPath = resolve(inputPath);
 		if (!existsSync(resolvedPath)) {
 			throw new SessionImportFileNotFoundError(resolvedPath);
@@ -660,6 +665,7 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 			return beforeResult;
 		}
 
+		this.session.assertClmOperationAllowed("session import");
 		const previousSessionFile = this.session.sessionFile;
 		const lease = this.acquireReplacementLease(destinationPath);
 		let sessionManager: SessionManager;

@@ -202,6 +202,61 @@ describe("AgentSession compaction", () => {
 		};
 	}
 
+	it("rejects CLM compaction entry points without dispatch or audit mutation", async () => {
+		const h = await createHarness({ persistSession: true, settings: { compaction: { keepRecentTokens: 1 } } });
+		harnesses.push(h);
+		const m = h.sessionManager;
+		const id = m.appendMessage(userMsg("accepted"));
+		m.appendClmOn({ blocks: [{ id, message: userMsg("accepted") }] }, id);
+		h.session.syncClmMode();
+		const before = m.getEntries();
+		await expect(h.session.compact()).rejects.toThrow(/CLM/);
+		expect(() => h.session.handleCompactHostRequest("compact.run")).toThrow(/CLM/);
+		await expect(internalsOf(h)._runAutoCompaction("threshold", false)).rejects.toThrow(/CLM/);
+		expect(await internalsOf(h)._checkCompaction(createAssistant(h, { totalTokens: 999_999 }))).toBe(false);
+		expect(
+			await internalsOf(h)._checkCompaction(
+				createAssistant(h, { stopReason: "error", errorMessage: "prompt is too long" }),
+			),
+		).toBe(false);
+		expect(h.faux.state.callCount).toBe(0);
+		expect(m.getEntries()).toEqual(before);
+	});
+
+	it("summarizes only accepted frozen content after off with a durable retained tail", async () => {
+		const h = await createHarness({ persistSession: true, settings: { compaction: { keepRecentTokens: 10 } } });
+		harnesses.push(h);
+		const m = h.sessionManager;
+		m.appendMessage(userMsg("obsolete"));
+		const accepted = userMsg("accepted history");
+		const id = m.appendMessage(accepted);
+		const tail = m.appendMessage(userMsg("retained tail ".repeat(100)));
+		const snapshot = {
+			blocks: [
+				{ id, message: accepted },
+				{ id: tail, message: userMsg("retained tail ".repeat(100)) },
+			],
+		};
+		m.appendClmOn(snapshot, tail);
+		m.appendClmOffBoundary(snapshot, tail);
+		h.session.agent.state.messages = m.buildSessionContext().messages;
+		const inputs: string[] = [];
+		h.setResponses([
+			(context) => {
+				inputs.push(JSON.stringify(context));
+				return fauxAssistantMessage("accepted summary");
+			},
+		]);
+		const result = await h.session.compact();
+		expect(inputs).toHaveLength(1);
+		expect(inputs[0]).toContain("accepted history");
+		expect(inputs[0]).not.toContain("obsolete");
+		expect(result.firstKeptEntryId).toBe(tail);
+		const restored = SessionManager.open(h.session.sessionFile!).buildSessionContext().messages;
+		expect(JSON.stringify(restored)).toContain("retained tail");
+		expect(JSON.stringify(restored)).not.toContain("obsolete");
+	});
+
 	it("manually compacts using an extension-provided summary", async () => {
 		const harness = await createHarness({
 			settings: { compaction: { keepRecentTokens: 1 } },

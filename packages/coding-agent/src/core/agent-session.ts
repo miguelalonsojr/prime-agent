@@ -107,7 +107,7 @@ import {
 } from "./autonomous.js";
 import { type BashResult, executeBashWithOperations } from "./bash-executor.js";
 import { estimateClmRequestTokens } from "./clm/budget.js";
-import { type ClmRequestInputs, LiveContextController } from "./clm/live-context.js";
+import { type ClmRequestInputs, type ClmStatus, LiveContextController } from "./clm/live-context.js";
 import {
 	COMPACT_SKILL_NAME,
 	type CompactionResult,
@@ -336,6 +336,7 @@ import type {
 } from "./session-manager.js";
 import {
 	CURRENT_SESSION_VERSION,
+	getCompactionContextEntries,
 	getLatestCompactionEntry,
 	type SessionHeader,
 	SessionManager,
@@ -1563,6 +1564,7 @@ export class AgentSession {
 	private _serviceTierPreference: ServiceTier;
 	private _clmRecoveryError: ClmRecoveryError | undefined;
 	private _clmController?: LiveContextController;
+	private _clmTransition = false;
 	private _clmPreviousToolExecution?: Agent["toolExecution"];
 	private _clmPrompt = "";
 	private readonly _clmEditDefinitions = new WeakMap<AgentTool, object>();
@@ -1838,6 +1840,7 @@ export class AgentSession {
 		this._clmRecoveryError = getClmRecoveryError(this.sessionManager);
 		if (this._clmRecoveryError) this.agent.state.messages = [];
 		this.settingsManager = config.settingsManager;
+		const applyClmDefault = this.sessionManager.consumeClmDefaultEligibility();
 		this._serviceTierPreference = config.serviceTierPreference ?? config.agent.state.serviceTier;
 		this._scopedModels = config.scopedModels ?? [];
 		this._resourceLoader = config.resourceLoader;
@@ -1954,6 +1957,11 @@ export class AgentSession {
 			activeToolNames: this._initialActiveToolNames,
 			includeAllExtensionTools: true,
 		});
+		if (applyClmDefault && this.settingsManager.getClmEnabled()) {
+			this.assertModelContextAvailable();
+			LiveContextController.initializeEpoch(this.sessionManager);
+			this.syncClmMode();
+		}
 		this._ensureHarnessDigestContext();
 	}
 
@@ -1970,6 +1978,88 @@ export class AgentSession {
 			this._clmPrompt = "";
 			this._clmController = undefined;
 		}
+	}
+
+	/** Shared guard for operations that cannot run against a live CLM epoch. */
+	assertClmOperationAllowed(operation: string): void {
+		this.assertModelContextAvailable();
+		LiveContextController.assertWriterSettled(this.sessionManager);
+		this._clmController?.assertModelRequestAvailable();
+		if (this._clmTransition || this.sessionManager.getClmBranchState().mode === "on")
+			throw new Error(`CLM is on or changing; turn CLM off before ${operation}`);
+	}
+
+	private _assertClmTransitionIdle(): void {
+		this.assertModelContextAvailable();
+		if (
+			this.isSessionActive ||
+			this.agent.hasQueuedMessages() ||
+			this._pendingRequestedCompaction ||
+			this._pendingRequestedRefine ||
+			this._serializedPlanInFlight ||
+			this._refinePlanInFlight
+		)
+			throw new Error("CLM mode and restore require an idle session; settle active and queued actions first");
+		LiveContextController.assertWriterSettled(this.sessionManager);
+		this._clmController?.assertModelRequestAvailable();
+	}
+
+	private async _withClmTransition(operation: () => Promise<void>): Promise<ClmStatus> {
+		if (this._clmTransition) throw new Error("CLM mode transition is already active");
+		this._assertClmTransitionIdle();
+		this._clmTransition = true;
+		const pause = this.acquireQueuedWorkPause();
+		let fence: { owner: symbol; release(): void } | undefined;
+		try {
+			fence = await this._acquireSessionActionCommitFence();
+			await this._agentEventQueue;
+			this._assertClmTransitionIdle();
+			await operation();
+			this.agent.state.messages = this.sessionManager.buildSessionContext().messages;
+			this.syncClmMode();
+			return await this.getClmStatus();
+		} finally {
+			this._clmTransition = false;
+			fence?.release();
+			pause.release();
+		}
+	}
+
+	async setClmMode(enabled: boolean): Promise<ClmStatus> {
+		return this._withClmTransition(async () => {
+			const state = this.sessionManager.getClmBranchState();
+			if ((state.mode === "on") === enabled) return;
+			if (enabled) {
+				LiveContextController.initializeEpoch(this.sessionManager);
+				await this._getClmController();
+			} else {
+				await (await this._getClmController()).closeEpoch();
+			}
+		});
+	}
+
+	async getClmStatus(): Promise<ClmStatus> {
+		this.assertModelContextAvailable();
+		const state = this.sessionManager.getClmBranchState();
+		if (state.mode === "on") {
+			const status = (await this._getClmController()).getClmStatus();
+			status.warning ??= "CLM sessions cannot be resumed by older binaries; downgrade is unsupported";
+			return status;
+		}
+		const artifactDir = this.sessionManager.getSessionArtifactDir();
+		return {
+			mode: "off",
+			epochId: state.epochId,
+			revision: state.revision,
+			path: artifactDir ? join(artifactDir, "clm", "context.txt") : "",
+		};
+	}
+
+	async restoreClmRevision(epochId: string, revision: number): Promise<ClmStatus> {
+		return this._withClmTransition(async () => {
+			if (this.sessionManager.getClmBranchState().mode !== "on") throw new Error("CLM restore requires CLM on");
+			await (await this._getClmController()).restoreRevision(epochId, revision);
+		});
 	}
 
 	private _clmRequestInputs(): ClmRequestInputs {
@@ -4075,6 +4165,7 @@ export class AgentSession {
 	}
 
 	private async _thresholdCompactionNeeded(context: ShouldStopAfterTurnContext): Promise<boolean> {
+		if (this.sessionManager.getClmBranchState().mode === "on") return false;
 		const settings = this.settingsManager.getCompactionSettings();
 		if (!settings.enabled) return false;
 
@@ -4331,6 +4422,7 @@ export class AgentSession {
 				};
 			}
 			case "compact.run": {
+				this.assertClmOperationAllowed("compact.run");
 				const instructions = payload.instructions;
 				if (instructions !== undefined && typeof instructions !== "string") {
 					throw new Error("compact.run instructions must be a string when provided");
@@ -9120,7 +9212,7 @@ export class AgentSession {
 	}
 
 	async compact(customInstructions?: string, options: { skipAbort?: boolean } = {}): Promise<CompactionResult> {
-		this.assertModelContextAvailable();
+		this.assertClmOperationAllowed("compaction");
 		if (options.skipAbort && this.isStreaming) {
 			throw new Error("Cannot compact without aborting while the agent is running.");
 		}
@@ -9227,6 +9319,7 @@ export class AgentSession {
 		customInstructions?: string;
 		signal: AbortSignal;
 	}): Promise<CompactionResult> {
+		this.assertClmOperationAllowed("compaction");
 		const { model, apiKey, headers, customInstructions, signal } = options;
 		const pathEntries = this.sessionManager.getBranch();
 		const settings = this.settingsManager.getCompactionSettings();
@@ -9259,7 +9352,7 @@ export class AgentSession {
 					preparation,
 					// slice: getBranch() returns the live leaf-branch cache, which appends
 					// extend in place, so the awaited handler gets a snapshot.
-					branchEntries: pathEntries.slice(),
+					branchEntries: getCompactionContextEntries(pathEntries).slice(),
 					customInstructions,
 					signal,
 				})) as SessionBeforeCompactResult | undefined;
@@ -9343,6 +9436,13 @@ export class AgentSession {
 			if (signal.aborted) {
 				throw new Error("Compaction cancelled");
 			}
+
+			if (
+				this.sessionManager.getClmBranchState().epochId &&
+				(!pathEntries.some((entry) => entry.id === firstKeptEntryId) ||
+					!getCompactionContextEntries(pathEntries).some((entry) => entry.id === firstKeptEntryId))
+			)
+				throw new Error("CLM compaction requires a durable accepted retained-tail entry");
 
 			// Ledger-before-effect: the compaction outcome is durable before the transcript
 			// commits it. Marked first: the ID is consumed even when the write throws, and a
@@ -10545,6 +10645,7 @@ export class AgentSession {
 		skipAbortedCheck = true,
 		queueAutonomousContinuation = true,
 	): Promise<boolean> {
+		if (this.sessionManager.getClmBranchState().mode === "on") return false;
 		// An abort drops any compaction the model requested this turn, even on the
 		// pre-prompt path (skipAbortedCheck=false) which continues to threshold checks.
 		if (assistantMessage.stopReason === "aborted") {
@@ -10707,6 +10808,7 @@ export class AgentSession {
 		reason: "overflow" | "threshold" | "requested",
 		willRetry: boolean,
 	): Promise<boolean> {
+		this.assertClmOperationAllowed("automatic compaction");
 		// Any compaction consumes a pending model request and honors its instructions
 		// (overflow recovery can fire first and take the request with it).
 		const pending = this._pendingRequestedCompaction;
@@ -14927,7 +15029,7 @@ export class AgentSession {
 		aborted?: boolean;
 		summaryEntry?: BranchSummaryEntry;
 	}> {
-		this.assertModelContextAvailable();
+		this.assertClmOperationAllowed("historical navigation");
 		const previous = this._branchNavigationQueue;
 		let release = () => {};
 		this._branchNavigationQueue = new Promise<void>((resolve) => {
@@ -14995,6 +15097,7 @@ export class AgentSession {
 		aborted?: boolean;
 		summaryEntry?: BranchSummaryEntry;
 	}> {
+		this.assertClmOperationAllowed("historical navigation");
 		const oldLeafId = this.sessionManager.getLeafId();
 
 		// No-op if already at target after admitted work has settled.

@@ -55,6 +55,16 @@ export class LiveContextController {
 		this.status = { mode: state.mode, epochId: state.epochId, revision: state.revision, path };
 	}
 
+	static initializeEpoch(sessionManager: SessionManager): void {
+		LiveContextController.assertWriterSettled(sessionManager);
+		const { snapshot, watermark } = sessionManager.captureClmContext();
+		const document = renderContextDocument(snapshot, new Set());
+		LiveContextController.checkDocumentSize(document);
+		LiveContextController.checkSnapshotCap(snapshot, sessionManager);
+		parseContextDocument(document, snapshot);
+		sessionManager.appendClmOn(snapshot, watermark);
+	}
+
 	static async open(sessionManager: SessionManager, artifactDir: string): Promise<LiveContextController> {
 		const path = resolve(artifactDir, "clm", "context.txt");
 		let controller = LiveContextController.controllers.get(sessionManager);
@@ -191,6 +201,46 @@ export class LiveContextController {
 		return structuredClone(this.status);
 	}
 
+	closeEpoch(): Promise<void> {
+		return this.enqueue(async () => {
+			this.assertIdle();
+			const { snapshot, pending, watermark } = this.acceptedContext();
+			if (pending.length) throw new Error("CLM cannot turn off with an unfinished tool group");
+			LiveContextController.checkSnapshotCap(snapshot, this.sessionManager);
+			this.sessionManager.appendClmOffBoundary(snapshot, watermark);
+			this.status.mode = "off";
+			this.status.revision = this.sessionManager.getClmBranchState().revision;
+			LiveContextController.controllers.delete(this.sessionManager);
+		});
+	}
+
+	restoreRevision(epochId: string, revision: number): Promise<void> {
+		return this.enqueue(async () => {
+			this.assertIdle();
+			if (epochId !== this.status.epochId || !Number.isSafeInteger(revision) || revision < 0)
+				throw new Error("CLM restore requires an ancestor revision in the active epoch");
+			const target = this.sessionManager
+				.getBranch()
+				.find(
+					(entry) =>
+						(entry.type === "clm_on" || entry.type === "clm_revision") &&
+						entry.epochId === epochId &&
+						entry.revision === revision,
+				);
+			if (!target || (target.type !== "clm_on" && target.type !== "clm_revision"))
+				throw new Error("CLM restore target is not an ancestor on the selected branch");
+			const { pending } = this.acceptedContext();
+			if (pending.length) throw new Error("CLM cannot restore with an unfinished tool group");
+			const { watermark } = this.sessionManager.captureClmContext();
+			LiveContextController.checkSnapshotCap(target.snapshot, this.sessionManager);
+			const rendered = renderContextDocument(target.snapshot, new Set());
+			LiveContextController.checkDocumentSize(rendered);
+			parseContextDocument(rendered, target.snapshot);
+			const id = this.sessionManager.appendClmRevision(target.snapshot, watermark, `restore:${epochId}:${revision}`);
+			await this.publishAcceptedRevision(id, new Set(target.snapshot.blocks.map((block) => block.id)));
+		});
+	}
+
 	prepareToolAction(actionId: string, protectedActions: ProtectedActions): Promise<void> {
 		const originals = structuredClone(protectedActions);
 		return this.enqueue(async () => {
@@ -255,8 +305,8 @@ export class LiveContextController {
 						throw new Error("CLM protected reference was relabelled");
 				}
 				this.checkBudget({ blocks: [...candidate.blocks, ...action.pending] }, request);
-				this.checkSnapshotCap(candidate);
-				this.checkDocumentSize(renderContextDocument(candidate, new Set()));
+				LiveContextController.checkSnapshotCap(candidate, this.sessionManager);
+				LiveContextController.checkDocumentSize(renderContextDocument(candidate, new Set()));
 				// No awaited work between branch validation and the durable commit.
 				if (this.sessionManager.getLeafId() !== action.leafId) throw new Error("CLM session changed before import");
 				committedId = this.sessionManager.appendClmRevision(candidate, action.watermark, actionId);
@@ -291,8 +341,8 @@ export class LiveContextController {
 				throw new Error("CLM failed provider cleanup cannot cover another pending tool group");
 			const protectedIds = this.validateProtection(snapshot, originals);
 			this.checkBudget(snapshot, request);
-			this.checkSnapshotCap(snapshot);
-			this.checkDocumentSize(renderContextDocument(snapshot, protectedIds));
+			LiveContextController.checkSnapshotCap(snapshot, this.sessionManager);
+			LiveContextController.checkDocumentSize(renderContextDocument(snapshot, protectedIds));
 			this.assertHealthy();
 			if (this.sessionManager.getLeafId() !== leafId)
 				throw new Error("CLM session changed before failed provider cleanup");
@@ -425,7 +475,7 @@ export class LiveContextController {
 		const snapshot = { blocks: [...state.snapshot.blocks, ...suffix] };
 		const { editable, pending } = this.splitPendingToolGroup(snapshot, state.snapshot.blocks.length);
 		const rendered = renderContextDocument(editable, new Set());
-		this.checkDocumentSize(rendered);
+		LiveContextController.checkDocumentSize(rendered);
 		parseContextDocument(rendered, editable);
 		// A failed-provider cleanup still covers its removed raw audit tail in the watermark.
 		const completeCount = uncovered.length - pending.length;
@@ -501,16 +551,16 @@ export class LiveContextController {
 			throw new Error("CLM request exceeds its input budget; shorten context or restore an accepted revision");
 	}
 
-	private checkSnapshotCap(candidate: ClmSnapshot): void {
+	private static checkSnapshotCap(candidate: ClmSnapshot, sessionManager: SessionManager): void {
 		let bytes = Buffer.byteLength(JSON.stringify(candidate));
-		for (const entry of this.sessionManager.getEntries()) {
+		for (const entry of sessionManager.getEntries()) {
 			if (entry.type === "clm_on" || entry.type === "clm_revision" || entry.type === "clm_off_boundary")
 				bytes += Buffer.byteLength(JSON.stringify(entry.snapshot));
 		}
 		if (bytes > MAX_SNAPSHOT_BYTES) throw new Error("CLM cumulative snapshots exceed the 512 MiB session cap");
 	}
 
-	private checkDocumentSize(text: string): void {
+	private static checkDocumentSize(text: string): void {
 		if (Buffer.byteLength(text) > MAX_DOCUMENT_BYTES) throw new Error("CLM working document exceeds the 32 MiB cap");
 	}
 
@@ -546,7 +596,7 @@ export class LiveContextController {
 
 	private async publish(snapshot: ClmSnapshot, protectedIds: ReadonlySet<string>): Promise<void> {
 		const text = renderContextDocument(snapshot, protectedIds);
-		this.checkDocumentSize(text);
+		LiveContextController.checkDocumentSize(text);
 		const temporary = `${this.status.path}.${randomUUID()}.tmp`;
 		try {
 			await writeFile(temporary, text, { flag: "wx" });

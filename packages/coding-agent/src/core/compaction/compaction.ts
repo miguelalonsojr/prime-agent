@@ -16,7 +16,12 @@ import {
 	HARNESS_DIGEST_CUSTOM_TYPE,
 } from "../messages.js";
 import { completeWithProviderRetry, type ProviderRetryPolicy } from "../provider-retry.js";
-import { buildSessionContext, type CompactionEntry, type SessionEntry } from "../session-manager.js";
+import {
+	buildSessionContext,
+	type CompactionEntry,
+	getCompactionContextEntries,
+	type SessionEntry,
+} from "../session-manager.js";
 import { addAssistantUsage, emptyUsage } from "../usage.js";
 import {
 	computeFileLists,
@@ -98,10 +103,19 @@ function getMessageFromEntryForCompaction(entry: SessionEntry): AgentMessage | u
 		return undefined;
 	}
 	// Harness digests are regenerated on the new compaction head; never summarizer input.
-	if (entry.type === "custom_message" && entry.customType === HARNESS_DIGEST_CUSTOM_TYPE) {
+	if (
+		(entry.type === "custom_message" && entry.customType === HARNESS_DIGEST_CUSTOM_TYPE) ||
+		(entry.type === "message" &&
+			entry.message.role === "custom" &&
+			entry.message.customType === HARNESS_DIGEST_CUSTOM_TYPE)
+	) {
 		return undefined;
 	}
-	return getMessageFromEntry(entry);
+	const message = getMessageFromEntry(entry);
+	if (message?.role === "compactionSummary") {
+		return { ...message, harnessDigest: undefined, harnessStateFingerprint: undefined };
+	}
+	return message;
 }
 
 /** Result from compact() - SessionManager adds uuid/parentUuid when saving */
@@ -608,6 +622,8 @@ export function prepareCompaction(
 	pathEntries: SessionEntry[],
 	settings: CompactionSettings,
 ): CompactionPreparation | undefined {
+	const auditEntries = pathEntries;
+	pathEntries = getCompactionContextEntries(pathEntries);
 	if (pathEntries.length > 0 && pathEntries[pathEntries.length - 1].type === "compaction") {
 		return undefined;
 	}
@@ -641,6 +657,8 @@ export function prepareCompaction(
 		return undefined; // Session needs migration
 	}
 	const firstKeptEntryId = firstKeptEntry.id;
+	if (pathEntries !== auditEntries && !auditEntries.some((entry) => entry.id === firstKeptEntryId))
+		throw new Error("CLM compaction requires a durable retained-tail entry; retain newer audit messages first");
 
 	const historyEnd = cutPoint.isSplitTurn ? cutPoint.turnStartIndex : cutPoint.firstKeptEntryIndex;
 	const messagesToSummarize: AgentMessage[] = [];

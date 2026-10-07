@@ -15,6 +15,7 @@ import {
 	shouldCompact,
 } from "../src/core/compaction/index.js";
 import { SUMMARIZATION_SYSTEM_PROMPT, serializeConversation } from "../src/core/compaction/utils.js";
+import { createCompactionSummaryMessage } from "../src/core/messages.js";
 
 const { completeSimpleMock } = vi.hoisted(() => ({ completeSimpleMock: vi.fn() }));
 vi.mock("@earendil-works/pi-ai", async (importOriginal) => {
@@ -380,6 +381,51 @@ describe("prepareCompaction recency anchor", () => {
 // ============================================================================
 // Integration tests with real session data
 // ============================================================================
+
+describe("CLM frozen compaction provenance", () => {
+	it.each([false, true])("uses accepted bodies and iterative summaries (synthetic tail=%s)", (synthetic) => {
+		const old = createMessageEntry(createUserMessage("obsolete"));
+		const edited = createMessageEntry(createUserMessage("old body"));
+		const tail = createMessageEntry(createUserMessage("retained tail ".repeat(100)));
+		const checkpoint = createCompactionSummaryMessage("checkpoint", 1, tail.timestamp, "", 0, "digest");
+		const snapshot = {
+			blocks: [
+				{ id: "prior-summary", message: checkpoint },
+				{ id: edited.id, message: createUserMessage("accepted body") },
+				{ id: synthetic ? "snapshot-only" : tail.id, message: tail.message },
+			],
+		};
+		const on: SessionEntry = {
+			type: "clm_on",
+			id: "on",
+			parentId: tail.id,
+			timestamp: tail.timestamp,
+			epochId: "epoch",
+			revision: 0,
+			snapshot,
+			auditWatermark: tail.id,
+		};
+		const off: SessionEntry = { ...on, type: "clm_off_boundary", id: "off", parentId: "on", revision: 1 };
+		const entries: SessionEntry[] = [old, edited, tail, on, off];
+		const settings = { ...DEFAULT_COMPACTION_SETTINGS, keepRecentTokens: 10 };
+		expect(() => prepareCompaction(entries.slice(0, -1), settings)).toThrow(/CLM/);
+		if (synthetic) {
+			expect(() => prepareCompaction(entries, settings)).toThrow(/CLM.*durable/);
+			return;
+		}
+		const preparation = prepareCompaction(entries, settings)!;
+		expect(extractText(preparation.messagesToSummarize)).toBe("checkpoint\naccepted body");
+		expect(JSON.stringify(preparation.messagesToSummarize)).not.toContain("digest");
+		expect(preparation.firstKeptEntryId).toBe(tail.id);
+		entries.push({ ...createCompactionEntry("first summary", tail.id), parentId: off.id, harnessDigest: "digest" });
+		entries.push(createMessageEntry(createUserMessage("next tail ".repeat(100))));
+		const next = prepareCompaction(entries, settings)!;
+		expect(next.previousSummary).toBe("first summary");
+		expect(extractText(next.messagesToSummarize)).toContain("retained tail");
+		expect(extractText(next.messagesToSummarize)).not.toMatch(/obsolete|old body|digest/);
+		expect(next.firstKeptEntryId).toBe(entries.at(-1)!.id);
+	});
+});
 
 describe("Large session fixture", () => {
 	it("should parse the large session", () => {
