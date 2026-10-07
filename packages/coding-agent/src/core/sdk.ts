@@ -2,7 +2,7 @@ import { join } from "node:path";
 import { Agent, type AgentMessage, type ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { clampServiceTier, clampThinkingLevel, type Message, type Model, streamSimple } from "@earendil-works/pi-ai";
 import { getAgentDir } from "../config.js";
-import { AgentSession } from "./agent-session.js";
+import { AgentSession, getClmRecoveryError } from "./agent-session.js";
 import type { AgentSessionCreationOptions } from "./agent-session-services.js";
 import { formatNoModelsAvailableMessage } from "./auth-guidance.js";
 import { AuthStorage } from "./auth-storage.js";
@@ -21,7 +21,7 @@ import {
 } from "./request-timing.js";
 import type { ResourceLoader } from "./resource-loader.js";
 import { DefaultResourceLoader } from "./resource-loader.js";
-import { getDefaultSessionDir, SessionManager } from "./session-manager.js";
+import { getDefaultSessionDir, type SessionContext, SessionManager } from "./session-manager.js";
 import { SettingsManager } from "./settings-manager.js";
 import { time } from "./timings.js";
 import { createBashTool, createEditTool, createIpythonTool, withFileMutationQueue } from "./tools/index.js";
@@ -179,8 +179,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		time("resourceLoader.reload");
 	}
 
-	const existingSession = sessionManager.buildSessionContext();
-	const hasExistingSession = existingSession.messages.length > 0;
+	const recoveryError = getClmRecoveryError(sessionManager);
+	const existingSession: SessionContext = recoveryError
+		? { messages: [], model: null, thinkingLevel: "off", serviceTier: "default" }
+		: sessionManager.buildSessionContext();
+	const hasExistingSession = recoveryError !== undefined || existingSession.messages.length > 0;
 	const hasThinkingEntry = sessionManager.getBranch().some((entry) => entry.type === "thinking_level_change");
 	const hasServiceTierEntry = sessionManager.getBranch().some((entry) => entry.type === "service_tier_change");
 
@@ -344,7 +347,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 	if (hasExistingSession) {
 		agent.state.messages = existingSession.messages;
-		if (!hasThinkingEntry) {
+		if (!hasThinkingEntry && !recoveryError) {
 			sessionManager.appendThinkingLevelChange(thinkingLevel);
 		}
 	} else {
@@ -353,7 +356,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		}
 		sessionManager.appendThinkingLevelChange(thinkingLevel);
 	}
-	if (!hasServiceTierEntry) {
+	if (!hasServiceTierEntry && !recoveryError) {
 		sessionManager.appendServiceTierChange(serviceTierPreference);
 	}
 

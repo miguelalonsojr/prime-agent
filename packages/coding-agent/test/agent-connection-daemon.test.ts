@@ -2718,6 +2718,28 @@ describe("DaemonAgentConnection", () => {
 		await connection.dispose();
 	});
 
+	it("keeps audit snapshots readable when optional model context fails", async () => {
+		const fakeClient = new FakeDaemonClient();
+		const request = fakeClient.request.bind(fakeClient);
+		vi.spyOn(fakeClient, "request").mockImplementation((command, timeout, options) =>
+			command.type === "get_session_context"
+				? Promise.resolve(failure(command.id, command.type, "CLM recovery requires repair"))
+				: request(command, timeout, options),
+		);
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+		try {
+			await connection.attach();
+			emitSequencedQueueUpdate(fakeClient, "active-1", 13);
+			await expect(connection.getInitialSnapshot()).resolves.toMatchObject({
+				messages: [{ role: "user", content: "current prompt", timestamp: 4 }],
+			});
+			expect((await connection.getInitialSnapshot()).sessionContext).toBeUndefined();
+			await expect(connection.getSessionContext()).rejects.toThrow("CLM recovery requires repair");
+		} finally {
+			await connection.dispose();
+		}
+	});
+
 	it("keeps attach snapshots usable when the daemon omits duplicate session context", async () => {
 		const fakeClient = new FakeDaemonClient();
 		const messages: AgentMessage[] = [{ role: "user", content: "snapshot prompt", timestamp: 1 }];

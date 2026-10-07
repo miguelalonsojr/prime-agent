@@ -673,14 +673,14 @@ export class DaemonAgentConnection implements AgentConnection {
 				{ type: "get_session_context", activeSessionId: this.activeSessionId },
 				undefined,
 				options,
-			),
+			).catch(() => undefined),
 		]);
 		const children = this.latestSnapshot?.children;
 		const streamingMessage = this.latestSnapshot?.streamingMessage;
 		this.latestSnapshot = {
 			state,
 			messages: messagesData.messages,
-			sessionContext: sessionContextData.context,
+			...(sessionContextData ? { sessionContext: sessionContextData.context } : {}),
 			...(children ? { children } : {}),
 			...(streamingMessage ? { streamingMessage } : {}),
 		};

@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readdirSync, realpathSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fauxAssistantMessage, registerFauxProvider } from "@earendil-works/pi-ai";
@@ -33,6 +33,7 @@ import type {
 	SessionStartEvent,
 } from "../../src/index.js";
 import { createDefaultRuntimeFactory } from "../../src/main.js";
+import { InProcessAgentConnection } from "../../src/modes/agent-connection/in-process-agent-connection.js";
 import { assistantMsg, createTestResourceLoader, userMsg } from "../utilities.js";
 import { conversationMessages, createHarness, getMessageText, type Harness } from "./harness.js";
 
@@ -179,6 +180,63 @@ describe("AgentSessionRuntime characterization", () => {
 		const runtime = new AgentSessionRuntime(session, services, createRuntime);
 		return { runtime, disposeSession };
 	}
+
+	it.each(["corrupt", "on", "off"] as const)("attaches CLM %s without replaying discarded audit", async (mode) => {
+		const harness = await createHarness({ persistSession: true });
+		cleanups.push(harness.cleanup);
+		const manager = harness.sessionManager;
+		const watermark = manager.appendMessage(userMsg("original audit only"));
+		const accepted = { blocks: [{ id: "accepted", message: userMsg("accepted context") }] };
+		manager.appendClmOn(accepted, watermark);
+		manager.appendClmRevision(accepted, watermark, "settled-action");
+		if (mode === "off") manager.appendClmOffBoundary(accepted, watermark);
+		const path = manager.getSessionFile()!;
+		if (mode === "corrupt") {
+			writeFileSync(path, readFileSync(path, "utf8").replace(/"checksum":"[^"]+"/, '"checksum":"damaged"'));
+		}
+		const before = readFileSync(path, "utf8");
+		const startup = createRuntimeForTest(() => {}, { sessionManager: SessionManager.open(path) });
+		await expect(startup).resolves.toHaveProperty("runtime");
+		const { runtime, faux } = await startup;
+		const connection = new InProcessAgentConnection(runtime);
+		cleanups.push(() => connection.dispose());
+		const requests: string[] = [];
+		faux.setResponses([
+			(context) => {
+				requests.push(JSON.stringify(context.messages));
+				return fauxAssistantMessage("reply");
+			},
+		]);
+		const snapshot = await connection.getInitialSnapshot();
+		if (mode === "corrupt") {
+			expect(snapshot.messages.map(getMessageText)).toContain("original audit only");
+			expect((await connection.getMessages()).map(getMessageText)).toContain("original audit only");
+			expect(snapshot.sessionTree?.tree.length).toBeGreaterThan(0);
+			expect(snapshot.sessionContext).toBeUndefined();
+			expect(runtime.session.agent.state.messages).toEqual([]);
+			await expect(connection.getSessionContext()).rejects.toMatchObject({ name: "ClmRecoveryError" });
+			await expect(connection.prompt("new request")).rejects.toMatchObject({ name: "ClmRecoveryError" });
+			await expect(connection.compact()).rejects.toMatchObject({ name: "ClmRecoveryError" });
+			await expect(connection.refine()).rejects.toMatchObject({ name: "ClmRecoveryError" });
+			await expect(connection.startSideQuestion("side", "question")).rejects.toMatchObject({
+				name: "ClmRecoveryError",
+			});
+			await expect(runtime.session.runRlmChild("child")).rejects.toMatchObject({ name: "ClmRecoveryError" });
+			await expect(runtime.session.navigateTree(watermark, { summarize: true })).rejects.toMatchObject({
+				name: "ClmRecoveryError",
+			});
+			expect(requests).toEqual([]);
+			expect(readFileSync(path, "utf8")).toBe(before);
+			runtime.session.setAutoRetryEnabled(false);
+			await runtime.session.agent.prompt("direct low-level continuation");
+			expect(requests).toEqual([]);
+		} else {
+			await connection.promptAndWait("new request");
+			expect(requests).toHaveLength(1);
+			expect(requests[0]).toContain("accepted context");
+			expect(requests[0]).not.toContain("original audit only");
+		}
+	});
 
 	it("passes session config to replacement runtimes", async () => {
 		const calls: Array<Parameters<CreateAgentSessionRuntimeFactory>[0]> = [];

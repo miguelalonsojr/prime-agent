@@ -4692,6 +4692,7 @@ export class AgentDaemon {
 
 			case "start_side_question": {
 				const state = this.getSessionState(command.activeSessionId);
+				state.runtime.session.assertModelContextAvailable();
 				if (this.sideQuestionRuns.has(command.sideQuestionId)) {
 					throw new Error(`Side question already exists: ${command.sideQuestionId}`);
 				}
@@ -4872,7 +4873,7 @@ export class AgentDaemon {
 			case "get_messages": {
 				const state = this.getSessionState(command.activeSessionId);
 				return success(command.id, "get_messages", {
-					messages: state.runtime.session.messages,
+					messages: state.runtime.session.getTranscriptMessages(),
 				});
 			}
 
@@ -5482,7 +5483,7 @@ export class AgentDaemon {
 			activeSessionId: state.activeSessionId,
 			summary: summaryForActiveSession(state),
 			state: connectionState,
-			messages: session.messages,
+			messages: session.getTranscriptMessages(),
 			// Omit duplicate heavy payloads from attach. The client can derive render
 			// context from messages + state, and fetch the full session tree lazily
 			// when the tree/branch selector opens.

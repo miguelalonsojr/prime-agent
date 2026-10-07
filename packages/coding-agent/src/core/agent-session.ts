@@ -196,6 +196,7 @@ import {
 	convertToLlm,
 	createAsyncBashCompletionMessage,
 	createCompactionOutcomeMessage,
+	createCustomMessage,
 	createHarnessDigestMessage,
 	createHeartbeatPromptMessage,
 	createRefinementNoticeMessage,
@@ -1518,11 +1519,30 @@ function attributeChildUsage(parentUsage: Usage, childUsage: Usage): void {
 	parentUsage.totalTokens = parentContextTokens;
 }
 
+export class ClmRecoveryError extends Error {
+	constructor(cause: unknown) {
+		super("CLM context recovery failed; repair and reopen the session before requesting model work.", { cause });
+		this.name = "ClmRecoveryError";
+	}
+}
+
+/** Validation failures are local recovery state, never permission to replay audit context. */
+export function getClmRecoveryError(sessionManager: SessionManager): ClmRecoveryError | undefined {
+	try {
+		sessionManager.getClmBranchState();
+		return undefined;
+	} catch (cause) {
+		return new ClmRecoveryError(cause);
+	}
+}
+
 export class AgentSession {
 	readonly agent: Agent;
 	readonly sessionManager: SessionManager;
 	readonly settingsManager: SettingsManager;
 	private _serviceTierPreference: ServiceTier;
+	private _clmRecoveryError: ClmRecoveryError | undefined;
+	private readonly _unguardedStreamFn: Agent["streamFn"];
 
 	private _scopedModels: Array<{
 		model: Model<any>;
@@ -1787,6 +1807,8 @@ export class AgentSession {
 	constructor(config: AgentSessionConfig) {
 		this.agent = config.agent;
 		this.sessionManager = config.sessionManager;
+		this._clmRecoveryError = getClmRecoveryError(this.sessionManager);
+		if (this._clmRecoveryError) this.agent.state.messages = [];
 		this.settingsManager = config.settingsManager;
 		this._serviceTierPreference = config.serviceTierPreference ?? config.agent.state.serviceTier;
 		this._scopedModels = config.scopedModels ?? [];
@@ -1832,7 +1854,12 @@ export class AgentSession {
 			parentSessionId: config.semanticParentSessionId,
 			spawnedByRequestId: config.semanticSpawnedByRequestId,
 		});
-		this.agent.streamFn = wrapStreamFnWithSemanticEdges(this.agent.streamFn, this._semanticEdges);
+		this._unguardedStreamFn = this.agent.streamFn;
+		const streamFn = wrapStreamFnWithSemanticEdges(this._unguardedStreamFn, this._semanticEdges);
+		this.agent.streamFn = (model, context, options) => {
+			this.assertModelContextAvailable();
+			return streamFn(model, context, options);
+		};
 		// A resumed child may have replied before this process started; false would
 		// claim knowledge that is not present in the session transcript.
 		this._repliedToParentSinceTask =
@@ -1858,7 +1885,7 @@ export class AgentSession {
 		}
 		this._restoreLateIpythonSentAgentMessages();
 		// Cannot await in a constructor; a live wake job restores within a microtask, only a rebuilt job waits on the store.
-		void this._restoreQuotaPark();
+		if (!this._clmRecoveryError) void this._restoreQuotaPark();
 		if (this._goalState.status === "active") {
 			this._goalAccountingStartedAt = Date.now();
 		}
@@ -1997,6 +2024,7 @@ export class AgentSession {
 		headers?: Record<string, string>;
 		requestModel: Model<Api>;
 	}> {
+		this.assertModelContextAvailable();
 		const result = await this._modelRegistry.getApiKeyAndHeaders(model);
 		if (!result.ok) {
 			if (result.error.startsWith("No API key found")) {
@@ -3228,6 +3256,7 @@ export class AgentSession {
 	}
 
 	private _shouldStopBeforeTurn(): boolean {
+		this.assertModelContextAvailable();
 		return this._steeringStopPending;
 	}
 
@@ -5290,7 +5319,33 @@ export class AgentSession {
 		return this.agent.state.messages;
 	}
 
+	/** The audit is only for display. It must never replace Agent.state.messages. */
+	getTranscriptMessages(): AgentMessage[] {
+		if (!this._clmRecoveryError) return this.messages;
+		const messages: AgentMessage[] = [];
+		for (const entry of this.sessionManager.getBranch()) {
+			if (entry.type === "message") {
+				messages.push(entry.message);
+			} else if (entry.type === "custom_message") {
+				messages.push(
+					createCustomMessage(entry.customType, entry.content, entry.display, entry.details, entry.timestamp),
+				);
+			}
+		}
+		return messages;
+	}
+
+	get clmRecoveryError(): ClmRecoveryError | undefined {
+		return this._clmRecoveryError;
+	}
+
+	assertModelContextAvailable(): void {
+		this._clmRecoveryError ??= getClmRecoveryError(this.sessionManager);
+		if (this._clmRecoveryError) throw this._clmRecoveryError;
+	}
+
 	buildSessionContext(): SessionContext {
+		this.assertModelContextAvailable();
 		const context = this.sessionManager.buildSessionContext();
 		for (const message of context.messages) {
 			this._applyLateIpythonSentAgentMessages(message);
@@ -5971,6 +6026,7 @@ export class AgentSession {
 	private _promptSubmissionInFlight = false;
 
 	private async _prompt(text: string, options?: InternalPromptOptions): Promise<void> {
+		this.assertModelContextAvailable();
 		// Synchronous preflight guard: from submission until the prompt promise
 		// settles, a model switch must not tear down a routed turn's override
 		// (the routing decision for this turn's images may already be made).
@@ -6710,6 +6766,7 @@ export class AgentSession {
 	}
 
 	private _assertSessionActionAdmissionAvailable(): void {
+		this.assertModelContextAvailable();
 		if (this._disposed || this._disposing) {
 			throw new Error("Cannot admit a session action because the session is disposing or disposed.");
 		}
@@ -8742,6 +8799,7 @@ export class AgentSession {
 	}
 
 	async compact(customInstructions?: string, options: { skipAbort?: boolean } = {}): Promise<CompactionResult> {
+		this.assertModelContextAvailable();
 		if (options.skipAbort && this.isStreaming) {
 			throw new Error("Cannot compact without aborting while the agent is running.");
 		}
@@ -9479,6 +9537,7 @@ export class AgentSession {
 		fallback?: { model: Model<Api>; apiKey: string; headers?: Record<string, string> },
 		requiredContextTokens?: number,
 	): Promise<{ model: Model<Api>; apiKey: string; headers?: Record<string, string> } | undefined> {
+		this.assertModelContextAvailable();
 		const sessionModel = this.model;
 		if (!sessionModel) {
 			return fallback;
@@ -9527,6 +9586,7 @@ export class AgentSession {
 	}
 
 	private async _reviewAutoRefine(context: AutoRefineReviewRequest, signal?: AbortSignal): Promise<AutoRefineReview> {
+		this.assertModelContextAvailable();
 		if (this._autoRefineReviewer) {
 			return this._autoRefineReviewer(context, signal);
 		}
@@ -9633,6 +9693,7 @@ export class AgentSession {
 
 	/** Cold-boundary digest delivery: empty contexts defer to the first committed turn (untouched sessions must stay empty); non-empty contexts append only when the newest in-context digest mismatches disk. */
 	private _ensureHarnessDigestContext(): void {
+		if (this._clmRecoveryError) return;
 		if (this.agent.state.messages.length === 0) {
 			this._harnessDigestPending = true;
 			return;
@@ -11321,7 +11382,7 @@ export class AgentSession {
 			},
 			convertToLlm: this.agent.convertToLlm,
 			transformContext: this.agent.transformContext,
-			streamFn: this.agent.streamFn,
+			streamFn: this._unguardedStreamFn,
 			getApiKey: this.agent.getApiKey,
 			onPayload: this.agent.onPayload,
 			onResponse: this.agent.onResponse,
@@ -13153,6 +13214,7 @@ export class AgentSession {
 	}
 
 	async createRlmSession(prompt: string, kwargs: Record<string, unknown> = {}): Promise<RlmCreateSessionResult> {
+		this.assertModelContextAvailable();
 		const { name: rawName, model: rawModel, thinking: rawThinking, cwd: rawCwd, ...unsupported } = kwargs;
 		const unsupportedKeys = Object.keys(unsupported);
 		if (unsupportedKeys.length > 0) {
@@ -13215,10 +13277,12 @@ export class AgentSession {
 		kwargs: Record<string, unknown> = {},
 		spawnCode?: string,
 	): Promise<RlmSpawnHandle> {
+		this.assertModelContextAvailable();
 		return this._startRlmChildRun(prompt, kwargs, spawnCode);
 	}
 
 	private _isRetryableError(message: AssistantMessage): boolean {
+		if (this._clmRecoveryError) return false;
 		if (message.stopReason !== "error" || !message.errorMessage) return false;
 
 		const contextWindow = this._runModel()?.contextWindow ?? 0;
@@ -14534,6 +14598,7 @@ export class AgentSession {
 		aborted?: boolean;
 		summaryEntry?: BranchSummaryEntry;
 	}> {
+		this.assertModelContextAvailable();
 		const previous = this._branchNavigationQueue;
 		let release = () => {};
 		this._branchNavigationQueue = new Promise<void>((resolve) => {

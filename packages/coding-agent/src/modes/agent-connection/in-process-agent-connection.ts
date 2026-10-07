@@ -103,7 +103,7 @@ export class InProcessAgentConnection implements AgentConnection {
 			await this.emit({
 				type: "session_replaced",
 				state: createAgentConnectionState(this.runtimeHost),
-				messages: this.runtimeHost.session.messages,
+				messages: this.runtimeHost.session.getTranscriptMessages(),
 			});
 		});
 	}
@@ -152,7 +152,7 @@ export class InProcessAgentConnection implements AgentConnection {
 	}
 
 	async getMessages(): Promise<AgentMessage[]> {
-		return this.session.state.messages;
+		return this.session.getTranscriptMessages();
 	}
 
 	async getSessionHeader(): Promise<AgentConnectionSessionHeader | undefined> {
@@ -397,6 +397,7 @@ export class InProcessAgentConnection implements AgentConnection {
 		question: string,
 		previousTurns?: AgentConnectionSideQuestionTurn[],
 	): Promise<void> {
+		this.session.assertModelContextAvailable();
 		if (this.sideQuestionRuns.has(id)) {
 			throw new Error(`Side question already exists: ${id}`);
 		}
@@ -629,7 +630,7 @@ export class InProcessAgentConnection implements AgentConnection {
 		}
 		const unsubscribes = new Set<() => void>();
 		return {
-			getMessages: async () => child.messages,
+			getMessages: async () => child.getTranscriptMessages(),
 			getCommands: async () => createAgentConnectionCommands(child),
 			subscribe: (listener) => {
 				const unsubscribe = child.subscribe((event) => void listener({ type: "session_event", event }));
