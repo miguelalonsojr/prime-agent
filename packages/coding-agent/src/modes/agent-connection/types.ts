@@ -27,6 +27,7 @@ import type {
 	SessionActionSnapshot,
 } from "../../core/session-action-store.js";
 import type { DeleteSessionFileResult } from "../../core/session-file-actions.js";
+import type { ClmOffBoundaryEntry, ClmOnEntry, ClmRevisionEntry } from "../../core/session-manager.js";
 import type { SessionStats } from "../../core/session-stats.js";
 import type { SessionUsageSummary } from "../../core/usage.js";
 import type { SessionSummary } from "../daemon/daemon-session-list.js";
@@ -246,6 +247,9 @@ export interface AgentConnectionGitStateEntry extends AgentConnectionSessionEntr
 }
 
 export type AgentConnectionSessionEntry =
+	| ClmOnEntry
+	| ClmRevisionEntry
+	| ClmOffBoundaryEntry
 	| AgentConnectionSessionMessageEntry
 	| AgentConnectionThinkingLevelChangeEntry
 	| AgentConnectionServiceTierChangeEntry

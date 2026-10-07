@@ -196,6 +196,91 @@ describe("buildSessionContext", () => {
 		expect(buildSessionContext(entries, "2").messages).toHaveLength(1);
 	});
 
+	it("keeps a CLM deletion on the selected branch", () => {
+		const audit = [msg("1", null, "user", "obsolete"), msg("2", "1", "user", "keep")];
+		const base = { timestamp: T, epochId: "epoch-a", auditWatermark: "2" };
+		const entries: SessionEntry[] = [
+			...audit,
+			{
+				type: "clm_on",
+				id: "3",
+				parentId: "2",
+				...base,
+				revision: 0,
+				snapshot: { blocks: audit.map((entry) => ({ id: entry.id, message: entry.message })) },
+			},
+			{
+				type: "clm_revision",
+				id: "4",
+				parentId: "3",
+				...base,
+				revision: 1,
+				baseRevision: 0,
+				checksum: "accepted",
+				observedActionId: "action-a",
+				snapshot: { blocks: [{ id: "2", message: audit[1].message }] },
+			},
+			msg("5", "4", "user", "new action"),
+			msg("6", "2", "user", "alternate branch"),
+		];
+		const selected = buildSessionContext(entries, "5");
+		const alternate = buildSessionContext(entries, "6");
+		expect(selected.clm).toMatchObject({ mode: "on", epochId: "epoch-a", revision: 1 });
+		expect(selected.messages.map(textOf)).toEqual(["keep", "new action"]);
+		expect(JSON.stringify(selected.messages)).not.toContain("obsolete");
+		expect(alternate.messages.map(textOf)).toEqual(["obsolete", "keep", "alternate branch"]);
+		expect(alternate.clm).toBeUndefined();
+	});
+
+	it("does not replay an audit message covered by the off boundary watermark", () => {
+		const retained = msg("1", null, "user", "retained");
+		const covered = msg("2", "1", "user", "covered");
+		const base = { timestamp: T, epochId: "epoch-a", auditWatermark: "2" };
+		const entries: SessionEntry[] = [
+			retained,
+			covered,
+			{
+				type: "clm_on",
+				id: "3",
+				parentId: "2",
+				...base,
+				revision: 0,
+				snapshot: { blocks: [{ id: "1", message: retained.message }] },
+			},
+			{
+				type: "clm_off_boundary",
+				id: "4",
+				parentId: "3",
+				...base,
+				revision: 1,
+				snapshot: { blocks: [{ id: "1", message: retained.message }] },
+			},
+			msg("5", "4", "user", "continued"),
+		];
+		const context = buildSessionContext(entries);
+		expect(context.clm).toMatchObject({ mode: "off", epochId: "epoch-a", revision: 1 });
+		expect(context.messages.map(textOf)).toEqual(["retained", "continued"]);
+	});
+
+	it("enables from the already-compacted model context instead of old audit", () => {
+		const entries = chain("u obsolete", "u retained", "c compacted|2", "u recent");
+		const initial = buildSessionContext(entries).messages;
+		entries.push({
+			type: "clm_on",
+			id: "5",
+			parentId: "4",
+			timestamp: T,
+			epochId: "epoch-b",
+			revision: 0,
+			snapshot: { blocks: initial.map((message, index) => ({ id: `block-${index}`, message })) },
+			auditWatermark: "4",
+		});
+		const context = buildSessionContext(entries);
+		expect(context.clm).toMatchObject({ mode: "on", epochId: "epoch-b", revision: 0 });
+		expect(context.messages).toEqual(initial);
+		expect(JSON.stringify(context.messages)).not.toContain("obsolete");
+	});
+
 	describe("harness digest dedupe", () => {
 		it("keeps only the newest digest custom message", () => {
 			const ctx = buildSessionContext(chain("u hello", "d digest-a", "a first reply", "d digest-b"));

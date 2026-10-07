@@ -103,6 +103,45 @@ export interface SessionMessageEntry extends SessionEntryBase {
 	message: AgentMessage;
 }
 
+export interface ClmBlock {
+	id: string;
+	message: AgentMessage;
+}
+
+export interface ClmSnapshot {
+	blocks: ClmBlock[];
+}
+
+export interface ClmBranchState {
+	mode: "on" | "off";
+	epochId?: string;
+	revision?: number;
+	snapshot?: ClmSnapshot;
+	auditWatermark: string | null;
+}
+
+interface ClmEntryBase extends SessionEntryBase {
+	epochId: string;
+	revision: number;
+	snapshot: ClmSnapshot;
+	auditWatermark: string | null;
+}
+
+export interface ClmOnEntry extends ClmEntryBase {
+	type: "clm_on";
+}
+
+export interface ClmRevisionEntry extends ClmEntryBase {
+	type: "clm_revision";
+	baseRevision: number;
+	checksum: string;
+	observedActionId: string;
+}
+
+export interface ClmOffBoundaryEntry extends ClmEntryBase {
+	type: "clm_off_boundary";
+}
+
 type AssistantSessionMessageEntry = SessionMessageEntry & { message: AssistantMessage };
 
 export interface ThinkingLevelChangeEntry extends SessionEntryBase {
@@ -214,6 +253,9 @@ export interface CustomMessageEntry<T = unknown> extends SessionEntryBase {
 
 export type SessionEntry =
 	| SessionMessageEntry
+	| ClmOnEntry
+	| ClmRevisionEntry
+	| ClmOffBoundaryEntry
 	| ThinkingLevelChangeEntry
 	| ServiceTierChangeEntry
 	| ModelChangeEntry
@@ -245,6 +287,7 @@ export interface SessionContext {
 	thinkingLevel: string;
 	serviceTier: ServiceTier;
 	model: { provider: string; modelId: string } | null;
+	clm?: ClmBranchState;
 }
 
 export interface SessionModelRef {
@@ -481,8 +524,12 @@ export function buildSessionContext(
 	let serviceTier: ServiceTier = "default";
 	let model: { provider: string; modelId: string } | null = null;
 	let compaction: CompactionEntry | null = null;
+	let clmEntry: ClmOnEntry | ClmRevisionEntry | ClmOffBoundaryEntry | null = null;
 
 	for (const entry of path) {
+		if (entry.type === "clm_on" || entry.type === "clm_revision" || entry.type === "clm_off_boundary") {
+			clmEntry = entry;
+		}
 		if (entry.type === "thinking_level_change") {
 			thinkingLevel = entry.thinkingLevel;
 		} else if (entry.type === "service_tier_change") {
@@ -494,6 +541,41 @@ export function buildSessionContext(
 		} else if (entry.type === "compaction") {
 			compaction = entry;
 		}
+	}
+
+	if (clmEntry) {
+		const watermarkIndex =
+			clmEntry.auditWatermark === null
+				? path.indexOf(clmEntry)
+				: path.findIndex((entry) => entry.id === clmEntry.auditWatermark);
+		if (watermarkIndex < 0) {
+			throw new Error(`CLM audit watermark not found on selected branch: ${clmEntry.auditWatermark}`);
+		}
+		const messages = clmEntry.snapshot.blocks.map((block) => block.message);
+		for (let i = watermarkIndex + 1; i < path.length; i++) {
+			const entry = path[i];
+			if (entry.type === "message") messages.push(entry.message);
+			else if (entry.type === "custom_message") {
+				messages.push(
+					createCustomMessage(entry.customType, entry.content, entry.display, entry.details, entry.timestamp),
+				);
+			} else if (entry.type === "branch_summary" && entry.summary) {
+				messages.push(createBranchSummaryMessage(entry.summary, entry.fromId, entry.timestamp));
+			}
+		}
+		return {
+			messages,
+			thinkingLevel,
+			serviceTier,
+			model,
+			clm: {
+				mode: clmEntry.type === "clm_off_boundary" ? "off" : "on",
+				epochId: clmEntry.epochId,
+				revision: clmEntry.revision,
+				snapshot: clmEntry.snapshot,
+				auditWatermark: clmEntry.auditWatermark,
+			},
+		};
 	}
 
 	// Harness digests are regenerable snapshots of persistent state, so only the
