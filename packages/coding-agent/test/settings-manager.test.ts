@@ -160,14 +160,14 @@ describe("SettingsManager", () => {
 			["unset CLM default is false", {}, {}, (manager) => manager.getClmEnabled(), false],
 			["global CLM default is true", { clm: { enabled: true } }, {}, (manager) => manager.getClmEnabled(), true],
 			[
-				"project CLM false overrides global true",
+				"project false wins",
 				{ clm: { enabled: true } },
 				{ clm: { enabled: false } },
 				(manager) => manager.getClmEnabled(),
 				false,
 			],
 			[
-				"empty project CLM retains global true",
+				"empty project keeps true",
 				{ clm: { enabled: true } },
 				{ clm: {} },
 				(manager) => manager.getClmEnabled(),
