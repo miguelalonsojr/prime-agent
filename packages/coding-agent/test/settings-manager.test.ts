@@ -128,6 +128,8 @@ describe("SettingsManager", () => {
 	});
 
 	describe("project vs global precedence", () => {
+		const clmOn = { clm: { enabled: true } };
+		const clmOff = { clm: { enabled: false } };
 		it.each<[string, unknown, unknown, (manager: SettingsManager) => unknown, unknown]>([
 			[
 				"project sessionDir overrides global",
@@ -157,22 +159,10 @@ describe("SettingsManager", () => {
 				(manager) => manager.getIdleEvictionMinutes(),
 				60,
 			],
-			["unset CLM default is false", {}, {}, (manager) => manager.getClmEnabled(), false],
-			["global CLM default is true", { clm: { enabled: true } }, {}, (manager) => manager.getClmEnabled(), true],
-			[
-				"project false wins",
-				{ clm: { enabled: true } },
-				{ clm: { enabled: false } },
-				(manager) => manager.getClmEnabled(),
-				false,
-			],
-			[
-				"empty project keeps true",
-				{ clm: { enabled: true } },
-				{ clm: {} },
-				(manager) => manager.getClmEnabled(),
-				true,
-			],
+			["unset CLM is off", {}, {}, (m) => m.getClmEnabled(), false],
+			["global CLM on", clmOn, {}, (m) => m.getClmEnabled(), true],
+			["project false wins", clmOn, clmOff, (m) => m.getClmEnabled(), false],
+			["empty project keeps true", clmOn, { clm: {} }, (m) => m.getClmEnabled(), true],
 			[
 				"autonomous limits merge project over global, dropping invalid entries",
 				{ autonomous: { maxContinuations: 10, maxTurns: 40 } },
