@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import {
 	Agent,
 	type AgentContext,
@@ -19,6 +20,7 @@ import {
 import type {
 	Api,
 	AssistantMessage,
+	Context,
 	ImageContent,
 	Model,
 	ServiceTier,
@@ -104,6 +106,8 @@ import {
 	UNLIMITED_AUTONOMOUS_LIMIT,
 } from "./autonomous.js";
 import { type BashResult, executeBashWithOperations } from "./bash-executor.js";
+import { estimateClmRequestTokens } from "./clm/budget.js";
+import { type ClmRequestInputs, LiveContextController } from "./clm/live-context.js";
 import {
 	COMPACT_SKILL_NAME,
 	type CompactionResult,
@@ -324,6 +328,7 @@ import {
 import type {
 	BranchSummaryEntry,
 	ChildUsageAttributionEntry,
+	ClmBlock,
 	CompactionEntry,
 	SessionContext,
 	SessionEntry,
@@ -548,6 +553,7 @@ export interface AgentSessionConfig {
 	 */
 	baseToolsOverride?: Record<string, AgentTool>;
 	extensionRunnerRef?: { current?: ExtensionRunner };
+	clmContextRef?: { current?: AgentSession };
 	sessionStartEvent?: SessionStartEvent;
 	rlmDepth?: number;
 	rlmMaxDepth?: number;
@@ -1542,6 +1548,11 @@ export class AgentSession {
 	readonly settingsManager: SettingsManager;
 	private _serviceTierPreference: ServiceTier;
 	private _clmRecoveryError: ClmRecoveryError | undefined;
+	private _clmController?: LiveContextController;
+	private _clmPreviousToolExecution?: Agent["toolExecution"];
+	private _clmPrompt = "";
+	private readonly _clmDeliveryBlocks = new WeakMap<DeliveryRecord, ClmBlock>();
+	private _clmBindingError?: Error;
 	private readonly _unguardedStreamFn: Agent["streamFn"];
 
 	private _scopedModels: Array<{
@@ -1858,8 +1869,35 @@ export class AgentSession {
 		const streamFn = wrapStreamFnWithSemanticEdges(this._unguardedStreamFn, this._semanticEdges);
 		this.agent.streamFn = (model, context, options) => {
 			this.assertModelContextAvailable();
-			return streamFn(model, context, options);
+			const request =
+				this.sessionManager.getClmBranchState().mode === "on" ? this._clmRequestSnapshot(model, context) : context;
+			return streamFn(model, request, options);
 		};
+		if (config.clmContextRef) config.clmContextRef.current = this;
+		else {
+			const transformContext = this.agent.transformContext;
+			this.agent.transformContext = async (messages, signal) => {
+				const projected = await this.projectClmContext(messages);
+				return transformContext ? transformContext(projected, signal) : projected;
+			};
+		}
+		const onPayload = this.agent.onPayload;
+		this.agent.onPayload = async (payload, model) => {
+			if (this.sessionManager.getClmBranchState().mode !== "on") return onPayload?.(payload, model);
+			const original = this._cloneClmPayload(payload);
+			const result = await onPayload?.(payload, model);
+			const currentPayload = this._cloneClmPayload(payload);
+			const returnedPayload = this._cloneClmPayload(result === undefined ? payload : result);
+			try {
+				if (isDeepStrictEqual(original, currentPayload) && isDeepStrictEqual(original, returnedPayload)) {
+					return original;
+				}
+			} catch (cause) {
+				throw new Error("CLM extension payload comparison failed before dispatch", { cause });
+			}
+			throw new Error("CLM extension payload mutation cannot be budgeted; use the context hook instead");
+		};
+		this.syncClmMode();
 		// A resumed child may have replied before this process started; false would
 		// claim knowledge that is not present in the session transcript.
 		this._repliedToParentSinceTask =
@@ -1900,6 +1938,157 @@ export class AgentSession {
 			includeAllExtensionTools: true,
 		});
 		this._ensureHarnessDigestContext();
+	}
+
+	/** Synchronize internal request behavior after an idle durable mode transition. */
+	syncClmMode(): void {
+		if (this._clmRecoveryError) return;
+		if (this.sessionManager.getClmBranchState().mode === "on") {
+			this._clmPreviousToolExecution ??= this.agent.toolExecution;
+			this.agent.toolExecution = "sequential";
+		} else {
+			if (this._clmPreviousToolExecution !== undefined) this.agent.toolExecution = this._clmPreviousToolExecution;
+			this._clmPreviousToolExecution = undefined;
+			this.agent.state.systemPrompt = this.agent.state.systemPrompt.replace(this._clmPrompt, "");
+			this._clmPrompt = "";
+			this._clmController = undefined;
+		}
+	}
+
+	private _clmRequestInputs(): ClmRequestInputs {
+		const model = this.agent.modelOverride?.model ?? this.model;
+		if (!model) throw new Error("CLM request requires a model");
+		return structuredClone({
+			model,
+			systemPrompt: this.agent.state.systemPrompt,
+			tools: this.agent.state.tools.map(({ name, description, parameters }) => ({ name, description, parameters })),
+		});
+	}
+
+	private _cloneClmPayload(payload: unknown): unknown {
+		const visited = new Set<object>();
+		const validate = (value: unknown): void => {
+			if (typeof value === "function" || typeof value === "symbol") throw new Error("Unsupported payload value");
+			if (value === null || typeof value !== "object" || visited.has(value)) return;
+			visited.add(value);
+			const prototype = Object.getPrototypeOf(value);
+			if (prototype !== Object.prototype && prototype !== null && prototype !== Array.prototype)
+				throw new Error("Unsupported payload object");
+			for (const key of Reflect.ownKeys(value)) {
+				if (Array.isArray(value) && key === "length") continue;
+				const descriptor = Object.getOwnPropertyDescriptor(value, key);
+				if (typeof key !== "string" || !descriptor?.enumerable || !("value" in descriptor))
+					throw new Error("Unsupported payload property");
+				validate(descriptor.value);
+			}
+		};
+		try {
+			validate(payload);
+			return structuredClone(payload);
+		} catch (cause) {
+			throw new Error("CLM extension payload cannot be verified before dispatch", { cause });
+		}
+	}
+
+	private _clmRequestSnapshot(model: Model<Api>, context: Context): Context {
+		const snapshot: Context = structuredClone({
+			...context,
+			tools: context.tools?.map(({ name, description, parameters }) => ({ name, description, parameters })),
+		});
+		const estimate = estimateClmRequestTokens({
+			model,
+			systemPrompt: snapshot.systemPrompt ?? "",
+			messages: snapshot.messages,
+			tools: (snapshot.tools ?? []).map(({ name, description, parameters }) => ({ name, description, parameters })),
+		});
+		if (estimate.maxInputTokens !== null && estimate.estimatedInputTokens > estimate.maxInputTokens)
+			throw new Error("CLM final request exceeds its input budget after extension transforms");
+		return snapshot;
+	}
+
+	private async _getClmController(): Promise<LiveContextController> {
+		if (!this._clmController) {
+			const artifactDir = this.sessionManager.getSessionArtifactDir();
+			if (!artifactDir) throw new Error("CLM requires a persistent session artifact directory");
+			this._clmController = await LiveContextController.open(this.sessionManager, artifactDir);
+		}
+		const path = this._clmController.getClmStatus().path;
+		this._clmPrompt = `\n\nCLM working context: ${path}\nEdit this file only within one awaited tool action. Use an atomic save. Do not use detached or concurrent writers. Preserve every CTX_PROTECTED reference. Invalid edits retain the accepted revision.`;
+		if (!this.agent.state.systemPrompt.includes(this._clmPrompt)) this.agent.state.systemPrompt += this._clmPrompt;
+		return this._clmController;
+	}
+
+	private _clmProtectedActions(): Map<string, ClmBlock[]> {
+		if (this._clmBindingError) throw this._clmBindingError;
+		const actions = new Map<string, ClmBlock[]>();
+		const ids = new Set<string>();
+		const recordIds = new Set<string>();
+		const branch = new Set(this.sessionManager.getBranch().map((entry) => entry.id));
+		for (const action of this._actionStore.ownedActions()) {
+			if (action.payload.kind !== "turn") continue;
+			for (const record of action.payload.records) {
+				if (!record.started && !record.durable) continue;
+				const block = this._clmDeliveryBlocks.get(record);
+				if (
+					!record.id ||
+					recordIds.has(record.id) ||
+					record.ownerActionId !== action.id ||
+					!block ||
+					!branch.has(block.id) ||
+					ids.has(block.id)
+				)
+					throw new Error("CLM protected delivery has a missing or ambiguous original entry ID");
+				ids.add(block.id);
+				recordIds.add(record.id);
+				const owned = actions.get(action.id) ?? [];
+				owned.push(structuredClone(block));
+				actions.set(action.id, owned);
+			}
+		}
+		return actions;
+	}
+
+	private _bindClmDelivery(message: AgentMessage, entryId: string): void {
+		if (this.sessionManager.getClmBranchState().mode !== "on") return;
+		if (message.role !== "user" && message.role !== "custom") return;
+		const records = this._actionStore
+			.actionsForMessage(message)
+			.flatMap((action) =>
+				action.payload.kind === "turn" ? action.payload.records.filter((record) => record.message === message) : [],
+			);
+		if (records.length === 0) return;
+		const entry = this.sessionManager.getEntry(entryId);
+		if (
+			records.length !== 1 ||
+			this._clmDeliveryBlocks.has(records[0]) ||
+			!entry ||
+			(entry.type !== "message" && entry.type !== "custom_message")
+		) {
+			this._clmBindingError = new Error("CLM protected delivery has an ambiguous original entry ID");
+			return;
+		}
+		const canonical =
+			entry.type === "message"
+				? entry.message
+				: createCustomMessage(entry.customType, entry.content, entry.display, entry.details, entry.timestamp);
+		this._clmDeliveryBlocks.set(records[0], { id: entryId, message: structuredClone(canonical) });
+	}
+
+	async projectClmContext(messages: AgentMessage[]): Promise<AgentMessage[]> {
+		this.assertModelContextAvailable();
+		if (this.sessionManager.getClmBranchState().mode !== "on") return messages;
+		await this._agentEventQueue;
+		const fence = await this._acquireSessionActionCommitFence();
+		try {
+			const controller = await this._getClmController();
+			const protectedActions = this._clmProtectedActions();
+			return await controller.projectRequest(new Set(protectedActions.keys()), {
+				...this._clmRequestInputs(),
+				protectedActions,
+			});
+		} finally {
+			fence.release();
+		}
 	}
 
 	/** Refreshes MCP provider registrations without rebuilding the session runtime. */
@@ -2054,31 +2243,63 @@ export class AgentSession {
 	private _installAgentToolHooks(): void {
 		this.agent.beforeToolCall = async ({ toolCall, args }) => {
 			const runner = this._extensionRunner;
-			if (!runner.hasHandlers("tool_call")) {
-				return undefined;
-			}
-
+			const clm = this.sessionManager.getClmBranchState().mode === "on";
+			if (!clm && !runner.hasHandlers("tool_call")) return undefined;
 			await this._agentEventQueue;
-
+			let result: Awaited<ReturnType<ExtensionRunner["emitToolCall"]>>;
 			try {
-				return await runner.emitToolCall({
-					type: "tool_call",
-					toolName: toolCall.name,
-					toolCallId: toolCall.id,
-					input: args as Record<string, unknown>,
-				});
-			} catch (err) {
-				if (err instanceof Error) {
-					throw err;
-				}
-				throw new Error(`Extension failed, blocking execution: ${String(err)}`);
+				result = runner.hasHandlers("tool_call")
+					? await runner.emitToolCall({
+							type: "tool_call",
+							toolName: toolCall.name,
+							toolCallId: toolCall.id,
+							input: args as Record<string, unknown>,
+						})
+					: undefined;
+			} catch (error) {
+				if (error instanceof Error) throw error;
+				throw new Error(`Extension failed, blocking execution: ${String(error)}`);
 			}
+			if (clm && !result?.block) {
+				const fence = await this._acquireSessionActionCommitFence();
+				try {
+					const controller = await this._getClmController();
+					await controller.prepareToolAction(toolCall.id, this._clmProtectedActions());
+				} finally {
+					fence.release();
+				}
+			}
+			return result;
 		};
 
 		this.agent.afterToolCall = async ({ toolCall, args, result, isError }) => {
+			let rejectedEdit = false;
+			if (this.sessionManager.getClmBranchState().mode === "on") {
+				await this._agentEventQueue;
+				const fence = await this._acquireSessionActionCommitFence();
+				try {
+					const controller = await this._getClmController();
+					await controller.settleToolAction(toolCall.id, this._clmProtectedActions(), this._clmRequestInputs());
+				} catch (error) {
+					rejectedEdit = true;
+					isError = true;
+					result = {
+						...result,
+						content: [
+							...result.content,
+							{
+								type: "text",
+								text: `CLM edit rejected: ${this._asError(error).message}. Read the repaired context file before editing again.`,
+							},
+						],
+					};
+				} finally {
+					fence.release();
+				}
+			}
 			const runner = this._extensionRunner;
 			if (!runner.hasHandlers("tool_result")) {
-				return undefined;
+				return rejectedEdit ? { ...result, isError } : undefined;
 			}
 
 			const hookResult = await runner.emitToolResult({
@@ -2092,7 +2313,7 @@ export class AgentSession {
 			});
 
 			if (!hookResult) {
-				return undefined;
+				return rejectedEdit ? { ...result, isError } : undefined;
 			}
 
 			return {
@@ -4666,8 +4887,9 @@ export class AgentSession {
 		this._emit(event);
 
 		if (event.type === "message_end") {
+			let entryId: string | undefined;
 			if (event.message.role === "custom") {
-				this.sessionManager.appendCustomMessageEntry(
+				entryId = this.sessionManager.appendCustomMessageEntry(
 					event.message.customType,
 					event.message.content,
 					event.message.display,
@@ -4678,8 +4900,9 @@ export class AgentSession {
 				event.message.role === "assistant" ||
 				event.message.role === "toolResult"
 			) {
-				this.sessionManager.appendMessage(event.message);
+				entryId = this.sessionManager.appendMessage(event.message);
 			}
+			if (entryId) this._bindClmDelivery(event.message, entryId);
 
 			if (event.message.role === "assistant") {
 				this._lastAssistantMessage = event.message;
@@ -7203,6 +7426,7 @@ export class AgentSession {
 	}
 
 	private async _startPreparedTurnActions(actions: QueuedSessionAction[], epoch: number): Promise<void> {
+		this.syncClmMode();
 		let nextTurnMessages: CustomMessage[] = [];
 		const activeTurns = () =>
 			actions.filter(

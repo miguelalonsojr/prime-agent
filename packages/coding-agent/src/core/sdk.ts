@@ -291,6 +291,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	};
 
 	const extensionRunnerRef: { current?: ExtensionRunner } = {};
+	const clmContextRef: { current?: AgentSession } = {};
 
 	agent = new Agent({
 		initialState: {
@@ -335,9 +336,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		},
 		sessionId: sessionManager.getSessionId(),
 		transformContext: instrumentTransformContext(requestTimingEnabled, async (messages) => {
+			const projected = clmContextRef.current ? await clmContextRef.current.projectClmContext(messages) : messages;
 			const runner = extensionRunnerRef.current;
-			if (!runner) return messages;
-			return runner.emitContext(messages);
+			if (!runner) return projected;
+			return runner.emitContext(projected);
 		}),
 		steeringMode: settingsManager.getSteeringMode(),
 		followUpMode: settingsManager.getFollowUpMode(),
@@ -381,6 +383,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		agentMessageController: options.agentMessageController,
 		agentObserveController: options.agentObserveController,
 		extensionRunnerRef,
+		clmContextRef,
 		rlmDepth: options.rlmDepth,
 		rlmMaxDepth: options.rlmMaxDepth,
 		rlmSessionDir: options.rlmSessionDir,

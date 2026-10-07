@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { fauxAssistantMessage, fauxToolCall, type ToolResultMessage } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -2203,4 +2205,80 @@ describe("AgentSession queue regressions", () => {
 		expect(getUserTexts(harness)).toEqual(["recover stale routing"]);
 		expect(harness.eventsOfType("agent_start")).toHaveLength(1);
 	});
+});
+
+describe("CLM action identity", () => {
+	it.each(["user", "custom", "steering", "retry"])(
+		"pins distinct identical %s deliveries to their append IDs",
+		async (kind) => {
+			let path = "";
+			const protectedIds: string[][] = [];
+			const tool: AgentTool = {
+				name: "inspect",
+				label: "inspect",
+				description: "Inspect context",
+				parameters: Type.Object({}),
+				execute: async () => {
+					const text = readFileSync(path, "utf8");
+					protectedIds.push(
+						[...text.matchAll(/\[\[CTX_PROTECTED id=([^\]]+)\]\]/g)].map((match) => decodeURIComponent(match[1])),
+					);
+					if (kind === "steering" && protectedIds.length === 1) await harness.session.steer("same");
+					return { content: [{ type: "text", text: "receipt" }], details: {} };
+				},
+			};
+			let harness = await createHarness({
+				persistSession: true,
+				tools: [tool],
+				settings: { retry: { enabled: kind === "retry", baseDelayMs: 0, maxRetries: 1 } },
+			});
+			const original = harness;
+			try {
+				harness.sessionManager.appendClmOn({ blocks: [] }, null);
+				path = join(harness.sessionManager.getSessionArtifactDir()!, "clm", "context.txt");
+				for (let index = 0; index < (kind === "steering" ? 1 : 2); index++) {
+					await harness.session.restoreFollowUpMessage(
+						"same",
+						undefined,
+						kind === "custom" ? { customMessage: { ...createContextMessage("same"), timestamp: 1 } } : undefined,
+					);
+				}
+				const saved = harness.session.getSessionActionRecoverySnapshot();
+				original.session.dispose();
+				harness = await createHarness({
+					existingSessionFile: original.sessionManager.getSessionFile(),
+					tools: [tool],
+					settings: { retry: { enabled: kind === "retry", baseDelayMs: 0, maxRetries: 1 } },
+				});
+				await harness.session.restoreSessionActions(saved);
+				const responses = [
+					fauxAssistantMessage(fauxToolCall("inspect", {}), { stopReason: "toolUse" }),
+					fauxAssistantMessage("done"),
+					fauxAssistantMessage(fauxToolCall("inspect", {}), { stopReason: "toolUse" }),
+					fauxAssistantMessage("done"),
+				];
+				if (kind === "steering") responses.splice(1, 1);
+				if (kind === "retry")
+					responses.unshift(
+						fauxAssistantMessage("", { stopReason: "error", errorMessage: "503 temporarily unavailable" }),
+					);
+				harness.setResponses(responses);
+				harness.session.resumeQueuedWork();
+				await harness.session.waitForIdle();
+				const entries = harness.sessionManager
+					.getBranch()
+					.filter((entry) =>
+						entry.type === "message"
+							? entry.message.role === "user"
+							: entry.type === "custom_message" && entry.customType === "action-order-context",
+					);
+				expect(protectedIds[0]).toContain(entries[0].id);
+				expect(protectedIds[1]).toContain(entries[1].id);
+				expect(protectedIds[1]).not.toContain(entries[0].id);
+			} finally {
+				harness.cleanup();
+				original.cleanup();
+			}
+		},
+	);
 });
