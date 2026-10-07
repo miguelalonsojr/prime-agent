@@ -322,14 +322,9 @@ export class LiveContextController {
 		});
 	}
 
-	discardFailedProviderEntry(
-		failedEntry: ClmBlock,
-		protectedActions: ProtectedActions,
-		requestBudget: ClmRequestInputs,
-	): Promise<ClmRevisionEntry> {
+	discardFailedProviderEntry(failedEntry: ClmBlock, protectedActions: ProtectedActions): Promise<ClmRevisionEntry> {
 		const failed = structuredClone(failedEntry);
 		const originals = structuredClone(protectedActions);
-		const request = structuredClone(requestBudget);
 		return this.enqueue(async () => {
 			this.assertIdle();
 			const leafId = this.sessionManager.getLeafId();
@@ -340,7 +335,6 @@ export class LiveContextController {
 			if (pending.length > 0 || watermark !== failed.id)
 				throw new Error("CLM failed provider cleanup cannot cover another pending tool group");
 			const protectedIds = this.validateProtection(snapshot, originals);
-			this.checkBudget(snapshot, request);
 			LiveContextController.checkSnapshotCap(snapshot, this.sessionManager);
 			LiveContextController.checkDocumentSize(renderContextDocument(snapshot, protectedIds));
 			this.assertHealthy();

@@ -2198,11 +2198,7 @@ export class AgentSession {
 		if (!this._clmCleanupPending) return;
 		try {
 			if (!this._clmController) throw new Error("CLM failed provider entry has no owned request controller");
-			await this._clmController.discardFailedProviderEntry(
-				{ id, message },
-				this._clmProtectedActions(),
-				this._clmRequestInputs(),
-			);
+			await this._clmController.discardFailedProviderEntry({ id, message }, this._clmProtectedActions());
 		} catch (cause) {
 			this._clmRecoveryError ??= new ClmRecoveryError(
 				cause,

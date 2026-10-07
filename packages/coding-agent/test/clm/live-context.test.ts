@@ -486,7 +486,7 @@ describe("CLM live context", () => {
 		const message = fauxAssistantMessage(fauxToolCall("inspect", {}, { id: "partial" }), { stopReason: "error" });
 		const id = f.manager.appendMessage(message);
 		f.manager.appendModelChange(model.provider, model.id);
-		await f.controller.discardFailedProviderEntry({ id, message }, f.protectedActions, budget);
+		await f.controller.discardFailedProviderEntry({ id, message }, f.protectedActions);
 		const state = f.manager.getClmBranchState();
 		expect(state).toMatchObject({ revision: 2, auditWatermark: id });
 		expect(f.manager.getEntry(id)).toMatchObject({ message });

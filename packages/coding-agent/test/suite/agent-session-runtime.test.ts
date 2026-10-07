@@ -466,6 +466,90 @@ describe("AgentSessionRuntime characterization", () => {
 		expect(h.sessionManager.getEntries()).toEqual(before);
 	});
 
+	it.each(["restore", "off"] as const)(
+		"recovers via %s after the accepted CLM context exceeds a smaller model budget",
+		async (recovery) => {
+			const models = [
+				{ id: "roomy", contextWindow: 1_000_000, maxTokens: 1_000 },
+				{ id: "small", contextWindow: 20_000, maxTokens: 1_000 },
+			];
+			const settings = {
+				retry: { enabled: false },
+				autoRefine: { enabled: false },
+				compaction: { enabled: false, keepRecentTokens: 1 },
+			};
+			const h = await createHarness({ persistSession: true, models, settings });
+			cleanups.push(h.cleanup);
+			const s = h.session;
+			h.setResponses([fauxAssistantMessage("first"), fauxAssistantMessage("second")]);
+			await s.prompt("obsolete audit");
+			const on = await s.setClmMode(true);
+			await s.prompt("accepted large history ".repeat(6_000));
+			const controller = await LiveContextController.open(
+				h.sessionManager,
+				h.sessionManager.getSessionArtifactDir()!,
+			);
+			await controller.prepareToolAction("accept-large", new Map());
+			const { snapshot } = h.sessionManager.captureClmContext();
+			snapshot.blocks = snapshot.blocks.filter((block) => !JSON.stringify(block).includes("obsolete audit"));
+			writeFileSync(on.path, renderContextDocument(snapshot, new Set()));
+			await controller.settleToolAction("accept-large", new Map(), {
+				model: h.getModel(),
+				tools: [],
+				systemPrompt: "",
+			});
+			await s.setModel(h.models[1]);
+			const dispatched = h.faux.state.callCount;
+			await s.prompt("short request");
+			expect(h.faux.state.callCount).toBe(dispatched);
+			const failed = h.sessionManager
+				.getBranch()
+				.find(
+					(entry) =>
+						entry.type === "message" &&
+						entry.message.role === "assistant" &&
+						entry.message.stopReason === "error",
+				)!;
+			expect(failed).toMatchObject({ message: { errorMessage: expect.stringMatching(/CLM.*budget/) } });
+			expect(h.sessionManager.getBranch().at(-1)).toMatchObject({
+				type: "clm_revision",
+				auditWatermark: failed.id,
+				observedActionId: `failed-provider:${failed.id}`,
+			});
+			await expect(s.getClmStatus()).resolves.toMatchObject({ mode: "on", revision: 2 });
+			await s.disposeAsync();
+			const resumed = await createHarness({ existingSessionFile: s.sessionFile!, models, settings });
+			cleanups.push(resumed.cleanup);
+			expect(resumed.sessionManager.getEntry(failed.id)).toEqual(failed);
+			expect(JSON.stringify(resumed.sessionManager.buildSessionContext().messages)).toContain("short request");
+			expect(resumed.sessionManager.buildSessionContext().messages).not.toContainEqual(
+				expect.objectContaining({ stopReason: "error" }),
+			);
+			await resumed.session.setModel(resumed.models[1]);
+			await expect(resumed.session.getClmStatus()).resolves.toMatchObject({ mode: "on", revision: 2 });
+			if (recovery === "restore") {
+				await resumed.session.restoreClmRevision(on.epochId!, 0);
+			} else {
+				await resumed.session.setClmMode(false);
+				resumed.setResponses([
+					(context) => {
+						expect(JSON.stringify(context.messages)).toContain("accepted large history");
+						expect(JSON.stringify(context.messages)).not.toContain("obsolete audit");
+						return fauxAssistantMessage("accepted summary");
+					},
+				]);
+				await resumed.session.compact();
+			}
+			resumed.setResponses([fauxAssistantMessage("recovered reply")]);
+			await resumed.session.prompt("continue safely");
+			expect(getMessageText(resumed.session.messages.at(-1))).toBe("recovered reply");
+			expect(resumed.faux.state.callCount).toBe(recovery === "restore" ? 1 : 2);
+			const reopened = SessionManager.open(resumed.session.sessionFile!);
+			expect(reopened.getEntry(failed.id)).toEqual(failed);
+			expect(reopened.getClmBranchState().mode).toBe(recovery === "restore" ? "on" : "off");
+		},
+	);
+
 	it("guards on-mode navigation before audit mutation", async () => {
 		const { runtime } = await createRuntimeForTest(() => {});
 		await runtime.session.prompt("seed");
