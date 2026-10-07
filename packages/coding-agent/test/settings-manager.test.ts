@@ -157,6 +157,22 @@ describe("SettingsManager", () => {
 				(manager) => manager.getIdleEvictionMinutes(),
 				60,
 			],
+			["unset CLM default is false", {}, {}, (manager) => manager.getClmEnabled(), false],
+			["global CLM default is true", { clm: { enabled: true } }, {}, (manager) => manager.getClmEnabled(), true],
+			[
+				"project CLM false overrides global true",
+				{ clm: { enabled: true } },
+				{ clm: { enabled: false } },
+				(manager) => manager.getClmEnabled(),
+				false,
+			],
+			[
+				"empty project CLM retains global true",
+				{ clm: { enabled: true } },
+				{ clm: {} },
+				(manager) => manager.getClmEnabled(),
+				true,
+			],
 			[
 				"autonomous limits merge project over global, dropping invalid entries",
 				{ autonomous: { maxContinuations: 10, maxTurns: 40 } },

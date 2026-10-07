@@ -193,6 +193,10 @@ export type McpServerConfig =
 			callTimeoutMs?: number;
 	  };
 
+export interface ClmSettings {
+	enabled?: boolean;
+}
+
 export interface Settings {
 	onboardingShown?: boolean;
 	onboardingCompleted?: boolean;
@@ -218,6 +222,7 @@ export interface Settings {
 	followUpMode?: "all" | "one-at-a-time";
 	theme?: string;
 	compaction?: CompactionSettings;
+	clm?: ClmSettings;
 	autoRefine?: AutoRefineSettings;
 	agentTraces?: AgentTracesSettings;
 	telemetry?: TelemetrySettings;
@@ -1116,6 +1121,10 @@ export class SettingsManager {
 			maxPauseMs: Math.min(bound(wait?.maxPauseMs, 86_400_000), MAX_PROVIDER_PAUSE_MS),
 			maxParks: bound(wait?.maxParks, 8),
 		};
+	}
+
+	getClmEnabled(): boolean {
+		return this.settings.clm?.enabled ?? false;
 	}
 
 	getProviderBackupModel(): string | undefined {
