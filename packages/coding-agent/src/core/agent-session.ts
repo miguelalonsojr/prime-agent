@@ -359,8 +359,10 @@ import { type BuildSystemPromptOptions, buildSystemPrompt } from "./system-promp
 import { THINKING_LEVELS } from "./thinking-levels.js";
 import { acpMcpToolNames, createAcpMcpToolDefinitions } from "./tools/acp-mcp.js";
 import { type BashOperations, createLocalBashOperations } from "./tools/bash.js";
+import { getEditExecutionSettlement } from "./tools/edit.js";
 import { createAllToolDefinitions } from "./tools/index.js";
 import { IpythonKernelProvisioner, type UnavailablePythonSkills } from "./tools/ipython.js";
+import { resolveToCwd } from "./tools/path-utils.js";
 import { createToolDefinitionFromAgentTool } from "./tools/tool-definition-wrapper.js";
 import {
 	addAssistantUsage,
@@ -1536,9 +1538,10 @@ export class ClmRecoveryError extends Error {
 }
 
 /** Validation failures are local recovery state, never permission to replay audit context. */
-export function getClmRecoveryError(sessionManager: SessionManager): ClmRecoveryError | undefined {
+export function getClmRecoveryError(sessionManager: SessionManager, ownedWriter = false): ClmRecoveryError | undefined {
 	try {
 		const state = sessionManager.getClmBranchState();
+		if (!ownedWriter) LiveContextController.assertWriterSettled(sessionManager);
 		if (state.mode === "on") {
 			const uncovered = sessionManager.buildSessionContext().messages.slice(state.snapshot?.blocks.length ?? 0);
 			if (uncovered.some((message) => message.role === "assistant" && message.stopReason === "error"))
@@ -1546,7 +1549,10 @@ export function getClmRecoveryError(sessionManager: SessionManager): ClmRecovery
 		}
 		return undefined;
 	} catch (cause) {
-		return new ClmRecoveryError(cause);
+		return new ClmRecoveryError(
+			cause,
+			`CLM context recovery failed: ${cause instanceof Error ? cause.message : String(cause)}`,
+		);
 	}
 }
 
@@ -1559,6 +1565,8 @@ export class AgentSession {
 	private _clmController?: LiveContextController;
 	private _clmPreviousToolExecution?: Agent["toolExecution"];
 	private _clmPrompt = "";
+	private readonly _clmEditDefinitions = new WeakMap<AgentTool, object>();
+	private _clmToolFence?: { id: string; settlement: () => Promise<void> | undefined; dispose: () => void };
 	private readonly _clmDeliveryBlocks = new WeakMap<DeliveryRecord, ClmBlock>();
 	private _clmBindingError?: Error;
 	private _clmCleanupPending?: ClmRecoveryError;
@@ -1878,6 +1886,7 @@ export class AgentSession {
 		const streamFn = wrapStreamFnWithSemanticEdges(this._unguardedStreamFn, this._semanticEdges);
 		this.agent.streamFn = (model, context, options) => {
 			this.assertModelContextAvailable();
+			LiveContextController.assertWriterSettled(this.sessionManager);
 			const request =
 				this.sessionManager.getClmBranchState().mode === "on" ? this._clmRequestSnapshot(model, context) : context;
 			return streamFn(model, request, options);
@@ -2023,7 +2032,7 @@ export class AgentSession {
 			this._clmController = await LiveContextController.open(this.sessionManager, artifactDir);
 		}
 		const path = this._clmController.getClmStatus().path;
-		this._clmPrompt = `\n\nCLM working context: ${path}\nEdit this file only within one awaited tool action. Use an atomic save. Do not use detached or concurrent writers. Preserve every CTX_PROTECTED reference. Invalid edits retain the accepted revision.`;
+		this._clmPrompt = `\n\nCLM working context: ${path}\nEdit this file only within one awaited tool action. Use an atomic save. Do not use detached or concurrent writers. Cancellation of bash, Python, custom, or detached writers cannot prove physical settlement and leaves CLM blocked. Preserve every CTX_PROTECTED reference. Invalid edits retain the accepted revision.`;
 		if (!this.agent.state.systemPrompt.includes(this._clmPrompt)) this.agent.state.systemPrompt += this._clmPrompt;
 		return this._clmController;
 	}
@@ -2271,7 +2280,7 @@ export class AgentSession {
 	 * happens here instead of in wrappers.
 	 */
 	private _installAgentToolHooks(): void {
-		this.agent.beforeToolCall = async ({ toolCall, args }) => {
+		this.agent.beforeToolCall = async ({ toolCall, args, context }, signal) => {
 			const runner = this._extensionRunner;
 			const clm = this.sessionManager.getClmBranchState().mode === "on";
 			if (!clm && !runner.hasHandlers("tool_call")) return undefined;
@@ -2295,6 +2304,25 @@ export class AgentSession {
 				try {
 					const controller = await this._getClmController();
 					await controller.prepareToolAction(toolCall.id, this._clmProtectedActions());
+					const tool = context.tools?.find((candidate) => candidate.name === toolCall.name);
+					const execute = tool && this._clmEditDefinitions.get(tool);
+					const path =
+						typeof (args as { path?: unknown }).path === "string"
+							? resolveToCwd((args as { path: string }).path, this._cwd)
+							: undefined;
+					const settlement = () =>
+						execute && path ? getEditExecutionSettlement(execute, toolCall.id, signal, path) : undefined;
+					const cancel = () => controller.abortToolAction(toolCall.id, settlement());
+					this._clmToolFence = {
+						id: toolCall.id,
+						settlement,
+						dispose: () => signal?.removeEventListener("abort", cancel),
+					};
+					signal?.addEventListener("abort", cancel, { once: true });
+					if (signal?.aborted) {
+						cancel();
+						throw new Error("CLM tool action aborted before execution");
+					}
 				} finally {
 					fence.release();
 				}
@@ -2302,13 +2330,20 @@ export class AgentSession {
 			return result;
 		};
 
-		this.agent.afterToolCall = async ({ toolCall, args, result, isError }) => {
+		this.agent.afterToolCall = async ({ toolCall, args, result, isError }, signal) => {
 			let rejectedEdit = false;
 			if (this.sessionManager.getClmBranchState().mode === "on") {
 				await this._agentEventQueue;
 				const fence = await this._acquireSessionActionCommitFence();
 				try {
 					const controller = await this._getClmController();
+					const writer = this._clmToolFence;
+					if (!writer || writer.id !== toolCall.id) throw new Error("CLM tool action has no writer fence");
+					if (signal?.aborted) {
+						controller.abortToolAction(toolCall.id, writer.settlement());
+						throw new Error("CLM cancelled writer requires physical settlement and explicit repair");
+					}
+					await writer.settlement();
 					await controller.settleToolAction(toolCall.id, this._clmProtectedActions(), this._clmRequestInputs());
 				} catch (error) {
 					rejectedEdit = true;
@@ -2324,6 +2359,8 @@ export class AgentSession {
 						],
 					};
 				} finally {
+					this._clmToolFence?.dispose();
+					this._clmToolFence = undefined;
 					fence.release();
 				}
 			}
@@ -5616,7 +5653,7 @@ export class AgentSession {
 	assertModelContextAvailable(): void {
 		const active = this.clmRecoveryError;
 		if (active) throw active;
-		this._clmRecoveryError ??= getClmRecoveryError(this.sessionManager);
+		this._clmRecoveryError ??= getClmRecoveryError(this.sessionManager, this._clmController !== undefined);
 		if (this._clmRecoveryError) throw this._clmRecoveryError;
 	}
 
@@ -6303,6 +6340,7 @@ export class AgentSession {
 
 	private async _prompt(text: string, options?: InternalPromptOptions): Promise<void> {
 		this.assertModelContextAvailable();
+		if (!this.isStreaming) LiveContextController.assertWriterSettled(this.sessionManager);
 		// Synchronous preflight guard: from submission until the prompt promise
 		// settles, a model switch must not tear down a routed turn's override
 		// (the routing decision for this turn's images may already be made).
@@ -11118,6 +11156,10 @@ export class AgentSession {
 		const toolRegistry = new Map(wrappedBuiltInTools.map((tool) => [tool.name, tool]));
 		for (const tool of wrappedExtensionTools as AgentTool[]) {
 			toolRegistry.set(tool.name, tool);
+		}
+		for (const tool of toolRegistry.values()) {
+			const definition = definitionRegistry.get(tool.name)?.definition;
+			if (definition) this._clmEditDefinitions.set(tool, definition.execute);
 		}
 		this._toolRegistry = toolRegistry;
 

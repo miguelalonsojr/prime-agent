@@ -37,3 +37,8 @@ export async function withFileMutationQueue<T>(filePath: string, fn: () => Promi
 		}
 	}
 }
+
+/** Snapshot the physical work already admitted for this canonical path. */
+export function drainFileMutationQueue(filePath: string): Promise<void> {
+	return fileMutationQueues.get(getMutationQueueKey(filePath)) ?? Promise.resolve();
+}

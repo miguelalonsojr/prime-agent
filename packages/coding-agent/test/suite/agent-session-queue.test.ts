@@ -1,7 +1,9 @@
 import { readFileSync } from "node:fs";
+import fileSystem, { writeFile } from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
 import { join } from "node:path";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
-import { fauxAssistantMessage, fauxToolCall, type ToolResultMessage } from "@earendil-works/pi-ai";
+import { type Context, fauxAssistantMessage, fauxToolCall, type ToolResultMessage } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -11,6 +13,7 @@ import {
 	createAgentSessionMessage,
 	createAgentSessionMessagePrompt,
 } from "../../src/core/agent-messages.js";
+import { LiveContextController } from "../../src/core/clm/live-context.js";
 import { type AgentCronJob, shouldDeferHeartbeatCronJob } from "../../src/core/cron-jobs.js";
 import type { HostRequestHandlers, KernelSentAgentMessage } from "../../src/core/kernel/index.js";
 import {
@@ -23,6 +26,8 @@ import { getLocalHarnessStateDir, loadHarnessState, type RefinementResult } from
 import type { ActionStore, SessionAction } from "../../src/core/session-action-store.js";
 import { parseSessionSlashCommand } from "../../src/core/slash-commands.js";
 import type { BashOperations } from "../../src/core/tools/bash.js";
+import { createEditToolDefinition } from "../../src/core/tools/edit.js";
+import { drainFileMutationQueue } from "../../src/core/tools/file-mutation-queue.js";
 import {
 	conversationMessages,
 	createHarness,
@@ -2207,6 +2212,106 @@ describe("AgentSession queue regressions", () => {
 	});
 });
 describe("CLM action identity", () => {
+	it.each(["builtin", "custom"])("does not accept an aborted %s writer that finishes late", async (kind) => {
+		const [started, release, written] = [createDeferred(), createDeferred(), createDeferred()];
+		let path = "";
+		const tool: AgentTool = {
+			name: "edit",
+			label: "edit",
+			description: "custom writer",
+			parameters: Type.Object({}),
+			execute: async () => {
+				const text = readFileSync(path, "utf8");
+				started.resolve();
+				await release.promise;
+				await writeFile(path, text.replace("obsolete", "late bytes"));
+				written.resolve();
+				return { content: [{ type: "text", text: "done" }], details: {} };
+			},
+		};
+		const harness = await createHarness({
+			persistSession: true,
+			tools: kind === "custom" ? [tool] : [],
+			extensionFactories: kind === "builtin" ? [(pi) => pi.registerTool(createEditToolDefinition("/"))] : [],
+		});
+		const nextProviderCall = vi.fn((context: Context) => {
+			expect(context.messages.filter((message) => message.role === "user").map(getMessageText)).not.toContain(
+				"late bytes",
+			);
+			return fauxAssistantMessage("repaired");
+		});
+		const message = { role: "user" as const, content: "obsolete", timestamp: 1 };
+		const id = harness.sessionManager.appendMessage(message);
+		harness.sessionManager.appendClmOn({ blocks: [{ id, message }] }, id);
+		harness.session.syncClmMode();
+		path = join(harness.sessionManager.getSessionArtifactDir()!, "clm", "context.txt");
+		const originalWrite = fileSystem.writeFile;
+		const fault = vi.spyOn(fileSystem, "writeFile").mockImplementation(async (...args) => {
+			if (kind === "builtin" && args[0] === path) {
+				started.resolve();
+				await release.promise;
+				await originalWrite(...args);
+				written.resolve();
+				return;
+			}
+			return originalWrite(...args);
+		});
+		syncBuiltinESMExports();
+		harness.setResponses([
+			fauxAssistantMessage(
+				fauxToolCall(
+					"edit",
+					kind === "builtin" ? { path, edits: [{ oldText: "obsolete", newText: "late bytes" }] } : {},
+				),
+				{ stopReason: "toolUse" },
+			),
+			nextProviderCall,
+		]);
+		const run = harness.session.prompt("current");
+		let reached = false;
+		try {
+			reached = await Promise.race([started.promise.then(() => true), run.then(() => false)]);
+			expect(reached, JSON.stringify(harness.eventsOfType("tool_execution_end"))).toBe(true);
+			await harness.session.abort();
+			await run;
+			await expect(harness.session.prompt("while writing")).rejects.toThrow(/writer/);
+			release.resolve();
+			await written.promise;
+			await expect(harness.session.prompt("next")).rejects.toThrow();
+			expect(nextProviderCall).not.toHaveBeenCalled();
+			const controller = await LiveContextController.open(
+				harness.sessionManager,
+				harness.sessionManager.getSessionArtifactDir()!,
+			);
+			await drainFileMutationQueue(path);
+			if (kind === "builtin") {
+				await controller.repairCancelledToolAction();
+				await harness.session.prompt("after repair");
+				expect(nextProviderCall).toHaveBeenCalledTimes(1);
+			} else {
+				await expect(controller.repairCancelledToolAction()).rejects.toThrow(/settlement/);
+				const reopened = await createHarness({
+					existingSessionFile: harness.sessionManager.getSessionFile(),
+					tools: [tool],
+				});
+				try {
+					expect(JSON.stringify(reopened.session.getTranscriptMessages())).toContain("obsolete");
+					await expect(reopened.session.prompt("after restart")).rejects.toThrow(/writer/);
+				} finally {
+					reopened.cleanup();
+				}
+			}
+		} finally {
+			release.resolve();
+			await drainFileMutationQueue(path);
+			if (reached) await written.promise;
+			await run;
+			fault.mockRestore();
+			syncBuiltinESMExports();
+			harness.cleanup();
+		}
+	});
+
 	it.each(["user", "custom", "steering", "retry"])(
 		"pins distinct identical %s deliveries to their append IDs",
 		async (kind) => {

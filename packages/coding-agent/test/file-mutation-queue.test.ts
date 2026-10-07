@@ -3,7 +3,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { createEditTool } from "../src/core/tools/edit.js";
-import { withFileMutationQueue } from "../src/core/tools/file-mutation-queue.js";
+import { drainFileMutationQueue, withFileMutationQueue } from "../src/core/tools/file-mutation-queue.js";
+import { createDeferred } from "./suite/scheduling.js";
 
 function delay(ms: number): Promise<void> {
 	return new Promise((resolve) => setTimeout(resolve, ms));
@@ -86,6 +87,47 @@ describe("withFileMutationQueue", () => {
 });
 
 describe("built-in edit tool", () => {
+	it("keeps the physical queue closed after the edit wrapper aborts", async () => {
+		const dir = await createTempDir();
+		const path = join(dir, "late.txt");
+		await writeFile(path, "old");
+		const [started, release, written] = [createDeferred(), createDeferred(), createDeferred()];
+		const signal = new AbortController();
+		const tool = createEditTool(dir, {
+			operations: {
+				access,
+				readFile,
+				writeFile: async (path, text) => {
+					started.resolve();
+					await release.promise;
+					await writeFile(path, text);
+					written.resolve();
+				},
+			},
+		});
+		const result = tool.execute("late", { path, edits: [{ oldText: "old", newText: "late" }] }, signal.signal);
+		const aborted = expect(result).rejects.toThrow(/aborted/);
+		let next: Promise<unknown> | undefined;
+		let drained = false;
+		const drain = drainFileMutationQueue(path).then(() => {
+			drained = true;
+		});
+		try {
+			await started.promise;
+			signal.abort();
+			await aborted;
+			next = withFileMutationQueue(path, async () => readFile(path, "utf8"));
+			void next.catch(() => undefined);
+			expect(await readFile(path, "utf8")).toBe("old");
+			expect(drained).toBe(false);
+		} finally {
+			release.resolve();
+			await written.promise;
+			await drain;
+			expect(await next).toBe("late");
+		}
+	});
+
 	it("preserves both parallel edits on the same file", async () => {
 		const dir = await createTempDir();
 		const filePath = join(dir, "parallel-edit.txt");

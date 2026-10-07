@@ -18,7 +18,7 @@ import {
 	restoreLineEndings,
 	stripBom,
 } from "./edit-diff.js";
-import { withFileMutationQueue } from "./file-mutation-queue.js";
+import { drainFileMutationQueue, withFileMutationQueue } from "./file-mutation-queue.js";
 import { resolveToCwd } from "./path-utils.js";
 import { invalidArgText, shortenPath, str } from "./render-utils.js";
 import { wrapToolDefinition } from "./tool-definition-wrapper.js";
@@ -326,6 +326,26 @@ function setEditPreview(
 	return changed;
 }
 
+interface EditExecution {
+	id: string;
+	signal?: AbortSignal;
+	path: string;
+	settlement: Promise<void>;
+}
+const localEditExecutions = new WeakMap<object, EditExecution>();
+
+/** Only the local built-in implementation can issue a physical writer receipt. */
+export function getEditExecutionSettlement(
+	execute: object,
+	id: string,
+	signal: AbortSignal | undefined,
+	path: string,
+): Promise<void> | undefined {
+	const execution = localEditExecutions.get(execute);
+	if (!execution || execution.id !== id || execution.signal !== signal || execution.path !== path) return undefined;
+	return execution.settlement;
+}
+
 export function createEditToolDefinition(
 	cwd: string,
 	options?: EditToolOptions,
@@ -341,105 +361,52 @@ export function createEditToolDefinition(
 		parameters: editSchema,
 		renderShell: "self",
 		prepareArguments: prepareEditArguments,
-		async execute(_toolCallId, input: EditToolInput, signal?: AbortSignal, _onUpdate?, _ctx?) {
+		async execute(toolCallId, input: EditToolInput, signal?: AbortSignal, _onUpdate?, _ctx?) {
 			const { path, edits } = validateEditInput(input);
 			const absolutePath = resolveToCwd(path, cwd);
-
-			return withFileMutationQueue(
-				absolutePath,
-				() =>
-					new Promise<{
-						content: Array<{ type: "text"; text: string }>;
-						details: EditToolDetails | undefined;
-					}>((resolve, reject) => {
-						if (signal?.aborted) {
-							reject(new Error("Operation aborted"));
-							return;
-						}
-
-						let aborted = false;
-
-						const onAbort = () => {
-							aborted = true;
-							reject(new Error("Operation aborted"));
-						};
-
-						if (signal) {
-							signal.addEventListener("abort", onAbort, { once: true });
-						}
-
-						void (async () => {
-							try {
-								try {
-									await ops.access(absolutePath);
-								} catch (error: unknown) {
-									const errorMessage =
-										error instanceof Error && "code" in error ? `Error code: ${error.code}` : String(error);
-									if (signal) {
-										signal.removeEventListener("abort", onAbort);
-									}
-									reject(new Error(`Could not edit file: ${path}. ${errorMessage}.`));
-									return;
-								}
-
-								if (aborted) {
-									return;
-								}
-
-								const buffer = await ops.readFile(absolutePath);
-								const rawContent = buffer.toString("utf-8");
-
-								if (aborted) {
-									return;
-								}
-
-								// Strip BOM before matching. The model will not include an invisible BOM in oldText.
-								const { bom, text: content } = stripBom(rawContent);
-								const originalEnding = detectLineEnding(content);
-								const normalizedContent = normalizeToLF(content);
-								const { baseContent, newContent } = applyEditsToNormalizedContent(
-									normalizedContent,
-									edits,
-									path,
-								);
-
-								if (aborted) {
-									return;
-								}
-
-								const finalContent = bom + restoreLineEndings(newContent, originalEnding);
-								await ops.writeFile(absolutePath, finalContent);
-
-								if (aborted) {
-									return;
-								}
-
-								if (signal) {
-									signal.removeEventListener("abort", onAbort);
-								}
-
-								const diffResult = generateDiffString(baseContent, newContent);
-								resolve({
-									content: [
-										{
-											type: "text",
-											text: `Successfully replaced ${edits.length} block(s) in ${path}.`,
-										},
-									],
-									details: { diff: diffResult.diff, firstChangedLine: diffResult.firstChangedLine },
-								});
-							} catch (error: unknown) {
-								if (signal) {
-									signal.removeEventListener("abort", onAbort);
-								}
-
-								if (!aborted) {
-									reject(error instanceof Error ? error : new Error(String(error)));
-								}
-							}
-						})();
-					}),
-			);
+			const assertNotAborted = () => {
+				if (signal?.aborted) throw new Error("Operation aborted");
+			};
+			// The queue owns the whole filesystem body, never the abort-raced public promise.
+			const execution = withFileMutationQueue(absolutePath, async () => {
+				assertNotAborted();
+				try {
+					await ops.access(absolutePath);
+				} catch (error: unknown) {
+					const detail = error instanceof Error && "code" in error ? `Error code: ${error.code}` : String(error);
+					throw new Error(`Could not edit file: ${path}. ${detail}.`);
+				}
+				assertNotAborted();
+				const buffer = await ops.readFile(absolutePath);
+				assertNotAborted();
+				const { bom, text: content } = stripBom(buffer.toString("utf-8"));
+				const originalEnding = detectLineEnding(content);
+				const { baseContent, newContent } = applyEditsToNormalizedContent(normalizeToLF(content), edits, path);
+				assertNotAborted();
+				await ops.writeFile(absolutePath, bom + restoreLineEndings(newContent, originalEnding));
+				assertNotAborted();
+				const diff = generateDiffString(baseContent, newContent);
+				return {
+					content: [{ type: "text" as const, text: `Successfully replaced ${edits.length} block(s) in ${path}.` }],
+					details: { diff: diff.diff, firstChangedLine: diff.firstChangedLine },
+				};
+			});
+			if (ops === defaultEditOperations) {
+				localEditExecutions.set(definition.execute, {
+					id: toolCallId,
+					signal,
+					path: absolutePath,
+					settlement: drainFileMutationQueue(absolutePath),
+				});
+			}
+			return new Promise<Awaited<typeof execution>>((resolve, reject) => {
+				const onAbort = () => reject(new Error("Operation aborted"));
+				signal?.addEventListener("abort", onAbort, { once: true });
+				if (signal?.aborted) onAbort();
+				void execution
+					.then(resolve, (error: unknown) => reject(error instanceof Error ? error : new Error(String(error))))
+					.finally(() => signal?.removeEventListener("abort", onAbort));
+			});
 		},
 		renderCall(args, theme, context) {
 			const component = getEditCallRenderComponent(context.state, context.lastComponent);

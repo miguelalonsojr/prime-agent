@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { closeSync, fsyncSync, lstatSync, openSync, realpathSync, unlinkSync } from "node:fs";
 import { mkdir, open, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { isDeepStrictEqual } from "node:util";
@@ -43,6 +44,8 @@ export class LiveContextController {
 	private action?: ToolAction;
 	private conflict?: string;
 	private status: ClmStatus;
+	private cancelled?: { settled: boolean };
+	private markerArmed = false;
 
 	private constructor(
 		private readonly sessionManager: SessionManager,
@@ -57,6 +60,7 @@ export class LiveContextController {
 		let controller = LiveContextController.controllers.get(sessionManager);
 		if (!controller) {
 			controller = (async () => {
+				LiveContextController.assertWriterSettled(sessionManager);
 				const instance = new LiveContextController(sessionManager, path);
 				const { snapshot } = instance.acceptedContext();
 				await mkdir(dirname(path), { recursive: true });
@@ -69,6 +73,113 @@ export class LiveContextController {
 		const instance = await controller;
 		if (instance.status.path !== path) throw new Error("CLM already owns a different working mirror");
 		return instance;
+	}
+
+	/** Check before writing any off/on/restore transition, including after a restart. */
+	static assertWriterSettled(sessionManager: SessionManager): void {
+		const file = sessionManager.getSessionFile();
+		if (!file) return;
+		let canonical: string;
+		try {
+			canonical = realpathSync(file);
+		} catch (error) {
+			if (sessionManager.getClmBranchState().epochId) throw error;
+			return;
+		}
+		try {
+			lstatSync(`${canonical}.clm-writer`);
+		} catch (error) {
+			if (error instanceof Error && "code" in error && error.code === "ENOENT") return;
+			throw error;
+		}
+		throw new Error(
+			"CLM writer settlement is uncertain; retain the marker until known writer settlement and explicit repair",
+		);
+	}
+
+	private markerPath(): string {
+		const file = this.sessionManager.getSessionFile();
+		if (!file) throw new Error("CLM writer safety requires a persistent session");
+		return `${realpathSync(file)}.clm-writer`;
+	}
+
+	private syncMarkerDirectory(path: string): void {
+		const fd = openSync(dirname(path), "r");
+		try {
+			fsyncSync(fd);
+		} finally {
+			closeSync(fd);
+		}
+	}
+
+	private armMarker(): void {
+		try {
+			const path = this.markerPath();
+			const fd = openSync(path, "wx", 0o600);
+			try {
+				fsyncSync(fd);
+			} finally {
+				closeSync(fd);
+			}
+			this.syncMarkerDirectory(path);
+			this.markerArmed = true;
+		} catch (cause) {
+			this.conflict = "CLM writer marker creation or fsync is uncertain; repair the session";
+			throw new Error(this.conflict, { cause });
+		}
+	}
+
+	private clearMarker(): void {
+		if (!this.markerArmed) return;
+		const path = this.markerPath();
+		try {
+			unlinkSync(path);
+			this.syncMarkerDirectory(path);
+			this.markerArmed = false;
+		} catch (cause) {
+			// Re-arm if removal was visible but its directory sync failed.
+			try {
+				this.armMarker();
+			} catch {
+				/* Keep the in-process conflict even if storage is unavailable. */
+			}
+			this.conflict = "CLM writer marker removal is uncertain; repair the session";
+			throw new Error(this.conflict, { cause });
+		}
+	}
+
+	/** Cancellation invalidates an import synchronously, including one paused in readMirror. */
+	abortToolAction(actionId: string, actualExecutionSettlement?: Promise<void>): void {
+		if (this.action?.id !== actionId || this.cancelled) return;
+		const cancelled = { settled: false };
+		this.cancelled = cancelled;
+		this.conflict = "CLM cancelled writer requires physical settlement and explicit mirror repair";
+		this.status.error = this.conflict;
+		if (actualExecutionSettlement) {
+			void actualExecutionSettlement.then(
+				() => {
+					cancelled.settled = true;
+				},
+				() => undefined,
+			);
+		}
+	}
+
+	/** A restarted controller has no receipt and must not infer settlement from a hash or empty queue. */
+	repairCancelledToolAction(): Promise<void> {
+		return this.enqueue(async () => {
+			if (!this.cancelled?.settled) throw new Error("CLM physical writer settlement is not known");
+			const state = this.sessionManager.getClmBranchState();
+			if (state.epochId !== this.status.epochId || state.revision !== this.status.revision)
+				throw new Error("CLM accepted state changed before writer repair");
+			const { snapshot } = this.acceptedContext();
+			await this.publish(snapshot, new Set(snapshot.blocks.map((block) => block.id)));
+			this.clearMarker();
+			this.action = undefined;
+			this.cancelled = undefined;
+			this.conflict = undefined;
+			this.status.error = undefined;
+		});
 	}
 
 	getClmStatus(): ClmStatus {
@@ -89,6 +200,7 @@ export class LiveContextController {
 				this.conflict = "CLM session changed while preparing tool action";
 				throw new Error(this.conflict);
 			}
+			this.armMarker();
 			this.action = {
 				id: actionId,
 				protectedActions: originals,
@@ -121,7 +233,11 @@ export class LiveContextController {
 			let protectedIds: Set<string>;
 			try {
 				const text = await this.readMirror();
+				this.assertHealthy();
 				if (this.hash(text) === this.publishedHash) {
+					await this.publish(action.base, this.validateProtection(action.base, originals));
+					this.assertHealthy();
+					this.clearMarker();
 					this.action = undefined;
 					return null;
 				}
@@ -140,10 +256,14 @@ export class LiveContextController {
 				if (this.sessionManager.getLeafId() !== action.leafId) throw new Error("CLM session changed before import");
 				committedId = this.sessionManager.appendClmRevision(candidate, action.watermark, actionId);
 			} catch (error) {
-				await this.repairRejectedMirror(originals);
+				if (!this.cancelled) await this.repairRejectedMirror(originals);
 				throw error;
 			}
-			return this.publishAcceptedRevision(committedId, protectedIds);
+			const entry = await this.publishAcceptedRevision(committedId, protectedIds);
+			this.assertHealthy();
+			this.clearMarker();
+			this.action = undefined;
+			return entry;
 		});
 	}
 
@@ -203,6 +323,8 @@ export class LiveContextController {
 			await rename(this.status.path, `${this.status.path}.rejected-${randomUUID()}`);
 			const { snapshot } = this.acceptedContext();
 			await this.publish(snapshot, this.validateProtection(snapshot, originals));
+			this.assertHealthy();
+			this.clearMarker();
 			this.action = undefined;
 		} catch {
 			this.conflict = "CLM repair failed or commit is uncertain; reopen and verify the session";
@@ -220,7 +342,6 @@ export class LiveContextController {
 		}
 		this.status.revision = entry.revision;
 		this.status.error = undefined;
-		this.action = undefined;
 		try {
 			await this.publish(entry.snapshot, protectedIds);
 		} catch {
@@ -254,6 +375,7 @@ export class LiveContextController {
 	private assertIdle(): void {
 		this.assertHealthy();
 		if (this.action) throw new Error("CLM tool action writer has not settled");
+		LiveContextController.assertWriterSettled(this.sessionManager);
 	}
 
 	private acceptedContext(failedEntry?: ClmBlock): {

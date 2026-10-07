@@ -1,3 +1,4 @@
+import syncFileSystem, { existsSync } from "node:fs";
 import fileSystem, { mkdtemp, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
@@ -7,6 +8,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { LiveContextController } from "../../src/core/clm/live-context.js";
 import { type ClmBlock, SessionManager } from "../../src/core/session-manager.js";
 import { emptyUsage } from "../../src/core/usage.js";
+import { createDeferred } from "../suite/scheduling.js";
 
 const model: Model<Api> = {
 	id: "local",
@@ -48,6 +50,98 @@ async function fixture(messages: AuditMessage[] = [user("obsolete"), user("curre
 }
 
 describe("CLM live context", () => {
+	it.each(["marker", "directory"])("fails closed when %s fsync fails before admission", async (kind) => {
+		const f = await fixture();
+		let calls = 0;
+		const original = syncFileSystem.fsyncSync;
+		const fault = vi.spyOn(syncFileSystem, "fsyncSync").mockImplementation((fd) => {
+			if (++calls === (kind === "marker" ? 1 : 2)) throw new Error("injected sync failure");
+			original(fd);
+		});
+		syncBuiltinESMExports();
+		try {
+			await expect(f.prepare()).rejects.toThrow(/marker|fsync/);
+			await expect(f.project()).rejects.toThrow();
+			expect(existsSync(`${f.manager.getSessionFile()}.clm-writer`)).toBe(true);
+		} finally {
+			fault.mockRestore();
+			syncBuiltinESMExports();
+		}
+	});
+
+	it("repairs only after the retained physical receipt settles and fences a new epoch", async () => {
+		const f = await fixture();
+		await f.prepare();
+		const release = createDeferred();
+		const physical = release.promise.then(() => writeFile(f.path, "late bytes"));
+		f.controller.abortToolAction("tool", physical);
+		try {
+			await expect(f.controller.repairCancelledToolAction()).rejects.toThrow(/settlement/);
+			expect(() => LiveContextController.assertWriterSettled(f.manager)).toThrow(/writer/);
+		} finally {
+			release.resolve();
+			await physical;
+		}
+		await expect(f.project()).rejects.toThrow(/writer/);
+		await f.controller.repairCancelledToolAction();
+		expect(await readFile(f.path, "utf8")).not.toContain("late bytes");
+		expect(await f.project()).toEqual(f.blocks.map((block) => block.message));
+		f.manager.appendClmOffBoundary({ blocks: f.blocks }, f.blocks[1].id);
+		f.manager.appendClmOn({ blocks: f.blocks }, f.blocks[1].id);
+		const reopened = await LiveContextController.open(SessionManager.open(f.manager.getSessionFile()!), f.dir);
+		expect(JSON.stringify(await reopened.projectRequest(new Set(["request"]), f.request))).not.toContain(
+			"late bytes",
+		);
+	});
+
+	it("cancels an import paused in its mirror read without committing or repairing", async () => {
+		const f = await fixture();
+		await f.prepare();
+		await f.change((text) => text.replace("obsolete", "late bytes"));
+		const [started, release] = [createDeferred(), createDeferred()];
+		const original = fileSystem.open;
+		const fault = vi.spyOn(fileSystem, "open").mockImplementation(async (...args) => {
+			const file = await original(...args);
+			if (args[0] === f.path) {
+				started.resolve();
+				await release.promise;
+			}
+			return file;
+		});
+		syncBuiltinESMExports();
+		const settlement = expect(f.settle()).rejects.toThrow(/writer/);
+		try {
+			await started.promise;
+			f.controller.abortToolAction("tool", Promise.resolve());
+		} finally {
+			release.resolve();
+			try {
+				await settlement;
+			} finally {
+				fault.mockRestore();
+				syncBuiltinESMExports();
+			}
+		}
+		expect(f.manager.getClmBranchState().revision).toBe(0);
+		expect(await readFile(f.path, "utf8")).toContain("late bytes");
+		await expect(f.project()).rejects.toThrow(/writer/);
+	});
+
+	it("does not republish an admitted writer's mirror on a fresh reopen", async () => {
+		const f = await fixture();
+		await f.prepare();
+		await writeFile(f.path, "unsettled writer bytes");
+		const reopened = SessionManager.open(f.manager.getSessionFile()!);
+		await expect(LiveContextController.open(reopened, f.dir)).rejects.toThrow(/writer|settlement/i);
+		expect(await readFile(f.path, "utf8")).toBe("unsettled writer bytes");
+		await rm(join(f.dir, "clm"), { recursive: true });
+		reopened.appendClmOffBoundary({ blocks: f.blocks }, f.blocks[1].id);
+		reopened.appendClmOn({ blocks: f.blocks }, f.blocks[1].id);
+		await expect(LiveContextController.open(SessionManager.open(f.manager.getSessionFile()!), f.dir)).rejects.toThrow(
+			/writer/,
+		);
+	});
+
 	it.each([false, true])(
 		"reports durable acceptance after mirror publication failure (persistent=%s)",
 		async (persistent) => {
