@@ -106,6 +106,23 @@ describe("CLM context document", () => {
 		expect(base.blocks[0].message).toMatchObject({ content: expect.arrayContaining([image]) });
 	});
 
+	it.each([false, true])("rejects images owned by another block (protected=%s)", (protectedImage) => {
+		const base: ClmSnapshot = {
+			blocks: [
+				user("a", "caption"),
+				{
+					id: "b",
+					message: { role: "user", content: [image], timestamp: 2 },
+				},
+			],
+		};
+		const text = renderContextDocument(base, new Set(protectedImage ? ["b"] : []));
+		expect(parseContextDocument(text, base)).toEqual(base);
+		const edited = text.replace("caption", "[[CTX_IMAGE id=b:0]]");
+		expect(() => parseContextDocument(edited, base)).toThrow(/image/i);
+		expect(base.blocks[1].message).toMatchObject({ content: [image] });
+	});
+
 	it("renders protected references without editable request text", () => {
 		const base = { blocks: [user("current", "current request"), user("old", "settled request")] };
 		const text = renderContextDocument(base, new Set(["current"]));

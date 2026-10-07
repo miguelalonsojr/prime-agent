@@ -90,14 +90,12 @@ function readBlocks(text: string, registry: Map<string, ClmBlock>): DocumentBloc
 	return blocks;
 }
 
-function imageRegistry(base: ClmSnapshot): Map<string, ImageContent> {
+function imageRegistry(block: ClmBlock): Map<string, ImageContent> {
 	const images = new Map<string, ImageContent>();
-	for (const block of base.blocks) {
-		const message = block.message;
-		if (!("content" in message) || typeof message.content === "string") continue;
-		for (const [index, content] of message.content.entries()) {
-			if (content.type === "image") images.set(`${encodeURIComponent(block.id)}:${index}`, content);
-		}
+	const message = block.message;
+	if (!("content" in message) || typeof message.content === "string") return images;
+	for (const [index, content] of message.content.entries()) {
+		if (content.type === "image") images.set(`${encodeURIComponent(block.id)}:${index}`, content);
 	}
 	return images;
 }
@@ -176,11 +174,10 @@ function changedToolBlocks(base: ClmSnapshot, blocks: DocumentBlock[]): Set<stri
 
 export function parseContextDocument(text: string, base: ClmSnapshot): ClmSnapshot {
 	const blocks = readBlocks(text, baseRegistry(base));
-	const images = imageRegistry(base);
 	const changed = changedToolBlocks(base, blocks);
 	return {
 		blocks: blocks.map((block): ClmBlock => {
-			const content = parseBody(block.body, images);
+			const content = parseBody(block.body, imageRegistry(block.base));
 			if (unchanged(block) && !changed.has(block.base.id)) return structuredClone(block.base);
 			if (block.protected) throw new Error("Edited CLM tool group contains a protected reference");
 			if (block.role !== block.base.message.role)
