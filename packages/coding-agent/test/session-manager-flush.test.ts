@@ -3,6 +3,7 @@ import {
 	chmodSync,
 	type chownSync,
 	existsSync,
+	type fsyncSync,
 	lstatSync,
 	mkdirSync,
 	mkdtempSync,
@@ -26,6 +27,8 @@ type WriteFileSync = typeof writeFileSync;
 type WriteSync = typeof writeSyncFs;
 
 const fsMocks = vi.hoisted(() => ({
+	actualFsyncSync: undefined as typeof fsyncSync | undefined,
+	fsyncSync: vi.fn<typeof fsyncSync>(),
 	actualWriteFileSync: undefined as WriteFileSync | undefined,
 	actualWriteSync: undefined as WriteSync | undefined,
 	chmodSync: vi.fn<ChmodSync>(),
@@ -36,6 +39,8 @@ const fsMocks = vi.hoisted(() => ({
 }));
 vi.mock("node:fs", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("node:fs")>();
+	fsMocks.actualFsyncSync = actual.fsyncSync;
+	fsMocks.fsyncSync.mockImplementation(actual.fsyncSync);
 	fsMocks.actualWriteFileSync = actual.writeFileSync;
 	fsMocks.actualWriteSync = actual.writeSync;
 	fsMocks.chmodSync.mockImplementation(actual.chmodSync);
@@ -45,6 +50,7 @@ vi.mock("node:fs", async (importOriginal) => {
 	fsMocks.writeSync.mockImplementation(actual.writeSync);
 	return {
 		...actual,
+		fsyncSync: fsMocks.fsyncSync,
 		chmodSync: fsMocks.chmodSync,
 		chownSync: fsMocks.chownSync,
 		renameSync: fsMocks.renameSync,
@@ -58,6 +64,7 @@ import { SessionManager } from "../src/core/session-manager.js";
 const tempDirs: string[] = [];
 
 afterEach(() => {
+	fsMocks.fsyncSync.mockReset().mockImplementation(fsMocks.actualFsyncSync!);
 	while (tempDirs.length > 0) {
 		const dir = tempDirs.pop()!;
 		rmSync(dir, { recursive: true, force: true });
@@ -439,5 +446,74 @@ describe("SessionManager.appendCustomMessageEntryWithRollback", () => {
 
 		mgr.flushNow();
 		expect(readFileSync(file)).toEqual(before);
+	});
+});
+
+describe("SessionManager durable CLM entries", () => {
+	it("persists pre-assistant revisions and replays covered receipts once", () => {
+		const dir = createTempDir();
+		const mgr = SessionManager.create(dir, join(dir, "sessions"));
+		const watermark = mgr.appendMessage({ role: "user", content: "obsolete", timestamp: 1 });
+		const on = mgr.appendClmOn({ blocks: [] }, watermark);
+		const receipt = mgr.appendMessage({
+			role: "toolResult",
+			toolCallId: "call",
+			toolName: "edit",
+			content: [{ type: "text", text: "saved" }],
+			isError: false,
+			timestamp: 2,
+		});
+		const snapshot = { blocks: [{ id: receipt, message: mgr.buildSessionContext().messages[0] }] };
+		const revision = mgr.appendClmRevision(snapshot, receipt, "action-1");
+		const reopened = SessionManager.open(mgr.getSessionFile()!);
+		expect(reopened.getEntry(revision)).toMatchObject({
+			type: "clm_revision",
+			baseRevision: 0,
+			revision: 1,
+			observedActionId: "action-1",
+			auditWatermark: receipt,
+		});
+		expect(reopened.getClmBranchState(on)).toMatchObject({ mode: "on", revision: 0, auditWatermark: watermark });
+		expect(reopened.buildSessionContext().messages).toEqual([snapshot.blocks[0].message]);
+		expect(JSON.stringify(reopened.buildSessionContext().messages)).not.toContain("obsolete");
+		expect(reopened.getClmBranchState(null)).toEqual({ mode: "off", auditWatermark: null });
+	});
+
+	it.each(["clm_on", "clm_revision", "clm_off_boundary"] as const)("does not accept an uncertain %s write", (type) => {
+		const dir = createTempDir();
+		const mgr = SessionManager.create(dir, join(dir, "sessions"));
+		const watermark = mgr.appendMessage({ role: "user", content: "obsolete", timestamp: 1 });
+		mgr.flushNow();
+		if (type !== "clm_on") mgr.appendClmOn({ blocks: [] }, watermark);
+		const file = mgr.getSessionFile()!;
+		const before = readFileSync(file);
+		fsMocks.fsyncSync.mockImplementationOnce(() => {
+			throw new Error("sync failed");
+		});
+		const append = () =>
+			type === "clm_on"
+				? mgr.appendClmOn({ blocks: [] }, watermark)
+				: type === "clm_revision"
+					? mgr.appendClmRevision({ blocks: [] }, watermark, "a")
+					: mgr.appendClmOffBoundary({ blocks: [] }, watermark);
+		expect(append).toThrow("sync failed");
+		expect(readFileSync(file)).toEqual(before);
+		expect(() => mgr.buildSessionContext()).toThrow(/CLM/);
+		expect(SessionManager.open(file).getClmBranchState().mode).toBe(type === "clm_on" ? "off" : "on");
+	});
+
+	it("verifies committed bytes before accepting a revision", () => {
+		const dir = createTempDir();
+		const mgr = SessionManager.create(dir, join(dir, "sessions"));
+		mgr.appendClmOn({ blocks: [] }, null);
+		const file = mgr.getSessionFile()!;
+		const unsubscribe = mgr.onPersist(() => appendFileSync(file, '{"type":"clm_revision","snapshot":'));
+		try {
+			expect(() => mgr.appendClmRevision({ blocks: [] }, null, "a")).toThrow(/CLM/);
+			expect(() => mgr.buildSessionContext()).toThrow(/CLM/);
+			expect(() => SessionManager.open(file).buildSessionContext()).toThrow(/CLM/);
+		} finally {
+			unsubscribe();
+		}
 	});
 });

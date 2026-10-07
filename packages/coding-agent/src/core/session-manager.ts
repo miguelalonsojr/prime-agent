@@ -1,12 +1,13 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage, ImageContent, Message, ServiceTier, TextContent, Usage } from "@earendil-works/pi-ai";
-import { randomUUID } from "crypto";
+import { createHash, randomUUID } from "crypto";
 import {
 	appendFileSync,
 	chownSync,
 	closeSync,
 	existsSync,
 	fstatSync,
+	fsyncSync,
 	mkdirSync,
 	openSync,
 	readdirSync,
@@ -60,6 +61,9 @@ const CONTENT_ENTRY_TYPES = new Set([
 	"label",
 	"compaction",
 	"branch_summary",
+	"clm_on",
+	"clm_revision",
+	"clm_off_boundary",
 ]);
 
 function statMetadataIfPresent(path: string): { mode: number; uid: number; gid: number } | undefined {
@@ -442,19 +446,7 @@ export function migrateSessionEntries(entries: FileEntry[]): void {
 }
 
 export function parseSessionEntries(content: string): FileEntry[] {
-	const entries: FileEntry[] = [];
-	const lines = content.trim().split("\n");
-
-	for (const line of lines) {
-		if (!line.trim()) continue;
-		try {
-			const entry = JSON.parse(line) as FileEntry;
-			entries.push(entry);
-		} catch {
-			// Skip malformed lines.
-		}
-	}
-
+	const entries = parseEntriesFromBuffer(Buffer.from(content));
 	applyChildUsageAttributions(entries);
 	return entries;
 }
@@ -482,6 +474,85 @@ export function getLatestCompactionEntry(entries: SessionEntry[]): CompactionEnt
 		}
 	}
 	return null;
+}
+
+type ClmEntry = ClmOnEntry | ClmRevisionEntry | ClmOffBoundaryEntry;
+
+function isClmEntry(entry: FileEntry): entry is ClmEntry {
+	return entry.type === "clm_on" || entry.type === "clm_revision" || entry.type === "clm_off_boundary";
+}
+
+function clmChecksum(snapshot: ClmSnapshot): string {
+	return createHash("sha256").update(JSON.stringify(snapshot)).digest("hex");
+}
+
+// Keep malformed-line evidence out of the audit DTOs, but carry it through every loader.
+const sessionParseDamage = new WeakMap<FileEntry[], { malformed: boolean; clm: boolean }>();
+
+function clmParseError(entries: FileEntry[]): string | undefined {
+	const damage = sessionParseDamage.get(entries);
+	return damage?.malformed && damage.clm
+		? "CLM session log is damaged; repair it before requesting model context"
+		: undefined;
+}
+
+function validateClmBranch(path: SessionEntry[]): void {
+	if (!path.some(isClmEntry)) return;
+	let previous: ClmEntry | undefined;
+	for (const [index, entry] of path.entries()) {
+		if (entry.parentId !== (path[index - 1]?.id ?? null)) throw new Error("CLM branch ancestry is incomplete");
+		if (!isClmEntry(entry)) continue;
+		if (
+			!entry.epochId ||
+			!Number.isSafeInteger(entry.revision) ||
+			entry.revision < 0 ||
+			!Array.isArray(entry.snapshot?.blocks)
+		) {
+			throw new Error(`CLM snapshot or revision is invalid: ${entry.id}`);
+		}
+		const ids = new Set<string>();
+		for (const block of entry.snapshot.blocks) {
+			if (
+				!block ||
+				typeof block.id !== "string" ||
+				!block.id ||
+				ids.has(block.id) ||
+				!block.message ||
+				typeof block.message.role !== "string"
+			) {
+				throw new Error(`CLM snapshot block is invalid: ${entry.id}`);
+			}
+			ids.add(block.id);
+		}
+		clmWatermarkIndex(path, entry);
+		if (entry.type === "clm_on") {
+			if (
+				entry.revision !== 0 ||
+				(previous && previous.type !== "clm_off_boundary") ||
+				previous?.epochId === entry.epochId
+			) {
+				throw new Error(`CLM enable epoch is invalid: ${entry.id}`);
+			}
+		} else {
+			if (
+				!previous ||
+				previous.type === "clm_off_boundary" ||
+				entry.epochId !== previous.epochId ||
+				entry.revision !== previous.revision + 1
+			) {
+				throw new Error(`CLM revision ancestry is invalid: ${entry.id}`);
+			}
+			if (
+				entry.type === "clm_revision" &&
+				(entry.baseRevision !== previous.revision ||
+					!entry.observedActionId ||
+					entry.checksum !== clmChecksum(entry.snapshot))
+			) {
+				throw new Error(`CLM revision checksum or receipt is invalid: ${entry.id}`);
+			}
+		}
+		previous = entry;
+	}
 }
 
 function clmWatermarkIndex(
@@ -526,6 +597,8 @@ export function buildSessionContext(
 	leafId?: string | null,
 	byId?: Map<string, SessionEntry>,
 ): SessionContext {
+	const parseError = clmParseError(entries);
+	if (parseError) throw new Error(parseError);
 	if (!byId) {
 		byId = new Map<string, SessionEntry>();
 		for (const entry of entries) {
@@ -718,11 +791,18 @@ export function getDefaultSessionDir(_cwd: string, agentDir: string = getDefault
 // (one giant UTF-16 string). Splitting on 0x0a is UTF-8-safe.
 function appendEntryFromBuffer(entries: FileEntry[], buffer: Buffer, start = 0, end = buffer.length): void {
 	if (end <= start) return;
+	const line = buffer.toString("utf8", start, end);
+	if (!line.trim()) return;
+	const damage = sessionParseDamage.get(entries) ?? { malformed: false, clm: false };
 	try {
-		entries.push(JSON.parse(buffer.toString("utf8", start, end)) as FileEntry);
+		const entry = JSON.parse(line) as FileEntry;
+		entries.push(entry);
+		damage.clm ||= isClmEntry(entry);
 	} catch {
-		// Skip malformed or blank lines.
+		damage.malformed = true;
+		damage.clm ||= /"type"\s*:\s*"clm_/.test(line);
 	}
+	sessionParseDamage.set(entries, damage);
 }
 
 function parseEntriesFromBuffer(buffer: Buffer): FileEntry[] {
@@ -801,6 +881,9 @@ function repairJsonlDamage(filePath: string): void {
 		return;
 	}
 	if (buffer.length === 0 || snapshot.size !== buffer.length) return;
+	// Do not erase an uncertain CLM transition. Audit loading stays available;
+	// the model-context path reports the damage until explicit repair.
+	if (/"type"\s*:\s*"clm_/.test(buffer.toString("utf8"))) return;
 	const keptLines: Buffer[] = [];
 	let recoveredNulLines = 0;
 	let droppedLines = 0;
@@ -1861,6 +1944,7 @@ export class SessionManager {
 	// and must not hold it across an append.
 	private leafBranchCache: { leafId: string | null; entries: SessionEntry[] } | null = null;
 	private persistListeners = new Set<SessionPersistListener>();
+	private clmRecoveryError: string | undefined;
 
 	private constructor(
 		cwd: string,
@@ -1889,10 +1973,12 @@ export class SessionManager {
 	 * lets the async daemon path skip the synchronous re-read.
 	 */
 	setSessionFile(sessionFile: string, preloadedEntries?: FileEntry[]): void {
+		this.clmRecoveryError = undefined;
 		this.sessionFile = resolve(sessionFile);
 		if (existsSync(this.sessionFile)) {
 			if (this.persist && preloadedEntries === undefined) repairJsonlDamage(this.sessionFile);
 			this.fileEntries = preloadedEntries ?? loadEntriesFromFile(this.sessionFile);
+			this.clmRecoveryError = clmParseError(this.fileEntries);
 			this._refreshHasAssistantEntry();
 
 			// If file was empty or corrupted (no valid header), truncate and start fresh
@@ -1914,7 +2000,7 @@ export class SessionManager {
 				header.rlmDepth = resolveSessionRlmDepth(header, this.sessionFile);
 				shouldRewrite = true;
 			}
-			if (shouldRewrite) {
+			if (shouldRewrite && !this.clmRecoveryError) {
 				this._rewriteFile();
 			}
 
@@ -1952,6 +2038,7 @@ export class SessionManager {
 			}
 		}
 
+		this.clmRecoveryError = undefined;
 		this.sessionId = sessionId;
 		const timestamp = new Date().toISOString();
 		const git = this.persist ? (captureGitContext(this.cwd) ?? undefined) : undefined;
@@ -2015,19 +2102,36 @@ export class SessionManager {
 	}
 
 	private _rewriteFile(): void {
+		this._writeFileEntries(this.fileEntries);
+	}
+
+	private _writeFileEntries(entries: FileEntry[], durable = false): void {
+		if (this.clmRecoveryError) throw new Error(this.clmRecoveryError);
 		if (!this.persist || !this.sessionFile) return;
-		const content = `${this.fileEntries.map((e) => JSON.stringify(e)).join("\n")}\n`;
+		const content = `${entries.map((e) => JSON.stringify(e)).join("\n")}\n`;
 		const targetPath = realpathIfPresentSync(this.sessionFile);
 		const directory = dirname(targetPath);
 		mkdirSync(directory, { recursive: true });
 		const metadata = statMetadataIfPresent(targetPath);
 		writeFileAtomicSync(targetPath, content, {
+			fsync: durable,
 			...(metadata === undefined ? {} : { mode: metadata.mode }),
 			beforeRename: (tempPath) => {
 				if (metadata !== undefined) chownSync(tempPath, metadata.uid, metadata.gid);
 			},
 		});
+		if (durable) {
+			const descriptor = openSync(directory, "r");
+			try {
+				fsyncSync(descriptor);
+			} finally {
+				closeSync(descriptor);
+			}
+		}
 		this._notifyPersistListeners();
+		if (durable && readFileSync(targetPath, "utf8") !== content) {
+			throw new Error("CLM committed bytes could not be verified");
+		}
 	}
 
 	private _notifyPersistListeners(): void {
@@ -2175,6 +2279,97 @@ export class SessionManager {
 		} else {
 			this.leafBranchCache = null;
 		}
+	}
+
+	getClmBranchState(leafId: string | null = this.leafId): ClmBranchState {
+		if (this.clmRecoveryError) throw new Error(this.clmRecoveryError);
+		if (leafId === null) return { mode: "off", auditWatermark: null };
+		if (!this.byId.has(leafId)) throw new Error(`CLM branch leaf not found: ${leafId}`);
+		const path = this.getBranch(leafId);
+		validateClmBranch(path);
+		let entry: ClmEntry | undefined;
+		for (let index = path.length - 1; index >= 0; index--) {
+			const candidate = path[index];
+			if (isClmEntry(candidate)) {
+				entry = candidate;
+				break;
+			}
+		}
+		return entry
+			? {
+					mode: entry.type === "clm_off_boundary" ? "off" : "on",
+					epochId: entry.epochId,
+					revision: entry.revision,
+					snapshot: structuredClone(entry.snapshot),
+					auditWatermark: entry.auditWatermark,
+				}
+			: { mode: "off", auditWatermark: null };
+	}
+
+	appendClmOn(snapshot: ClmSnapshot, watermark: string | null): string {
+		if (this.getClmBranchState().mode === "on") throw new Error("CLM is already on");
+		return this._commitClmEntry({
+			type: "clm_on",
+			id: generateId(this.byId),
+			parentId: this.leafId,
+			timestamp: new Date().toISOString(),
+			epochId: randomUUID(),
+			revision: 0,
+			snapshot: structuredClone(snapshot),
+			auditWatermark: watermark,
+		});
+	}
+
+	appendClmRevision(snapshot: ClmSnapshot, watermark: string | null, actionId: string): string {
+		const state = this.getClmBranchState();
+		if (state.mode !== "on" || state.epochId === undefined || state.revision === undefined)
+			throw new Error("CLM is not on");
+		return this._commitClmEntry({
+			type: "clm_revision",
+			id: generateId(this.byId),
+			parentId: this.leafId,
+			timestamp: new Date().toISOString(),
+			epochId: state.epochId,
+			revision: state.revision + 1,
+			baseRevision: state.revision,
+			checksum: clmChecksum(snapshot),
+			observedActionId: actionId,
+			snapshot: structuredClone(snapshot),
+			auditWatermark: watermark,
+		});
+	}
+
+	appendClmOffBoundary(snapshot: ClmSnapshot, watermark: string | null): string {
+		const state = this.getClmBranchState();
+		if (state.mode !== "on" || state.epochId === undefined || state.revision === undefined)
+			throw new Error("CLM is not on");
+		return this._commitClmEntry({
+			type: "clm_off_boundary",
+			id: generateId(this.byId),
+			parentId: this.leafId,
+			timestamp: new Date().toISOString(),
+			epochId: state.epochId,
+			revision: state.revision + 1,
+			snapshot: structuredClone(snapshot),
+			auditWatermark: watermark,
+		});
+	}
+
+	private _commitClmEntry(entry: ClmEntry): string {
+		validateClmBranch([...this.getBranch(), entry]);
+		try {
+			this._writeFileEntries([...this.fileEntries, entry], true);
+		} catch (error) {
+			// An I/O error may occur after rename. Do not guess which revision won.
+			this.clmRecoveryError = "CLM commit is uncertain; reopen and verify the session log";
+			throw error;
+		}
+		this.fileEntries.push(entry);
+		this.byId.set(entry.id, entry);
+		this.leafId = entry.id;
+		this._extendLeafBranchCache(entry);
+		this.flushed = this.persist;
+		return entry.id;
 	}
 
 	appendMessage(message: Message | CustomMessage | BashExecutionMessage): string {
@@ -2564,6 +2759,8 @@ export class SessionManager {
 	}
 
 	buildSessionContext(): SessionContext {
+		if (this.clmRecoveryError) throw new Error(this.clmRecoveryError);
+		validateClmBranch(this.getBranch());
 		// Pass fileEntries directly rather than getEntries(): the resolved context
 		// is computed from the leaf-to-root walk over byId (which already excludes
 		// the header), so the entries argument is only a fallback for an undefined
@@ -2578,7 +2775,10 @@ export class SessionManager {
 	}
 
 	getEntries(): SessionEntry[] {
-		return this.fileEntries.filter((e): e is SessionEntry => e.type !== "session");
+		const entries = this.fileEntries.filter((e): e is SessionEntry => e.type !== "session");
+		const damage = sessionParseDamage.get(this.fileEntries);
+		if (damage) sessionParseDamage.set(entries, damage);
+		return entries;
 	}
 
 	getFlatTree(): SessionTreeFlatNode[] {
@@ -2672,7 +2872,13 @@ export class SessionManager {
 			throw new Error(`Entry ${leafId} not found`);
 		}
 
-		const pathWithoutLabels = path.filter((e) => e.type !== "label");
+		this.getClmBranchState(leafId);
+		const pathWithoutLabels = path
+			.filter((e) => e.type !== "label")
+			.map((entry, index, entries) => {
+				const parentId = entries[index - 1]?.id ?? null;
+				return entry.parentId === parentId ? entry : { ...entry, parentId };
+			});
 
 		const target = this.persist
 			? createUniqueSessionFileTarget(this.getSessionDir())
@@ -2724,13 +2930,10 @@ export class SessionManager {
 			this.sessionFile = newSessionFile;
 			this._buildIndex();
 
-			// Only write the file now if it contains an assistant message.
-			// Otherwise defer to _persist(), which creates the file on the
-			// first assistant response, matching the newSession() contract
-			// and avoiding the duplicate-header bug when _persist()'s
-			// no-assistant guard later resets flushed to false.
-			if (this.hasAssistantEntry) {
-				this._rewriteFile();
+			// CLM boundaries must survive reopen even before an assistant response.
+			// Ordinary pre-assistant branches still defer their first write.
+			if (this.hasAssistantEntry || path.some(isClmEntry)) {
+				this._writeFileEntries(this.fileEntries, path.some(isClmEntry));
 				this.flushed = true;
 			} else {
 				this.flushed = false;
@@ -2830,6 +3033,10 @@ export class SessionManager {
 			throw new Error(`Cannot fork: source session has no header: ${sourcePath}`);
 		}
 		migrateToCurrentVersion(sourceEntries);
+		const parseError = clmParseError(sourceEntries);
+		if (parseError) throw new Error(parseError);
+		const source = new SessionManager(targetCwd, dirname(sourcePath), sourcePath, false, sourceEntries);
+		source.getClmBranchState();
 
 		const dir = sessionDir ?? getDefaultSessionDir(targetCwd);
 		if (!existsSync(dir)) {
@@ -2877,6 +3084,7 @@ export class SessionManager {
 				const out = parentId === entry.parentId ? entry : { ...entry, parentId };
 				writeAllSync(descriptor, `${JSON.stringify(out)}\n`, newSessionFile);
 			}
+			if (sourceEntries.some(isClmEntry)) fsyncSync(descriptor);
 		} finally {
 			closeSync(descriptor);
 		}

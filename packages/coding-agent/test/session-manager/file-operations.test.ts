@@ -35,6 +35,7 @@ vi.mock("node:fs", async (importOriginal) => {
 
 import { computeOwnAndTotalUsage } from "../../src/core/context-tree.js";
 import {
+	buildSessionContext,
 	type FileEntry,
 	loadEntriesFromFile,
 	loadEntriesFromFileAsync,
@@ -190,6 +191,70 @@ describe("session tree metadata", () => {
 	function headerOf(file: string): Record<string, unknown> {
 		return JSON.parse(readFileSync(file, "utf8").split("\n")[0] ?? "{}");
 	}
+
+	describe("CLM recovery", () => {
+		it.each(["branch", "fork"])("forks a frozen CLM boundary without source artifacts (%s)", (method) => {
+			const source = SessionManager.create(tempDir, join(tempDir, "sessions"));
+			const watermark = source.appendMessage({ role: "user", content: "obsolete", timestamp: 1 });
+			const snapshot = {
+				blocks: [
+					{
+						id: "accepted",
+						message: {
+							role: "user" as const,
+							content: [
+								{ type: "text" as const, text: "retained" },
+								{ type: "image" as const, data: "YWJj", mimeType: "image/png" },
+							],
+							timestamp: 1,
+						},
+					},
+				],
+			};
+			source.appendClmOn(snapshot, watermark);
+			source.appendLabelChange(watermark, "audit");
+			const off = source.appendClmOffBoundary(snapshot, watermark);
+			const sourceFile = source.getSessionFile()!;
+			const artifacts = source.getSessionArtifactDir()!;
+			mkdirSync(artifacts, { recursive: true });
+			writeFileSync(join(artifacts, "context.txt"), "obsolete pending bytes");
+			const fork = method === "fork" ? SessionManager.forkFrom(sourceFile, tempDir, join(tempDir, "forks")) : source;
+			if (method === "branch") fork.createBranchedSession(off);
+			rmSync(artifacts, { recursive: true });
+			rmSync(sourceFile);
+			const reopened = SessionManager.open(fork.getSessionFile()!);
+			expect(reopened.buildSessionContext().messages).toEqual([snapshot.blocks[0].message]);
+			expect(JSON.stringify(reopened.buildSessionContext().messages)).not.toContain("obsolete");
+			expect(reopened.getClmBranchState()).toMatchObject({ mode: "off", revision: 1, auditWatermark: watermark });
+		});
+
+		it.each(["missing snapshot", "checksum", "torn enable", "torn revision"])(
+			"fails closed on %s while retaining audit access",
+			async (damage) => {
+				const source = SessionManager.create(tempDir, tempDir);
+				const watermark = source.appendMessage({ role: "user", content: "obsolete", timestamp: 1 });
+				source.appendClmOn({ blocks: [] }, watermark);
+				source.appendClmRevision({ blocks: [] }, watermark, "a");
+				const file = source.getSessionFile()!;
+				const lines = readFileSync(file, "utf8").trim().split("\n");
+				if (damage === "torn enable") lines.splice(2, 2, '{"type":"clm_on","snapshot":');
+				else if (damage === "torn revision") lines[3] = '{"type":"clm_revision","snapshot":';
+				else {
+					const entry = JSON.parse(lines[3]);
+					if (damage === "missing snapshot") delete entry.snapshot;
+					else entry.checksum = "corrupt";
+					lines[3] = JSON.stringify(entry);
+				}
+				writeFileSync(file, `${lines.join("\n")}\n`);
+				for (const reopened of [SessionManager.open(file), await SessionManager.openAsync(file)]) {
+					expect(JSON.stringify(reopened.getEntries())).toContain("obsolete");
+					expect(() => reopened.buildSessionContext()).toThrow(/CLM/);
+					if (damage.startsWith("torn")) expect(() => buildSessionContext(reopened.getEntries())).toThrow(/CLM/);
+				}
+				expect(() => SessionManager.forkFrom(file, tempDir, tempDir)).toThrow(/CLM/);
+			},
+		);
+	});
 
 	it.each(["2.5", "2oops", "9007199254740993"])("rejects invalid RLM_DEPTH value %s", (value) => {
 		vi.stubEnv("RLM_DEPTH", value);
