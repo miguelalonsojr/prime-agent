@@ -1124,7 +1124,7 @@ export class SettingsManager {
 	}
 
 	getClmEnabled(): boolean {
-		return this.settings.clm?.enabled ?? false;
+		return this.settings.clm?.enabled === true;
 	}
 
 	getProviderBackupModel(): string | undefined {

@@ -163,6 +163,7 @@ describe("SettingsManager", () => {
 			["global CLM on", clmOn, {}, (m) => m.getClmEnabled(), true],
 			["project false wins", clmOn, clmOff, (m) => m.getClmEnabled(), false],
 			["empty project keeps true", clmOn, { clm: {} }, (m) => m.getClmEnabled(), true],
+			["malformed CLM is off", { clm: { enabled: "false" } }, {}, (m) => m.getClmEnabled(), false],
 			[
 				"autonomous limits merge project over global, dropping invalid entries",
 				{ autonomous: { maxContinuations: 10, maxTurns: 40 } },
