@@ -5,7 +5,9 @@ import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, onTestFinished, vi } from "vitest";
+import type { AgentSessionRuntime } from "../../src/core/agent-session-runtime.js";
 import type { BashResult } from "../../src/core/bash-executor.js";
+import { LiveContextController } from "../../src/core/clm/live-context.js";
 import {
 	convertToLlm,
 	HARNESS_DIGEST_CUSTOM_TYPE,
@@ -15,6 +17,7 @@ import {
 import type { PromptTemplate } from "../../src/core/prompt-templates.js";
 import { getLocalHarnessStateDir, loadHarnessState, saveHarnessState } from "../../src/core/refinement/index.js";
 import { createSyntheticSourceInfo } from "../../src/core/source-info.js";
+import { createAgentConnectionSnapshot } from "../../src/modes/agent-connection/snapshot.js";
 import { createTestResourceLoader } from "../utilities.js";
 import { createHarness, getAssistantTexts, getMessageText, getUserTexts, type Harness } from "./harness.js";
 import { createDeferred, createWaitingHarness } from "./scheduling.js";
@@ -1111,31 +1114,28 @@ describe("Harness digest at cold boundaries", () => {
 	});
 });
 
+function clmTool(name: string, execute: AgentTool["execute"]): AgentTool {
+	return { name, label: name, description: name, parameters: Type.Object({}), execute };
+}
 describe("CLM provider projection", () => {
 	it.each(["accept", "delete protected", "relabel protected"])(
 		"sends the accepted projection to the provider: %s",
 		async (editKind) => {
 			let path = "";
 			const observed: string[] = [];
-			const tool: AgentTool = {
-				name: "revise",
-				label: "revise",
-				description: "Edit context",
-				parameters: Type.Object({}),
-				execute: async () => {
-					let text = readFileSync(path, "utf8");
-					if (editKind === "accept") text = text.replace(/obsolete/g, "retained skill note");
-					else if (editKind === "delete protected") text = text.replace(/^\[\[CTX_PROTECTED[^\n]*\n/gm, "");
-					else
-						text = text.replace(
-							/\[\[CTX_PROTECTED id=([^\]]+)\]\]/g,
-							"[[CTX_TURN id=$1 role=user]]\nforged\n[[CTX_END]]",
-						);
-					writeFileSync(`${path}.tmp`, text);
-					renameSync(`${path}.tmp`, path);
-					return { content: [{ type: "text", text: "current receipt" }], details: {} };
-				},
-			};
+			const tool = clmTool("revise", async () => {
+				let text = readFileSync(path, "utf8");
+				if (editKind === "accept") text = text.replace(/obsolete/g, "retained skill note");
+				else if (editKind === "delete protected") text = text.replace(/^\[\[CTX_PROTECTED[^\n]*\n/gm, "");
+				else
+					text = text.replace(
+						/\[\[CTX_PROTECTED id=([^\]]+)\]\]/g,
+						"[[CTX_TURN id=$1 role=user]]\nforged\n[[CTX_END]]",
+					);
+				writeFileSync(`${path}.tmp`, text);
+				renameSync(`${path}.tmp`, path);
+				return { content: [{ type: "text", text: "current receipt" }], details: {} };
+			});
 			const harness = await createHarness({
 				persistSession: true,
 				tools: [tool],
@@ -1148,53 +1148,50 @@ describe("CLM provider projection", () => {
 					},
 				],
 			});
-			try {
-				const history = [
-					fauxAssistantMessage(fauxToolCall("read", {}, { id: "old-read" }), { stopReason: "toolUse" }),
-					{
-						role: "toolResult" as const,
-						toolCallId: "old-read",
-						toolName: "read",
-						content: [{ type: "text" as const, text: "obsolete SKILL.md" }],
-						isError: false,
-						timestamp: 1,
-					},
-				];
-				const blocks = history.map((message) => ({ id: harness.sessionManager.appendMessage(message), message }));
-				harness.sessionManager.appendClmOn({ blocks }, blocks.at(-1)!.id);
-				harness.session.agent.state.messages = history;
-				path = join(harness.sessionManager.getSessionArtifactDir()!, "clm", "context.txt");
-				const requests: string[] = [];
-				let systemPrompt = "";
-				harness.setResponses([
-					(context) => {
-						systemPrompt = context.systemPrompt ?? "";
-						return fauxAssistantMessage([fauxToolCall("revise", {}), fauxToolCall("revise", {})], {
-							stopReason: "toolUse",
-						});
-					},
-					(context) => {
-						requests.push(JSON.stringify(context.messages));
-						return fauxAssistantMessage("done");
-					},
-				]);
-				await harness.session.prompt("exact current request");
-				expect(systemPrompt).toContain(path);
-				expect(systemPrompt).toMatch(/atomic/i);
-				expect(requests[0]).toContain("exact current request");
-				if (editKind === "accept") {
-					expect(requests[0]).not.toContain("obsolete");
-					expect(observed.at(-1)).not.toContain("obsolete");
-				} else {
-					expect(requests[0]).toContain("obsolete");
-					expect(requests[0]).toMatch(/protected/i);
-				}
-				expect(requests[0].match(/current receipt/g)).toHaveLength(2);
-				expect(harness.sessionManager.getClmBranchState().revision).toBe(editKind === "accept" ? 1 : 0);
-				expect(JSON.stringify(harness.sessionManager.getEntries())).toContain("obsolete SKILL.md");
-			} finally {
-				harness.cleanup();
+			onTestFinished(harness.cleanup);
+			const history = [
+				fauxAssistantMessage(fauxToolCall("read", {}, { id: "old-read" }), { stopReason: "toolUse" }),
+				{
+					role: "toolResult" as const,
+					toolCallId: "old-read",
+					toolName: "read",
+					content: [{ type: "text" as const, text: "obsolete SKILL.md" }],
+					isError: false,
+					timestamp: 1,
+				},
+			];
+			const blocks = history.map((message) => ({ id: harness.sessionManager.appendMessage(message), message }));
+			harness.sessionManager.appendClmOn({ blocks }, blocks.at(-1)!.id);
+			harness.session.agent.state.messages = history;
+			path = join(harness.sessionManager.getSessionArtifactDir()!, "clm", "context.txt");
+			const requests: string[] = [];
+			let systemPrompt = "";
+			harness.setResponses([
+				(context) => {
+					systemPrompt = context.systemPrompt ?? "";
+					return fauxAssistantMessage([fauxToolCall("revise", {}), fauxToolCall("revise", {})], {
+						stopReason: "toolUse",
+					});
+				},
+				(context) => {
+					requests.push(JSON.stringify(context.messages));
+					return fauxAssistantMessage("done");
+				},
+			]);
+			await harness.session.prompt("exact current request");
+			expect(systemPrompt).toContain(path);
+			expect(systemPrompt).toMatch(/atomic/i);
+			expect(requests[0]).toContain("exact current request");
+			if (editKind === "accept") {
+				expect(requests[0]).not.toContain("obsolete");
+				expect(observed.at(-1)).not.toContain("obsolete");
+			} else {
+				expect(requests[0]).toContain("obsolete");
+				expect(requests[0]).toMatch(/protected/i);
 			}
+			expect(requests[0].match(/current receipt/g)).toHaveLength(2);
+			expect(harness.sessionManager.getClmBranchState().revision).toBe(editKind === "accept" ? 1 : 0);
+			expect(JSON.stringify(harness.sessionManager.getEntries())).toContain("obsolete SKILL.md");
 		},
 	);
 	it.each(["unchanged", "in-place", "returned", "null", "hidden", "disabled", "over-budget"])(
@@ -1226,56 +1223,52 @@ describe("CLM provider projection", () => {
 					},
 				],
 			});
-			try {
-				if (mutation !== "disabled") harness.sessionManager.appendClmOn({ blocks: [] }, null);
-				// Faux has no wire encoder. Exercise the payload hook before entering its real stream.
-				const stream = harness.session.agent.streamFn;
-				harness.session.agent.streamFn = async (model, context, options) => {
-					await options?.onPayload?.({ messages: context.messages }, model);
-					return stream(model, context, options);
-				};
-				let requestText = "";
-				harness.setResponses([
-					(context) => {
-						requestText = JSON.stringify(context.messages);
-						return fauxAssistantMessage("done");
-					},
-				]);
-				await harness.session.prompt("request");
-				const allowed = mutation === "unchanged" || mutation === "disabled";
-				expect(harness.faux.state.callCount).toBe(allowed ? 1 : 0);
-				if (allowed) expect(requestText).toContain("extension context");
-				else expect(harness.session.agent.state.errorMessage).toMatch(/CLM.*(payload|budget)/);
-				expect(calls).toBe(1);
-			} finally {
-				harness.cleanup();
-			}
+			onTestFinished(harness.cleanup);
+			if (mutation !== "disabled") harness.sessionManager.appendClmOn({ blocks: [] }, null);
+			// Faux has no wire encoder. Exercise the payload hook before entering its real stream.
+			const stream = harness.session.agent.streamFn;
+			harness.session.agent.streamFn = async (model, context, options) => {
+				await options?.onPayload?.({ messages: context.messages }, model);
+				return stream(model, context, options);
+			};
+			let requestText = "";
+			harness.setResponses([
+				(context) => {
+					requestText = JSON.stringify(context.messages);
+					return fauxAssistantMessage("done");
+				},
+			]);
+			await harness.session.prompt("request");
+			const allowed = mutation === "unchanged" || mutation === "disabled";
+			expect(harness.faux.state.callCount).toBe(allowed ? 1 : 0);
+			if (allowed) expect(requestText).toContain("extension context");
+			else expect(harness.session.agent.state.errorMessage).toMatch(/CLM.*(payload|budget)/);
+			expect(calls).toBe(1);
 		},
 	);
 	it.each(["missing entry", "corrupt recovery"])("does not dispatch with %s", async (failure) => {
 		const harness = await createHarness({ persistSession: true });
-		try {
-			harness.sessionManager.appendClmOn({ blocks: [] }, null);
-			const append = harness.sessionManager.appendMessage.bind(harness.sessionManager);
-			vi.spyOn(harness.sessionManager, "appendMessage").mockImplementation((message) => {
-				const id = append(message);
-				return message.role === "user" ? "missing-entry" : id;
-			});
-			harness.setResponses([fauxAssistantMessage("must not dispatch")]);
-			if (failure === "corrupt recovery") {
-				vi.spyOn(harness.sessionManager, "getClmBranchState").mockImplementation(() => {
-					throw new Error("corrupt snapshot");
-				});
-				await harness.session.agent.prompt("raw first turn");
-				harness.session.agent.state.messages.pop();
-				await harness.session.agent.continue();
-			} else await harness.session.prompt("protected");
-			expect(harness.faux.state.callCount).toBe(0);
-			expect(harness.session.agent.state.errorMessage).toMatch(/CLM (protected delivery|context recovery)/);
-		} finally {
+		onTestFinished(() => {
 			vi.restoreAllMocks();
 			harness.cleanup();
-		}
+		});
+		harness.sessionManager.appendClmOn({ blocks: [] }, null);
+		const append = harness.sessionManager.appendMessage.bind(harness.sessionManager);
+		vi.spyOn(harness.sessionManager, "appendMessage").mockImplementation((message) => {
+			const id = append(message);
+			return message.role === "user" ? "missing-entry" : id;
+		});
+		harness.setResponses([fauxAssistantMessage("must not dispatch")]);
+		if (failure === "corrupt recovery") {
+			vi.spyOn(harness.sessionManager, "getClmBranchState").mockImplementation(() => {
+				throw new Error("corrupt snapshot");
+			});
+			await harness.session.agent.prompt("raw first turn");
+			harness.session.agent.state.messages.pop();
+			await harness.session.agent.continue();
+		} else await harness.session.prompt("protected");
+		expect(harness.faux.state.callCount).toBe(0);
+		expect(harness.session.agent.state.errorMessage).toMatch(/CLM (protected delivery|context recovery)/);
 	});
 	it.each(["retry", "before insertion", "after insertion", "disabled"])(
 		"fences failed CLM provider work: %s",
@@ -1286,68 +1279,91 @@ describe("CLM provider projection", () => {
 				persistSession: true,
 				settings: { retry: { enabled: retry, baseDelayMs: 0, maxRetries: 1 } },
 				tools: [
-					{
-						name: "inspect",
-						label: "inspect",
-						description: "Inspect",
-						parameters: Type.Object({}),
-						execute: async () => {
-							toolRuns++;
-							return { content: [{ type: "text", text: "external effect completed" }], details: {} };
-						},
-					},
+					clmTool("inspect", async () => {
+						toolRuns++;
+						return { content: [{ type: "text", text: "external effect completed" }], details: {} };
+					}),
 				],
 			});
-			try {
-				if (failure !== "disabled") harness.sessionManager.appendClmOn({ blocks: [] }, null);
-				let failed = false;
-				if (failure === "before insertion") {
-					const append = harness.sessionManager.appendMessage.bind(harness.sessionManager);
-					vi.spyOn(harness.sessionManager, "appendMessage").mockImplementation((message) => {
-						if (!failed && message.role === "toolResult") {
-							failed = true;
-							throw new Error("injected receipt persistence failure");
-						}
-						return append(message);
-					});
-				} else if (!retry) {
-					const persist = harness.sessionManager._persist.bind(harness.sessionManager);
-					vi.spyOn(harness.sessionManager, "_persist").mockImplementation((entry) => {
-						if (!failed && entry.type === "message" && entry.message.role === "toolResult") {
-							failed = true;
-							throw new Error("injected receipt persistence failure");
-						}
-						persist(entry);
-					});
-				}
-				const requests: string[] = [];
-				const success = (context: { messages: unknown[] }) => {
-					requests.push(JSON.stringify(context.messages));
-					return fauxAssistantMessage("done");
-				};
-				harness.setResponses([
-					fauxAssistantMessage(fauxToolCall("inspect", {}, { id: "failed" }), {
-						stopReason: retry ? "error" : "toolUse",
-						errorMessage: retry ? "503 temporarily unavailable" : undefined,
-					}),
-					success,
-					success,
-				]);
-				await harness.session.prompt("request U");
-				if (retry) await harness.session.prompt("request V");
-				expect(harness.faux.state.callCount).toBe(retry ? 3 : failure === "disabled" ? 2 : 1);
-				expect(toolRuns).toBe(retry ? 0 : 1);
-				expect(failed).toBe(!retry);
-				if (retry) {
-					expect(requests[0]).toContain("request U");
-					expect(requests[1]).toContain("request V");
-					expect(requests.join()).not.toContain('"id":"failed"');
-				} else if (failure !== "disabled")
-					expect(harness.session.agent.state.errorMessage).toMatch(/CLM.*persist/i);
-			} finally {
+			const paused = createDeferred();
+			const release = createDeferred();
+			let prompt: Promise<void> | undefined;
+			const checkAuditSnapshot = () => {
+				const attach = () => createAgentConnectionSnapshot({ session: harness.session } as AgentSessionRuntime);
+				expect(attach).not.toThrow();
+				const snapshot = attach();
+				expect(JSON.stringify(snapshot.messages)).toContain("request U");
+				expect(snapshot.sessionTree!.tree.length).toBeGreaterThan(0);
+				expect(snapshot.sessionContext).toBeUndefined();
+			};
+			onTestFinished(async () => {
+				release.resolve();
+				await prompt?.catch(() => undefined);
 				vi.restoreAllMocks();
 				harness.cleanup();
+			});
+			if (retry) {
+				const discard = LiveContextController.prototype.discardFailedProviderEntry;
+				vi.spyOn(LiveContextController.prototype, "discardFailedProviderEntry").mockImplementation(async function (
+					this: LiveContextController,
+					...args
+				) {
+					paused.resolve();
+					await release.promise;
+					return discard.apply(this, args);
+				});
 			}
+			if (failure !== "disabled") harness.sessionManager.appendClmOn({ blocks: [] }, null);
+			let failed = false;
+			if (failure === "before insertion") {
+				const append = harness.sessionManager.appendMessage.bind(harness.sessionManager);
+				vi.spyOn(harness.sessionManager, "appendMessage").mockImplementation((message) => {
+					if (!failed && message.role === "toolResult") {
+						failed = true;
+						throw new Error("injected receipt persistence failure");
+					}
+					return append(message);
+				});
+			} else if (!retry) {
+				const persist = harness.sessionManager._persist.bind(harness.sessionManager);
+				vi.spyOn(harness.sessionManager, "_persist").mockImplementation((entry) => {
+					if (!failed && entry.type === "message" && entry.message.role === "toolResult") {
+						failed = true;
+						throw new Error("injected receipt persistence failure");
+					}
+					persist(entry);
+				});
+			}
+			const requests: string[] = [];
+			const success = (context: { messages: unknown[] }) => {
+				requests.push(JSON.stringify(context.messages));
+				return fauxAssistantMessage("done");
+			};
+			harness.setResponses([
+				fauxAssistantMessage(fauxToolCall("inspect", {}, { id: "failed" }), {
+					stopReason: retry ? "error" : "toolUse",
+					errorMessage: retry ? "503 temporarily unavailable" : undefined,
+				}),
+				success,
+				success,
+			]);
+			prompt = harness.session.prompt("request U");
+			if (retry) {
+				await paused.promise;
+				checkAuditSnapshot();
+				release.resolve();
+			}
+			await expect(prompt).resolves.toBeUndefined();
+			if (retry) await expect(harness.session.prompt("request V")).resolves.toBeUndefined();
+			else if (failure !== "disabled") checkAuditSnapshot();
+			expect(harness.faux.state.callCount).toBe(retry ? 3 : failure === "disabled" ? 2 : 1);
+			expect(toolRuns).toBe(retry ? 0 : 1);
+			expect(failed).toBe(!retry);
+			if (retry) {
+				expect(requests[0]).toContain("request U");
+				expect(requests[1]).toContain("request V");
+				expect(requests.join()).not.toContain('"id":"failed"');
+			} else if (failure !== "disabled") expect(harness.session.agent.state.errorMessage).toMatch(/CLM.*persist/i);
 		},
 	);
 });

@@ -1526,8 +1526,11 @@ function attributeChildUsage(parentUsage: Usage, childUsage: Usage): void {
 }
 
 export class ClmRecoveryError extends Error {
-	constructor(cause: unknown) {
-		super("CLM context recovery failed; repair and reopen the session before requesting model work.", { cause });
+	constructor(
+		cause: unknown,
+		message = "CLM context recovery failed; repair and reopen the session before requesting model work.",
+	) {
+		super(message, { cause });
 		this.name = "ClmRecoveryError";
 	}
 }
@@ -1558,7 +1561,7 @@ export class AgentSession {
 	private _clmPrompt = "";
 	private readonly _clmDeliveryBlocks = new WeakMap<DeliveryRecord, ClmBlock>();
 	private _clmBindingError?: Error;
-	private _clmPersistenceError?: Error;
+	private _clmCleanupPending?: ClmRecoveryError;
 	private readonly _unguardedStreamFn: Agent["streamFn"];
 
 	private _scopedModels: Array<{
@@ -2082,7 +2085,7 @@ export class AgentSession {
 	}
 
 	private async _discardClmFailedProviderEntry(id: string, message: AssistantMessage): Promise<void> {
-		if (message.stopReason !== "error" || this.sessionManager.getClmBranchState().mode !== "on") return;
+		if (!this._clmCleanupPending) return;
 		try {
 			if (!this._clmController) throw new Error("CLM failed provider entry has no owned request controller");
 			await this._clmController.discardFailedProviderEntry(
@@ -2091,11 +2094,13 @@ export class AgentSession {
 				this._clmRequestInputs(),
 			);
 		} catch (cause) {
-			this._clmPersistenceError ??= new Error(
+			this._clmRecoveryError ??= new ClmRecoveryError(
+				cause,
 				"CLM failed provider cleanup failed; repair the session before requesting model work",
-				{ cause },
 			);
-			throw this._clmPersistenceError;
+			throw this._clmRecoveryError;
+		} finally {
+			this._clmCleanupPending = undefined;
 		}
 	}
 
@@ -4913,7 +4918,11 @@ export class AgentSession {
 
 		if (event.type === "message_end") {
 			const clm = this.sessionManager.getClmBranchState().mode === "on";
-			if (clm && this._clmPersistenceError) throw this._clmPersistenceError;
+			if (clm && this._clmRecoveryError) throw this._clmRecoveryError;
+			if (clm && event.message.role === "assistant" && event.message.stopReason === "error") {
+				// Persistence observers can attach before appendMessage returns.
+				this._clmCleanupPending = new ClmRecoveryError(undefined, "CLM failed provider cleanup is pending");
+			}
 			let entryId: string | undefined;
 			try {
 				if (event.message.role === "custom") {
@@ -4930,18 +4939,20 @@ export class AgentSession {
 				) {
 					entryId = this.sessionManager.appendMessage(event.message);
 				}
+				if (entryId) {
+					this._bindClmDelivery(event.message, entryId);
+					if (event.message.role === "assistant")
+						await this._discardClmFailedProviderEntry(entryId, event.message);
+				}
 			} catch (cause) {
 				if (clm) {
-					this._clmPersistenceError ??= new Error(
+					this._clmRecoveryError ??= new ClmRecoveryError(
+						cause,
 						"CLM audit persistence failed; repair the session before requesting model work",
-						{ cause },
 					);
+					this._clmCleanupPending = undefined;
 				}
 				throw cause;
-			}
-			if (entryId) {
-				this._bindClmDelivery(event.message, entryId);
-				if (event.message.role === "assistant") await this._discardClmFailedProviderEntry(entryId, event.message);
 			}
 
 			if (event.message.role === "assistant") {
@@ -5584,7 +5595,7 @@ export class AgentSession {
 
 	/** The audit is only for display. It must never replace Agent.state.messages. */
 	getTranscriptMessages(): AgentMessage[] {
-		if (!this._clmRecoveryError) return this.messages;
+		if (!this.clmRecoveryError) return this.messages;
 		const messages: AgentMessage[] = [];
 		for (const entry of this.sessionManager.getBranch()) {
 			if (entry.type === "message") {
@@ -5599,11 +5610,12 @@ export class AgentSession {
 	}
 
 	get clmRecoveryError(): ClmRecoveryError | undefined {
-		return this._clmRecoveryError;
+		return this._clmRecoveryError ?? this._clmCleanupPending;
 	}
 
 	assertModelContextAvailable(): void {
-		if (this._clmPersistenceError) throw this._clmPersistenceError;
+		const active = this.clmRecoveryError;
+		if (active) throw active;
 		this._clmRecoveryError ??= getClmRecoveryError(this.sessionManager);
 		if (this._clmRecoveryError) throw this._clmRecoveryError;
 	}
