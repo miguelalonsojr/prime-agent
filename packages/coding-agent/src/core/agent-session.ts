@@ -1885,8 +1885,7 @@ export class AgentSession {
 		this._unguardedStreamFn = this.agent.streamFn;
 		const streamFn = wrapStreamFnWithSemanticEdges(this._unguardedStreamFn, this._semanticEdges);
 		this.agent.streamFn = (model, context, options) => {
-			this.assertModelContextAvailable();
-			LiveContextController.assertWriterSettled(this.sessionManager);
+			this._assertModelRequestAvailable();
 			const request =
 				this.sessionManager.getClmBranchState().mode === "on" ? this._clmRequestSnapshot(model, context) : context;
 			return streamFn(model, request, options);
@@ -2252,8 +2251,9 @@ export class AgentSession {
 		headers?: Record<string, string>;
 		requestModel: Model<Api>;
 	}> {
-		this.assertModelContextAvailable();
+		this._assertModelRequestAvailable();
 		const result = await this._modelRegistry.getApiKeyAndHeaders(model);
+		this._assertModelRequestAvailable();
 		if (!result.ok) {
 			if (result.error.startsWith("No API key found")) {
 				throw new Error(formatNoApiKeyFoundMessage(model.provider));
@@ -5650,6 +5650,12 @@ export class AgentSession {
 		return this._clmRecoveryError ?? this._clmCleanupPending;
 	}
 
+	private _assertModelRequestAvailable(): void {
+		this.assertModelContextAvailable();
+		if (this._clmController) this._clmController.assertModelRequestAvailable();
+		else LiveContextController.assertWriterSettled(this.sessionManager);
+	}
+
 	assertModelContextAvailable(): void {
 		const active = this.clmRecoveryError;
 		if (active) throw active;
@@ -6340,7 +6346,7 @@ export class AgentSession {
 
 	private async _prompt(text: string, options?: InternalPromptOptions): Promise<void> {
 		this.assertModelContextAvailable();
-		if (!this.isStreaming) LiveContextController.assertWriterSettled(this.sessionManager);
+		if (!this.isStreaming) this._assertModelRequestAvailable();
 		// Synchronous preflight guard: from submission until the prompt promise
 		// settles, a model switch must not tear down a routed turn's override
 		// (the routing decision for this turn's images may already be made).
@@ -9316,6 +9322,7 @@ export class AgentSession {
 						throw error;
 					}
 				};
+				this._assertModelRequestAvailable();
 				({ summary, firstKeptEntryId, tokensBefore, details, usage } = await compact(
 					preparation,
 					summarization.model,
@@ -9852,12 +9859,13 @@ export class AgentSession {
 		fallback?: { model: Model<Api>; apiKey: string; headers?: Record<string, string> },
 		requiredContextTokens?: number,
 	): Promise<{ model: Model<Api>; apiKey: string; headers?: Record<string, string> } | undefined> {
-		this.assertModelContextAvailable();
+		this._assertModelRequestAvailable();
 		const sessionModel = this.model;
 		if (!sessionModel) {
 			return fallback;
 		}
 		const resolveSessionAuth = async () => {
+			this._assertModelRequestAvailable();
 			if (fallback) {
 				return fallback;
 			}
@@ -9901,7 +9909,7 @@ export class AgentSession {
 	}
 
 	private async _reviewAutoRefine(context: AutoRefineReviewRequest, signal?: AbortSignal): Promise<AutoRefineReview> {
-		this.assertModelContextAvailable();
+		this._assertModelRequestAvailable();
 		if (this._autoRefineReviewer) {
 			return this._autoRefineReviewer(context, signal);
 		}
@@ -9909,6 +9917,7 @@ export class AgentSession {
 		if (!refinementModel) {
 			return { shouldRefine: false, rationale: "No model selected." };
 		}
+		this._assertModelRequestAvailable();
 		return reviewAutoRefine(
 			this.agent.state.messages,
 			this._loadMergedHarnessState(),
@@ -10330,6 +10339,7 @@ export class AgentSession {
 				};
 			}
 		}
+		this._assertModelRequestAvailable();
 		const plan = await planRefinement(
 			this.agent.state.messages,
 			planningState,
@@ -15084,6 +15094,7 @@ export class AgentSession {
 					apiKey,
 					headers,
 				};
+				this._assertModelRequestAvailable();
 				const result = await generateBranchSummary(entriesToSummarize, {
 					model: summarization.model,
 					apiKey: summarization.apiKey,

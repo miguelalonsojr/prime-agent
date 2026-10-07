@@ -182,6 +182,11 @@ export class LiveContextController {
 		});
 	}
 
+	/** Provider calls require an idle, healthy writer lane, not just valid accepted JSONL. */
+	assertModelRequestAvailable(): void {
+		this.assertIdle();
+	}
+
 	getClmStatus(): ClmStatus {
 		return structuredClone(this.status);
 	}

@@ -50,17 +50,18 @@ async function fixture(messages: AuditMessage[] = [user("obsolete"), user("curre
 }
 
 describe("CLM live context", () => {
-	it.each(["marker", "directory"])("fails closed when %s fsync fails before admission", async (kind) => {
+	it.each(["marker", "directory", "removal"])("fails closed when %s fsync fails", async (kind) => {
 		const f = await fixture();
+		if (kind === "removal") await f.prepare();
 		let calls = 0;
 		const original = syncFileSystem.fsyncSync;
 		const fault = vi.spyOn(syncFileSystem, "fsyncSync").mockImplementation((fd) => {
-			if (++calls === (kind === "marker" ? 1 : 2)) throw new Error("injected sync failure");
+			if (++calls === (kind === "directory" ? 2 : 1)) throw new Error("injected sync failure");
 			original(fd);
 		});
 		syncBuiltinESMExports();
 		try {
-			await expect(f.prepare()).rejects.toThrow(/marker|fsync/);
+			await expect(kind === "removal" ? f.settle() : f.prepare()).rejects.toThrow(/marker|fsync/);
 			await expect(f.project()).rejects.toThrow();
 			expect(existsSync(`${f.manager.getSessionFile()}.clm-writer`)).toBe(true);
 		} finally {
