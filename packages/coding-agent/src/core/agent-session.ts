@@ -2023,7 +2023,7 @@ export class AgentSession {
 		};
 	}
 
-	private _assertClmTransitionIdle(): void {
+	private _assertClmTransitionIdle(kind: "mode" | "restore"): void {
 		this.assertModelContextAvailable();
 		if (
 			this.isSessionActive ||
@@ -2034,20 +2034,26 @@ export class AgentSession {
 			this._refinePlanInFlight
 		)
 			throw new Error("CLM mode and restore require an idle session; settle active and queued actions first");
-		LiveContextController.assertWriterSettled(this.sessionManager);
-		this._clmController?.assertModelRequestAvailable();
+		if (kind === "restore" && this._clmController) this._clmController.assertRestoreAvailable();
+		else {
+			LiveContextController.assertWriterSettled(this.sessionManager);
+			this._clmController?.assertModelRequestAvailable();
+		}
 	}
 
-	private async _withClmTransition(operation: () => Promise<void>): Promise<ClmStatus> {
+	private async _withClmTransition(
+		operation: () => Promise<void>,
+		kind: "mode" | "restore" = "mode",
+	): Promise<ClmStatus> {
 		if (this._clmTransition) throw new Error("CLM mode transition is already active");
-		this._assertClmTransitionIdle();
+		this._assertClmTransitionIdle(kind);
 		this._clmTransition = true;
 		const pause = this.acquireQueuedWorkPause();
 		let fence: { owner: symbol; release(): void } | undefined;
 		try {
 			fence = await this._acquireSessionActionCommitFence();
 			await this._agentEventQueue;
-			this._assertClmTransitionIdle();
+			this._assertClmTransitionIdle(kind);
 			await operation();
 			this.agent.state.messages = this.sessionManager.buildSessionContext().messages;
 			this.syncClmMode();
@@ -2115,7 +2121,7 @@ export class AgentSession {
 		return this._withClmTransition(async () => {
 			if (this.sessionManager.getClmBranchState().mode !== "on") throw new Error("CLM restore requires CLM on");
 			await (await this._getClmController()).restoreRevision(epochId, revision);
-		});
+		}, "restore");
 	}
 
 	private _recordObservedProviderUsage(pin: ClmUsagePin, response: AssistantMessage, messageEntryId?: string): void {

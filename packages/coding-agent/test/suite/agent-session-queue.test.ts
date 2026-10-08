@@ -2244,7 +2244,7 @@ describe("CLM action identity", () => {
 		const tool: AgentTool = {
 			...createEditToolDefinition("/"),
 			execute: async () => {
-				await writeFile(path, readFileSync(path, "utf8").replace("obsolete", "late bytes"));
+				await writeFile(path, readFileSync(path, "utf8").replace("accepted", "late bytes"));
 				return { content: [{ type: "text", text: "done" }], details: {} };
 			},
 		};
@@ -2254,6 +2254,8 @@ describe("CLM action identity", () => {
 			extensionFactories: kind === "builtin" ? [(pi) => pi.registerTool(createEditToolDefinition("/"))] : [],
 		});
 		const nextProviderCall = vi.fn((context: Context) => {
+			expect(context.messages.map(getMessageText)).toContain("obsolete");
+			expect(context.messages.map(getMessageText)).not.toContain("accepted");
 			expect(context.messages.map(getMessageText)).not.toContain("late bytes");
 			return fauxAssistantMessage("repaired");
 		});
@@ -2261,6 +2263,8 @@ describe("CLM action identity", () => {
 		const manager = harness.sessionManager;
 		const id = manager.appendMessage(message);
 		manager.appendClmOn({ blocks: [{ id, message }] }, id);
+		manager.appendClmRevision({ blocks: [{ id, message: { ...message, content: "accepted" } }] }, id, "seed");
+		const epoch = manager.getClmBranchState().epochId!;
 		harness.session.syncClmMode();
 		path = join(manager.getSessionArtifactDir()!, "clm", "context.txt");
 		const originalWrite = fileSystem.writeFile;
@@ -2276,7 +2280,7 @@ describe("CLM action identity", () => {
 		});
 		syncBuiltinESMExports();
 		harness.setResponses([
-			fauxAssistantMessage(fauxToolCall("edit", { path, edits: [{ oldText: "obsolete", newText: "late bytes" }] }), {
+			fauxAssistantMessage(fauxToolCall("edit", { path, edits: [{ oldText: "accepted", newText: "late bytes" }] }), {
 				stopReason: "toolUse",
 			}),
 			nextProviderCall,
@@ -2288,6 +2292,8 @@ describe("CLM action identity", () => {
 			expect(reached, JSON.stringify(harness.eventsOfType("tool_execution_end"))).toBe(true);
 			await harness.session.abort();
 			await run;
+			await expect(harness.session.restoreClmRevision(epoch, 0)).rejects.toThrow(/idle|writer/);
+			expect(manager.getClmBranchState().revision).toBe(1);
 			await expect(harness.session.prompt("while writing")).rejects.toThrow(/writer/);
 			await expect(harness.session.refine()).rejects.toThrow(/writer/);
 			release.resolve();
@@ -2295,20 +2301,39 @@ describe("CLM action identity", () => {
 			await expect(harness.session.prompt("next")).rejects.toThrow();
 			await expect(harness.session.refine()).rejects.toThrow(/writer/);
 			expect(nextProviderCall).not.toHaveBeenCalled();
-			const controller = await LiveContextController.open(manager, manager.getSessionArtifactDir()!);
 			await drainFileMutationQueue(path);
+			await expect(harness.session.setClmMode(false)).rejects.toThrow(/writer/);
 			if (kind === "builtin") {
-				await controller.repairCancelledToolAction();
+				await harness.session.restoreFollowUpMessage("queued");
+				await expect(harness.session.restoreClmRevision(epoch, 0)).rejects.toThrow(/idle/);
+				harness.session.clearQueue();
+				await expect(harness.session.restoreClmRevision("other-epoch", 0)).rejects.toThrow(/epoch/);
+				await expect(harness.session.restoreClmRevision(epoch, 99)).rejects.toThrow(/ancestor/);
+				expect(existsSync(`${manager.getSessionFile()}.clm-writer`)).toBe(true);
+				const status = await harness.session.restoreClmRevision(epoch, 0);
+				expect(status).toMatchObject({ mode: "on", epochId: epoch, revision: 2 });
+				expect(status.error).toBeUndefined();
+				expect(existsSync(`${manager.getSessionFile()}.clm-writer`)).toBe(false);
+				expect(manager.getClmBranchState().snapshot?.blocks).toEqual([{ id, message }]);
+				expect(manager.getEntry(id)).toMatchObject({ message });
+				expect(readFileSync(path, "utf8")).not.toContain("late bytes");
+				expect(JSON.stringify(await harness.session.getClmAcceptedView())).toContain("obsolete");
 				await harness.session.prompt("after repair");
 				expect(nextProviderCall).toHaveBeenCalledTimes(1);
 				harness.setResponses([fauxAssistantMessage(refinePlanJson("after writer repair"))]);
 				expect((await harness.session.refine()).summary).toBe("after writer repair");
+				await writeFile(path, "unowned drift");
+				await expect(harness.session.projectClmContext([])).rejects.toThrow(/drift/);
+				await expect(harness.session.restoreClmRevision(epoch, 0)).rejects.toThrow(/drift/);
+				expect(readFileSync(path, "utf8")).toBe("unowned drift");
 			} else {
-				await expect(controller.repairCancelledToolAction()).rejects.toThrow(/settlement/);
+				await expect(harness.session.restoreClmRevision(epoch, 0)).rejects.toThrow(/writer/);
+				expect(manager.getClmBranchState().revision).toBe(1);
 				const reopened = await createHarness({ existingSessionFile: manager.getSessionFile(), tools: [tool] });
 				try {
 					expect(JSON.stringify(reopened.session.getTranscriptMessages())).toContain("obsolete");
 					await expect(reopened.session.prompt("after restart")).rejects.toThrow(/writer/);
+					await expect(reopened.session.restoreClmRevision(epoch, 0)).rejects.toThrow(/writer/);
 				} finally {
 					reopened.cleanup();
 				}

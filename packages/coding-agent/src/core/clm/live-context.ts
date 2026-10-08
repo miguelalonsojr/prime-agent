@@ -189,21 +189,36 @@ export class LiveContextController {
 		}
 	}
 
+	/** Restore alone may use the retained physical receipt; ordinary requests stay blocked. */
+	assertRestoreAvailable(): void {
+		if (!this.cancelled) {
+			this.assertIdle();
+			return;
+		}
+		if (!this.cancelled.settled || !this.markerArmed || !this.action)
+			throw new Error("CLM physical writer settlement is not known");
+		const state = this.sessionManager.getClmBranchState();
+		if (state.mode !== "on" || state.epochId !== this.status.epochId || state.revision !== this.status.revision)
+			throw new Error("CLM accepted state changed before writer repair");
+	}
+
 	/** A restarted controller has no receipt and must not infer settlement from a hash or empty queue. */
 	repairCancelledToolAction(): Promise<void> {
-		return this.enqueue(async () => {
-			if (!this.cancelled?.settled) throw new Error("CLM physical writer settlement is not known");
-			const state = this.sessionManager.getClmBranchState();
-			if (state.epochId !== this.status.epochId || state.revision !== this.status.revision)
-				throw new Error("CLM accepted state changed before writer repair");
-			const { snapshot } = this.acceptedContext();
-			await this.publish(snapshot, new Set(snapshot.blocks.map((block) => block.id)));
-			this.clearMarker();
-			this.action = undefined;
-			this.cancelled = undefined;
-			this.conflict = undefined;
-			this.status.error = undefined;
-		});
+		return this.enqueue(() => this.repairCancelledMirror());
+	}
+
+	private async repairCancelledMirror(): Promise<void> {
+		if (!this.cancelled) throw new Error("CLM physical writer settlement is not known");
+		this.assertRestoreAvailable();
+		const leafId = this.sessionManager.getLeafId();
+		const { snapshot } = this.acceptedContext();
+		await this.publish(snapshot, new Set(snapshot.blocks.map((block) => block.id)));
+		if (this.sessionManager.getLeafId() !== leafId) throw new Error("CLM session changed during writer repair");
+		this.clearMarker();
+		this.action = undefined;
+		this.cancelled = undefined;
+		this.conflict = undefined;
+		this.status.error = undefined;
 	}
 
 	/** Provider calls require an idle, healthy writer lane, not just valid accepted JSONL. */
@@ -273,7 +288,7 @@ export class LiveContextController {
 
 	restoreRevision(epochId: string, revision: number): Promise<void> {
 		return this.enqueue(async () => {
-			this.assertIdle();
+			this.assertRestoreAvailable();
 			if (epochId !== this.status.epochId || !Number.isSafeInteger(revision) || revision < 0)
 				throw new Error("CLM restore requires an ancestor revision in the active epoch");
 			const target = this.sessionManager
@@ -293,6 +308,8 @@ export class LiveContextController {
 			const rendered = renderContextDocument(target.snapshot, new Set());
 			LiveContextController.checkDocumentSize(rendered);
 			parseContextDocument(rendered, target.snapshot);
+			if (this.cancelled) await this.repairCancelledMirror();
+			this.assertIdle();
 			const id = this.sessionManager.appendClmRevision(target.snapshot, watermark, `restore:${epochId}:${revision}`);
 			await this.publishAcceptedRevision(id, new Set(target.snapshot.blocks.map((block) => block.id)));
 		});

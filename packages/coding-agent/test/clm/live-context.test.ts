@@ -140,8 +140,9 @@ describe("CLM live context", () => {
 		await f.prepare();
 		expect(() => f.controller.assertChildAdmissionAvailable("tool")).not.toThrow();
 		for (const id of [undefined, "other"]) expect(() => f.controller.assertChildAdmissionAvailable(id)).toThrow();
-		f.controller.abortToolAction("tool");
+		f.controller.abortToolAction("tool", Promise.reject(new Error("unknown physical settlement")));
 		expect(() => f.controller.assertChildAdmissionAvailable("tool")).toThrow(/writer/);
+		await expect(f.controller.restoreRevision(f.manager.getClmBranchState().epochId!, 0)).rejects.toThrow(/writer/);
 		const other = await fixture();
 		await writeFile(`${other.manager.getSessionFile()}.clm-writer`, "unknown");
 		expect(() => other.controller.assertChildAdmissionAvailable()).toThrow(/writer/);
