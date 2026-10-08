@@ -199,6 +199,40 @@ describe("AgentSession refinement auxiliary model", () => {
 		},
 	);
 
+	it("keeps the original accepted revision on a refinement retry after a new revision appears", async () => {
+		const h = await createHarness({
+			persistSession: true,
+			settings: { retry: { enabled: true, maxRetries: 1, baseDelayMs: 0 } },
+		});
+		harnesses.push(h);
+		const watermark = h.sessionManager.appendMessage(userMsg("task"));
+		h.sessionManager.appendClmOn({ blocks: [{ id: watermark, message: userMsg("task") }] }, watermark);
+		const epochId = h.sessionManager.getClmBranchState().epochId;
+		const first = { ...assistantText("transient"), stopReason: "error" as const };
+		first.usage.cacheRead = 9;
+		const second = emptyProposalResponse();
+		second.usage.cacheRead = 20;
+		completeSimpleMock
+			.mockImplementationOnce(async () => {
+				h.sessionManager.appendClmRevision(
+					{ blocks: [{ id: watermark, message: userMsg("changed") }] },
+					watermark,
+					"restore:simulated",
+				);
+				return first;
+			})
+			.mockResolvedValueOnce(second);
+		await expect(h.session.refine()).rejects.toThrow(/CLM accepted state changed/);
+		const receipts = h.sessionManager
+			.getBranch()
+			.filter((entry) => entry.type === "custom" && entry.customType === "clm_usage_v1");
+		expect(receipts.map((entry) => (entry.type === "custom" ? entry.data : null))).toMatchObject([
+			{ pin: { epochId, revision: 0 }, usage: { cacheRead: 9 } },
+			{ pin: { epochId, revision: 0 }, usage: { cacheRead: 20 } },
+		]);
+		expect(h.sessionManager.getClmMeasuredUsage()).toBeUndefined();
+	});
+
 	it("routes refinement planning to the configured auxiliary model", async () => {
 		const harness = await createRefineHarness({ auxiliaryModel: "faux/aux-model" });
 		await harness.session.refine({ instructions: "record a note" });

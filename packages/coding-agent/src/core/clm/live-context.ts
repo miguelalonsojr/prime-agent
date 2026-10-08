@@ -224,10 +224,12 @@ export class LiveContextController {
 	}
 
 	getClmStatus(configuredDefault = false): ClmStatus {
+		const measuredUsage = this.sessionManager.getClmMeasuredUsage();
 		return {
 			...structuredClone(this.status),
 			...this.sessionManager.getClmModeMetadata(),
 			configuredDefault,
+			...(measuredUsage ? { measuredUsage } : {}),
 		};
 	}
 

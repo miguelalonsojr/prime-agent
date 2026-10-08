@@ -1,9 +1,9 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { Api, Model } from "@earendil-works/pi-ai";
+import type { Api, AssistantMessage, Model } from "@earendil-works/pi-ai";
 import { completeSimple } from "@earendil-works/pi-ai";
 import type { ModelRegistry } from "../../core/model-registry.js";
 import { completeWithProviderRetry, type ProviderRetryPolicy, providerRetryPolicy } from "../../core/provider-retry.js";
-import type { AgentStatus, AgentTaskState } from "../../core/session-manager.js";
+import type { AgentStatus, AgentTaskState, ClmUsagePin } from "../../core/session-manager.js";
 import type { ActiveSessionState } from "./active-session-state.js";
 
 const SWEEP_INTERVAL_MS = 25_000;
@@ -154,11 +154,12 @@ export interface GenerateAgentStatusParams {
 	isWorking: boolean;
 	retryPolicy?: ProviderRetryPolicy;
 	signal?: AbortSignal;
+	onObservedResponse?: (message: AssistantMessage) => void;
 }
 
 /** One cheap model call for a fresh status, or undefined if unavailable/empty/failed. */
 export async function generateAgentStatus(params: GenerateAgentStatusParams): Promise<AgentStatusResult | undefined> {
-	const { registry, messages, isWorking, retryPolicy, signal } = params;
+	const { registry, messages, isWorking, retryPolicy, signal, onObservedResponse } = params;
 	if (messages.length === 0) {
 		return undefined;
 	}
@@ -171,6 +172,13 @@ export async function generateAgentStatus(params: GenerateAgentStatusParams): Pr
 		return undefined;
 	}
 	try {
+		const summaryMessages = [
+			{
+				role: "user" as const,
+				content: [{ type: "text" as const, text: buildStatusContext(messages, isWorking) }],
+				timestamp: Date.now(),
+			},
+		];
 		// One failed attempt would settle an idle session to a stale needs_input verdict.
 		const response = await completeWithProviderRetry(
 			() =>
@@ -178,17 +186,11 @@ export async function generateAgentStatus(params: GenerateAgentStatusParams): Pr
 					model,
 					{
 						systemPrompt: AGENT_STATUS_SYSTEM_PROMPT,
-						messages: [
-							{
-								role: "user" as const,
-								content: [{ type: "text" as const, text: buildStatusContext(messages, isWorking) }],
-								timestamp: Date.now(),
-							},
-						],
+						messages: summaryMessages,
 					},
 					{ maxTokens: SUMMARY_MAX_TOKENS, apiKey: auth.apiKey, headers: auth.headers, signal },
 				),
-			{ policy: retryPolicy, signal },
+			{ policy: retryPolicy, signal, onObservedResponse },
 		);
 		if (response.stopReason === "error") {
 			return undefined;
@@ -336,7 +338,19 @@ export class DaemonSessionSummarizer {
 			return;
 		}
 		const session = state.runtime.session;
-		const messages = session.messages;
+		let messages = session.messages;
+		let usagePin: ClmUsagePin | undefined;
+		try {
+			if (session.sessionManager.getClmBranchState?.().mode === "on") {
+				const accepted = await session.getClmAcceptedViewWithUsagePin();
+				messages = accepted.view.messages;
+				usagePin = accepted.pin;
+			} else {
+				usagePin = session.sessionManager.captureClmUsagePin?.();
+			}
+		} catch {
+			return;
+		}
 		if (messages.length === 0) {
 			return;
 		}
@@ -407,6 +421,14 @@ export class DaemonSessionSummarizer {
 				isWorking,
 				retryPolicy: providerRetryPolicy(session.settingsManager),
 				signal: controller.signal,
+				...(usagePin
+					? {
+							onObservedResponse: (response: AssistantMessage) => {
+								if (response.stopReason !== "aborted" && response.usage)
+									session.sessionManager.recordClmUsage(usagePin, response.usage);
+							},
+						}
+					: {}),
 			});
 			if (generated) {
 				this.failedIdleGenerations.delete(id);

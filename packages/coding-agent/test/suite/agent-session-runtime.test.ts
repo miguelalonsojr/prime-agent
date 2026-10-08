@@ -295,6 +295,54 @@ describe("AgentSessionRuntime characterization", () => {
 		await expect(session.restoreClmRevision(on.epochId!, 0)).rejects.toThrow(/CLM/);
 	});
 
+	it("attributes provider usage to the selected CLM revision after restore and reopen", async () => {
+		const { runtime, faux } = await createRuntimeForTest(() => {});
+		const session = runtime.session;
+		await session.prompt("initial task");
+		expect(
+			session.sessionManager
+				.getEntries()
+				.filter((entry) => entry.type === "custom" && entry.customType === "clm_usage_v1"),
+		).toHaveLength(1);
+		const on = await session.setClmMode(true);
+		vi.spyOn(session.modelRegistry, "getApiKeyAndHeaders").mockRejectedValueOnce(new Error("host auth failure"));
+		await expect(session.agent.streamFn(faux.getModel(), { systemPrompt: "", messages: [] }, {})).rejects.toThrow(
+			/host auth failure/,
+		);
+		faux.setResponses([fauxAssistantMessage("first"), fauxAssistantMessage("second")]);
+		await session.prompt("first CLM request");
+		const lastUser = session.sessionManager
+			.getBranch()
+			.filter((entry) => entry.type === "message" && entry.message.role === "user")
+			.at(-1);
+		const lastReceipt = session.sessionManager
+			.getBranch()
+			.filter((entry) => entry.type === "custom" && entry.customType === "clm_usage_v1")
+			.at(-1);
+		expect(lastReceipt?.type === "custom" ? lastReceipt.data : undefined).toMatchObject({
+			pin: { branchId: lastUser?.id },
+		});
+		const firstUsage = session.sessionManager
+			.getBranch()
+			.filter((entry) => entry.type === "message")
+			.at(-1);
+		if (firstUsage?.type !== "message" || firstUsage.message.role !== "assistant")
+			throw new Error("missing provider result");
+		expect((await session.getClmStatus()).measuredUsage?.cacheRead).toBe(firstUsage.message.usage.cacheRead);
+		await session.restoreClmRevision(on.epochId!, 0);
+		expect((await session.getClmStatus()).measuredUsage).toBeUndefined();
+		await session.prompt("second CLM request");
+		const secondUsage = session.sessionManager
+			.getBranch()
+			.filter((entry) => entry.type === "message")
+			.at(-1);
+		if (secondUsage?.type !== "message" || secondUsage.message.role !== "assistant")
+			throw new Error("missing provider result");
+		expect((await session.getClmStatus()).measuredUsage?.cacheRead).toBe(secondUsage.message.usage.cacheRead);
+		const reopened = SessionManager.open(session.sessionFile!);
+		expect(reopened.getClmMeasuredUsage()?.cacheRead).toBe(secondUsage.message.usage.cacheRead);
+	});
+
 	it("reads accepted bytes without opening the mirror or admitting a provider request", async () => {
 		const h = await createHarness({ persistSession: true, settings: { clm: { enabled: true } } });
 		cleanups.push(h.cleanup);

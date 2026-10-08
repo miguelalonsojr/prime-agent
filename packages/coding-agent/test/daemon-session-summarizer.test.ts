@@ -1,5 +1,7 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import { fauxAssistantMessage, registerFauxProvider } from "@earendil-works/pi-ai";
 import { describe, expect, test, vi } from "vitest";
+import type { ModelRegistry } from "../src/core/model-registry.js";
 import type { AgentStatus } from "../src/core/session-manager.js";
 import { SettingsManager } from "../src/core/settings-manager.js";
 import type { ActiveSessionState } from "../src/modes/daemon/active-session-state.js";
@@ -8,6 +10,7 @@ import {
 	buildStatusContext,
 	DaemonSessionSummarizer,
 	type GenerateAgentStatusParams,
+	generateAgentStatus,
 	parseAgentStatusResponse,
 } from "../src/modes/daemon/daemon-session-summarizer.js";
 
@@ -162,6 +165,45 @@ describe("daemon session summarizer", () => {
 		});
 	});
 
+	test("observes each faux status retry against one captured prompt", async () => {
+		const faux = registerFauxProvider({
+			provider: "prime-inference",
+			models: [{ id: "qwen/qwen3-30b-a3b-instruct-2507" }],
+		});
+		try {
+			const requests: string[] = [];
+			const observed: number[] = [];
+			faux.setResponses([
+				(context) => {
+					requests.push(JSON.stringify(context.messages));
+					return fauxAssistantMessage("temporary", { stopReason: "error" });
+				},
+				(context) => {
+					requests.push(JSON.stringify(context.messages));
+					return fauxAssistantMessage("<recap>Working</recap><status>NEEDS_INPUT</status>");
+				},
+			]);
+			const registry = {
+				find: () => faux.getModel(),
+				hasConfiguredAuth: () => true,
+				getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "faux-key", headers: {} }),
+			} as unknown as ModelRegistry;
+			const result = await generateAgentStatus({
+				registry,
+				messages: [userMessage("kept task")],
+				isWorking: false,
+				retryPolicy: { enabled: true, maxRetries: 1, baseDelayMs: 0, maxRetryDelayMs: 0 },
+				onObservedResponse: (message) => observed.push(message.usage.input),
+			});
+			expect(result?.taskState).toBe("needs_input");
+			expect(requests).toHaveLength(2);
+			expect(requests[1]).toBe(requests[0]);
+			expect(observed).toHaveLength(2);
+		} finally {
+			faux.unregister();
+		}
+	});
+
 	describe("status change notification", () => {
 		function makeState(options: {
 			messages: AgentMessage[];
@@ -171,6 +213,7 @@ describe("daemon session summarizer", () => {
 			persistedStatus?: AgentStatus;
 			appendAgentStatus?: (status: AgentStatus) => void;
 			getLeafId?: () => string | null;
+			clmView?: () => Promise<{ view: { messages: AgentMessage[] }; pin: { mode: "on"; branchId: string | null } }>;
 		}): ActiveSessionState {
 			return {
 				activeSessionId: options.activeSessionId ?? "active-1",
@@ -179,6 +222,7 @@ describe("daemon session summarizer", () => {
 					session: {
 						isSessionActive: options.isSessionActive,
 						messages: options.messages,
+						getClmAcceptedViewWithUsagePin: options.clmView,
 						modelRegistry: {},
 						settingsManager: SettingsManager.inMemory(),
 						state: { streamingMessage: undefined },
@@ -186,6 +230,7 @@ describe("daemon session summarizer", () => {
 							appendAgentStatus: options.appendAgentStatus ?? (() => {}),
 							getLatestAgentStatus: () => options.persistedStatus,
 							getLeafId: options.getLeafId ?? (() => null),
+							getClmBranchState: () => ({ mode: options.clmView ? "on" : "off" }),
 						},
 					},
 				},
@@ -215,6 +260,29 @@ describe("daemon session summarizer", () => {
 
 			expect(state.summaryState?.basedOnMessageCount).toBe(2);
 			expect(onStatusChanged).toHaveBeenCalledOnce();
+		});
+
+		test("uses the accepted CLM view and rejects an unavailable view before generation", async () => {
+			const audit = [userMessage("removed secret")];
+			const accepted = [userMessage("kept task")];
+			const generate = vi.fn(async () => ({ summary: "Working", taskState: "needs_input" as const }));
+			const state = makeState({
+				messages: audit,
+				isSessionActive: false,
+				clmView: async () => ({ view: { messages: accepted }, pin: { mode: "on", branchId: "entry" } }),
+			});
+			const summarizer = new DaemonSessionSummarizer(() => [state], undefined, generate);
+			await (summarizer as unknown as { summarize(state: ActiveSessionState): Promise<void> }).summarize(state);
+			expect(generate).toHaveBeenCalledWith(expect.objectContaining({ messages: accepted }));
+			const corrupt = makeState({
+				messages: audit,
+				isSessionActive: false,
+				clmView: async () => {
+					throw new Error("corrupt accepted view");
+				},
+			});
+			await (summarizer as unknown as { summarize(state: ActiveSessionState): Promise<void> }).summarize(corrupt);
+			expect(generate).toHaveBeenCalledTimes(1);
 		});
 
 		function failingIdleSetup(

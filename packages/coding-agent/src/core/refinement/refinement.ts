@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
-import type { Api, Model } from "@earendil-works/pi-ai";
+import type { Api, AssistantMessage, Model } from "@earendil-works/pi-ai";
 import { completeSimple } from "@earendil-works/pi-ai";
 import { getAgentDir } from "../../config.js";
 import { realpathIfPresentSync, writeFileAtomicSync } from "../../utils/atomic-file.js";
@@ -111,6 +111,7 @@ export interface RefineOptions {
 	rollbackId?: string;
 	global?: boolean;
 	retry?: ProviderRetryPolicy;
+	onObservedResponse?: (message: AssistantMessage) => void;
 }
 
 export type AutoRefineReason = "turn_interval" | "compact";
@@ -1298,7 +1299,7 @@ export async function planRefinement(
 					sessionId,
 				},
 			),
-		{ policy: options.retry, signal },
+		{ policy: options.retry, signal, onObservedResponse: options.onObservedResponse },
 	);
 
 	if (response.stopReason === "error") {
@@ -1340,6 +1341,7 @@ export async function reviewAutoRefine(
 	thinkingLevel?: ThinkingLevel,
 	retry?: ProviderRetryPolicy,
 	sessionId?: string,
+	onObservedResponse?: (message: AssistantMessage) => void,
 ): Promise<AutoRefineReview> {
 	const conversationText = serializeConversation(convertToLlm(messages)).slice(-40_000);
 	const buildPrompt = (conversation: string): string =>
@@ -1387,7 +1389,7 @@ ${conversation}
 					sessionId,
 				},
 			),
-		{ policy: retry, signal },
+		{ policy: retry, signal, onObservedResponse },
 	);
 	if (response.stopReason === "error") {
 		throw new Error(`Auto-refine review failed: ${response.errorMessage || "Unknown error"}`);

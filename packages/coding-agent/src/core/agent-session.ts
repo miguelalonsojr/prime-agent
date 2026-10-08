@@ -335,6 +335,7 @@ import type {
 	BranchSummaryEntry,
 	ChildUsageAttributionEntry,
 	ClmBlock,
+	ClmUsagePin,
 	CompactionEntry,
 	SessionContext,
 	SessionEntry,
@@ -1580,6 +1581,8 @@ export class AgentSession {
 	private _clmBindingError?: Error;
 	private _clmCleanupPending?: ClmRecoveryError;
 	private readonly _unguardedStreamFn: Agent["streamFn"];
+	private _clmProjectedUsagePin?: ClmUsagePin;
+	private readonly _clmDispatchedUsagePins: ClmUsagePin[] = [];
 
 	private _scopedModels: Array<{
 		model: Model<any>;
@@ -1898,7 +1901,15 @@ export class AgentSession {
 			this._assertModelRequestAvailable();
 			const request =
 				this.sessionManager.getClmBranchState().mode === "on" ? this._clmRequestSnapshot(model, context) : context;
-			return streamFn(model, request, options);
+			const pin = this._clmProjectedUsagePin ?? this.sessionManager.captureClmUsagePin();
+			const response = streamFn(model, request, options);
+			this._clmDispatchedUsagePins.push(pin);
+			this._clmProjectedUsagePin = undefined;
+			return Promise.resolve(response).catch((cause: unknown) => {
+				const index = this._clmDispatchedUsagePins.indexOf(pin);
+				if (index !== -1) this._clmDispatchedUsagePins.splice(index, 1);
+				throw cause;
+			});
 		};
 		if (config.clmContextRef) config.clmContextRef.current = this;
 		else {
@@ -1987,6 +1998,7 @@ export class AgentSession {
 			this.agent.state.systemPrompt = this.agent.state.systemPrompt.replace(this._clmPrompt, "");
 			this._clmPrompt = "";
 			this._clmController = undefined;
+			this._clmProjectedUsagePin = undefined;
 		}
 	}
 
@@ -2081,13 +2093,18 @@ export class AgentSession {
 
 	/** Optional inspection does not import the mirror or perform provider admission. */
 	async getClmAcceptedView(): Promise<ClmAcceptedView> {
+		return (await this.getClmAcceptedViewWithUsagePin()).view;
+	}
+
+	async getClmAcceptedViewWithUsagePin(): Promise<{ view: ClmAcceptedView; pin: ClmUsagePin }> {
 		const pause = this.acquireQueuedWorkPause();
 		let fence: { owner: symbol; release(): void } | undefined;
 		try {
 			fence = await this._acquireSessionActionCommitFence();
 			await this._agentEventQueue;
 			this.assertModelContextAvailable();
-			return await LiveContextController.readAcceptedView(this.sessionManager);
+			const view = await LiveContextController.readAcceptedView(this.sessionManager);
+			return { view, pin: this.sessionManager.captureClmUsagePin() };
 		} finally {
 			fence?.release();
 			pause.release();
@@ -2099,6 +2116,16 @@ export class AgentSession {
 			if (this.sessionManager.getClmBranchState().mode !== "on") throw new Error("CLM restore requires CLM on");
 			await (await this._getClmController()).restoreRevision(epochId, revision);
 		});
+	}
+
+	private _recordObservedProviderUsage(pin: ClmUsagePin, response: AssistantMessage, messageEntryId?: string): void {
+		if (
+			response.stopReason === "aborted" ||
+			isAgentLifecycleFailure(response) ||
+			isFauxProviderQueueExhausted(response)
+		)
+			return;
+		if (response.usage) this.sessionManager.recordClmUsage(pin, response.usage, messageEntryId);
 	}
 
 	private _clmRequestInputs(): ClmRequestInputs {
@@ -2245,10 +2272,12 @@ export class AgentSession {
 		try {
 			const controller = await this._getClmController();
 			const protectedActions = this._clmProtectedActions();
-			return await controller.projectRequest(new Set(protectedActions.keys()), {
+			const projected = await controller.projectRequest(new Set(protectedActions.keys()), {
 				...this._clmRequestInputs(),
 				protectedActions,
 			});
+			this._clmProjectedUsagePin = this.sessionManager.captureClmUsagePin();
+			return projected;
 		} finally {
 			fence.release();
 		}
@@ -5105,8 +5134,11 @@ export class AgentSession {
 				}
 				if (entryId) {
 					this._bindClmDelivery(event.message, entryId);
-					if (event.message.role === "assistant")
+					if (event.message.role === "assistant") {
+						const pin = this._clmDispatchedUsagePins.shift();
+						if (pin) this._recordObservedProviderUsage(pin, event.message, entryId);
 						await this._discardClmFailedProviderEntry(entryId, event.message);
+					}
 				}
 			} catch (cause) {
 				if (clm) {
@@ -9463,6 +9495,7 @@ export class AgentSession {
 					}
 				};
 				this._assertModelRequestAvailable();
+				const usagePin = this.sessionManager.captureClmUsagePin();
 				({ summary, firstKeptEntryId, tokensBefore, details, usage } = await compact(
 					preparation,
 					summarization.model,
@@ -9477,6 +9510,7 @@ export class AgentSession {
 					summaryCall,
 					providerRetryPolicy(this.settingsManager),
 					this.sessionId,
+					(response) => this._recordObservedProviderUsage(usagePin, response),
 				));
 			}
 
@@ -10066,6 +10100,7 @@ export class AgentSession {
 		}
 		this._assertModelRequestAvailable();
 		const messages = await this.getAcceptedModelContextSnapshot();
+		const usagePin = this.sessionManager.captureClmUsagePin();
 		return reviewAutoRefine(
 			messages,
 			this._loadMergedHarnessState(),
@@ -10078,6 +10113,7 @@ export class AgentSession {
 			this.thinkingLevel,
 			providerRetryPolicy(this.settingsManager),
 			this.sessionId,
+			(response) => this._recordObservedProviderUsage(usagePin, response),
 		);
 	}
 
@@ -10431,6 +10467,7 @@ export class AgentSession {
 			throw new Error(formatNoModelSelectedMessage());
 		}
 		const messages = await this.getAcceptedModelContextSnapshot();
+		const usagePin = this.sessionManager.captureClmUsagePin();
 		const globalHarnessStateDir = getGlobalHarnessStateDir();
 		const localHarnessStateDir = this._localHarnessStateDir();
 		const requestedScope = options.global ? "global" : "local";
@@ -10495,7 +10532,11 @@ export class AgentSession {
 			history,
 			refinementModel.model,
 			refinementModel.apiKey,
-			{ ...options, retry: providerRetryPolicy(this.settingsManager) },
+			{
+				...options,
+				retry: providerRetryPolicy(this.settingsManager),
+				onObservedResponse: (response) => this._recordObservedProviderUsage(usagePin, response),
+			},
 			refinementModel.headers,
 			signal,
 			this.thinkingLevel,
@@ -15297,6 +15338,7 @@ export class AgentSession {
 					headers,
 				};
 				this._assertModelRequestAvailable();
+				const usagePin = this.sessionManager.captureClmUsagePin();
 				const result = await generateBranchSummary(entriesToSummarize, {
 					model: summarization.model,
 					apiKey: summarization.apiKey,
@@ -15307,6 +15349,7 @@ export class AgentSession {
 					replaceInstructions,
 					reserveTokens: branchSummarySettings.reserveTokens,
 					retry: providerRetryPolicy(this.settingsManager),
+					onObservedResponse: (response) => this._recordObservedProviderUsage(usagePin, response),
 				});
 				if (result.aborted) {
 					return { cancelled: true, aborted: true };

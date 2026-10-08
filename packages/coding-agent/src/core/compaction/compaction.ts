@@ -552,6 +552,7 @@ export async function generateSummary(
 	retry?: ProviderRetryPolicy,
 	sessionId?: string,
 	recentStateAnchor?: string,
+	onObservedResponse?: (message: AssistantMessage) => void,
 ): Promise<SummarySlice> {
 	const maxTokens = historySummaryCompletionBudget(reserveTokens);
 
@@ -584,7 +585,7 @@ export async function generateSummary(
 				{ systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, messages: summarizationMessages },
 				completionOptions,
 			),
-		{ policy: retry, signal },
+		{ policy: retry, signal, onObservedResponse },
 	);
 
 	if (response.stopReason === "error") {
@@ -829,6 +830,7 @@ export async function compact(
 	summaryCall: SummaryCallRunner = (call) => call(headers),
 	retry?: ProviderRetryPolicy,
 	sessionId?: string,
+	onObservedResponse?: (message: AssistantMessage) => void,
 ): Promise<CompactionResult> {
 	const {
 		firstKeptEntryId,
@@ -862,6 +864,7 @@ export async function compact(
 							retry,
 							sessionId,
 							recentStateAnchor,
+							onObservedResponse,
 						),
 					)
 				: Promise.resolve<SummarySlice>({ summary: "No prior history." }),
@@ -876,6 +879,7 @@ export async function compact(
 					thinkingLevel,
 					retry,
 					sessionId,
+					onObservedResponse,
 				),
 			),
 		]);
@@ -896,6 +900,7 @@ export async function compact(
 				retry,
 				sessionId,
 				recentStateAnchor,
+				onObservedResponse,
 			),
 		);
 		slices.push(result);
@@ -936,6 +941,7 @@ async function generateTurnPrefixSummary(
 	thinkingLevel?: ThinkingLevel,
 	retry?: ProviderRetryPolicy,
 	sessionId?: string,
+	onObservedResponse?: (message: AssistantMessage) => void,
 ): Promise<SummarySlice> {
 	const maxTokens = turnPrefixSummaryCompletionBudget(reserveTokens);
 	const llmMessages = convertToLlm(messages);
@@ -958,7 +964,7 @@ async function generateTurnPrefixSummary(
 					? { maxTokens, signal, apiKey, headers, sessionId, reasoning: thinkingLevel }
 					: { maxTokens, signal, apiKey, headers, sessionId },
 			),
-		{ policy: retry, signal },
+		{ policy: retry, signal, onObservedResponse },
 	);
 
 	if (response.stopReason === "error") {

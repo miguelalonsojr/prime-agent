@@ -6,7 +6,7 @@
  */
 
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { Model, Usage } from "@earendil-works/pi-ai";
+import type { AssistantMessage, Model, Usage } from "@earendil-works/pi-ai";
 import { completeSimple } from "@earendil-works/pi-ai";
 import {
 	convertToLlm,
@@ -76,6 +76,7 @@ export interface GenerateBranchSummaryOptions {
 	/** If true, customInstructions replaces the default prompt instead of being appended */
 	replaceInstructions?: boolean;
 	retry?: ProviderRetryPolicy;
+	onObservedResponse?: (message: AssistantMessage) => void;
 	/** Tokens reserved for prompt + LLM response (default 16384) */
 	reserveTokens?: number;
 }
@@ -300,6 +301,7 @@ export async function generateBranchSummary(
 		customInstructions,
 		replaceInstructions,
 		retry,
+		onObservedResponse,
 		reserveTokens = 16384,
 	} = options;
 	const tokenBudget = branchSummaryTokenBudget(model.contextWindow, reserveTokens);
@@ -328,7 +330,7 @@ export async function generateBranchSummary(
 				{ systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, messages: summarizationMessages },
 				{ apiKey, headers, sessionId, signal, maxTokens: BRANCH_SUMMARY_MAX_TOKENS },
 			),
-		{ policy: retry, signal },
+		{ policy: retry, signal, onObservedResponse },
 	);
 	if (response.stopReason === "aborted") {
 		return { aborted: true };

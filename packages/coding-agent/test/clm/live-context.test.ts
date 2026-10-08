@@ -51,6 +51,41 @@ async function fixture(messages: AuditMessage[] = [user("obsolete"), user("curre
 }
 
 describe("CLM live context", () => {
+	it("attributes billed usage to the revision sent to the provider after reopen", async () => {
+		const f = await fixture();
+		const first = f.manager.captureClmUsagePin();
+		const usage = emptyUsage();
+		usage.cacheRead = 17;
+		usage.cost.total = 0.23;
+		f.manager.recordClmUsage(first, usage);
+		await f.prepare();
+		await f.change((text) => text.replace("obsolete", "summary"));
+		await f.settle();
+		expect(f.manager.getClmMeasuredUsage()).toBeUndefined();
+		const second = f.manager.captureClmUsagePin();
+		f.manager.recordClmUsage(second, { ...usage, cacheRead: 41, cost: { ...usage.cost, total: 0.81 } });
+		expect(f.manager.getClmMeasuredUsage()).toEqual({
+			input: 0,
+			output: 0,
+			cacheRead: 41,
+			cacheWrite: 0,
+			cost: 0.81,
+		});
+		f.manager.flushNow();
+		const reopened = SessionManager.open(f.manager.getSessionFile()!);
+		expect(reopened.getClmMeasuredUsage()).toEqual({ input: 0, output: 0, cacheRead: 41, cacheWrite: 0, cost: 0.81 });
+	});
+	it("treats unsupported and missing receipts as unknown", async () => {
+		const f = await fixture();
+		const pin = f.manager.captureClmUsagePin();
+		expect(f.manager.getClmMeasuredUsage()).toBeUndefined();
+		f.manager.appendCustomEntry("clm_usage_v2", { version: 2, pin, usage: emptyUsage() });
+		expect(f.manager.getClmMeasuredUsage()).toBeUndefined();
+		f.manager.branch(pin.branchId!);
+		f.manager.recordClmUsage(pin, { ...emptyUsage(), cost: { ...emptyUsage().cost, input: Number.NaN } });
+		expect(f.manager.getClmMeasuredUsage()).toBeUndefined();
+	});
+
 	it("inspects oversized durable context without relaxing provider or mirror limits", async () => {
 		const accepted = user("a".repeat(20 * 1024 * 1024));
 		const later = user("b".repeat(14 * 1024 * 1024));

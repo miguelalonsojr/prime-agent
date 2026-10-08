@@ -361,7 +361,10 @@ describe("prepareCompaction recency anchor", () => {
 		const preparation = anchoredPreparation("First summary", ["newest kept text"]);
 		completeSimpleMock.mockReset().mockResolvedValue(fauxAssistantMessage("Test summary"));
 		const model = { provider: "faux", id: "faux-1" } as unknown as Model<string>;
-		await compact(preparation!, model, "test-key");
+		const observed: number[] = [];
+		const optional = [undefined, undefined, undefined, undefined, undefined, undefined, undefined] as const;
+		await compact(preparation!, model, "test-key", ...optional, (message) => observed.push(message.usage.output));
+		expect(observed).toHaveLength(1);
 		const calls = completeSimpleMock.mock.calls.filter(
 			(call) => (call[1] as { systemPrompt?: string }).systemPrompt === SUMMARIZATION_SYSTEM_PROMPT,
 		);

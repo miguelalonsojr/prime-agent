@@ -145,6 +145,42 @@ export interface ClmModeMetadata {
 	recentRevisions: { epochId: string; revision: number }[];
 }
 
+export interface ClmUsagePin {
+	mode: "on" | "off";
+	branchId: string | null;
+	epochId?: string;
+	revision?: number;
+	entryId?: string;
+}
+
+interface ClmUsageReceipt {
+	version: 1;
+	pin: ClmUsagePin;
+	usage: Usage;
+	messageEntryId?: string;
+}
+
+const CLM_USAGE_RECEIPT = "clm_usage_v1";
+
+function isObservedClmUsage(value: unknown): value is Usage {
+	if (!value || typeof value !== "object") return false;
+	const usage = value as Partial<Usage>;
+	const cost = usage.cost;
+	if (!cost || typeof cost !== "object") return false;
+	return [
+		usage.input,
+		usage.output,
+		usage.cacheRead,
+		usage.cacheWrite,
+		usage.totalTokens,
+		cost.input,
+		cost.output,
+		cost.cacheRead,
+		cost.cacheWrite,
+		cost.total,
+	].every((number) => typeof number === "number" && Number.isFinite(number) && number >= 0);
+}
+
 export interface ClmBranchState {
 	mode: "on" | "off";
 	epochId?: string;
@@ -2348,6 +2384,82 @@ export class SessionManager {
 					auditWatermark: entry.auditWatermark,
 				}
 			: { mode: "off", auditWatermark: null };
+	}
+
+	captureClmUsagePin(): ClmUsagePin {
+		const state = this.getClmBranchState();
+		const accepted = this.getBranch().slice().reverse().find(isClmEntry);
+		return {
+			mode: state.mode,
+			branchId: this.leafId,
+			...(state.epochId !== undefined ? { epochId: state.epochId } : {}),
+			...(state.revision !== undefined ? { revision: state.revision } : {}),
+			...(accepted ? { entryId: accepted.id } : {}),
+		};
+	}
+
+	recordClmUsage(pin: ClmUsagePin, usage: Usage, messageEntryId?: string): void {
+		const receipt: ClmUsageReceipt = {
+			version: 1,
+			pin,
+			usage: cloneUsage(usage),
+			...(messageEntryId ? { messageEntryId } : {}),
+		};
+		this.appendCustomEntry(CLM_USAGE_RECEIPT, receipt);
+	}
+
+	getClmMeasuredUsage():
+		| { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number }
+		| undefined {
+		const state = this.getClmBranchState();
+		if (state.mode !== "on") return undefined;
+		const branch = this.getBranch();
+		const accepted = branch.slice().reverse().find(isClmEntry);
+		if (!accepted) return undefined;
+		let total: Usage | undefined;
+		const attributed = new Set<string>();
+		const selectedEntryIds = new Set(branch.map((entry) => entry.id));
+		for (const entry of branch) {
+			if (entry.type !== "custom" || !entry.customType.startsWith("clm_usage_")) continue;
+			const receipt = entry.data as Partial<ClmUsageReceipt> | undefined;
+			if (!receipt?.pin) return undefined;
+			if (
+				receipt.pin.epochId !== state.epochId ||
+				receipt.pin.revision !== state.revision ||
+				receipt.pin.entryId !== accepted.id ||
+				(receipt.pin.branchId !== null && !selectedEntryIds.has(receipt.pin.branchId))
+			)
+				continue;
+			if (entry.customType !== CLM_USAGE_RECEIPT || receipt.version !== 1 || !receipt.usage) return undefined;
+			if (!isObservedClmUsage(receipt.usage)) return undefined;
+			const usage = receipt.usage;
+			total ??= emptyUsage();
+			addAssistantUsage(total, usage);
+			if (receipt.messageEntryId) attributed.add(receipt.messageEntryId);
+		}
+		const boundary = branch.indexOf(accepted);
+		if (
+			branch
+				.slice(boundary + 1)
+				.some(
+					(entry) =>
+						entry.type === "message" &&
+						entry.message.role === "assistant" &&
+						entry.message.stopReason !== "aborted" &&
+						entry.message.usage &&
+						!attributed.has(entry.id),
+				)
+		)
+			return undefined;
+		return total
+			? {
+					input: total.input,
+					output: total.output,
+					cacheRead: total.cacheRead,
+					cacheWrite: total.cacheWrite,
+					cost: total.cost.total,
+				}
+			: undefined;
 	}
 
 	getClmModeMetadata(): ClmModeMetadata {

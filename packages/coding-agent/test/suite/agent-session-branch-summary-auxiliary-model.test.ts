@@ -61,11 +61,22 @@ describe("AgentSession branch summary auxiliary model", () => {
 		harness.setResponses([1, 2, 3].map(() => fauxAssistantMessage(turnText)));
 		for (const _ of [1, 2, 3]) await harness.session.prompt(turnText);
 		const [rootNode] = harness.sessionManager.getTree();
+		const previousLeaf = harness.sessionManager.getLeafId();
 		const result = await harness.session.navigateTree(rootNode.entry.id, { summarize: true });
 		const calls = completeSimpleMock.mock.calls.filter(
 			(call) => (call[1] as { systemPrompt?: string }).systemPrompt === SUMMARIZATION_SYSTEM_PROMPT,
 		);
 		expect(calls.length).toBe(options.stub ? 0 : 1);
+		expect(
+			harness.sessionManager
+				.getEntries()
+				.filter(
+					(entry) =>
+						entry.type === "custom" &&
+						entry.customType === "clm_usage_v1" &&
+						(entry.data as { pin?: { branchId?: string | null } })?.pin?.branchId === previousLeaf,
+				),
+		).toHaveLength(calls.length);
 		expect(result.summaryEntry?.summary).toContain(options.stub ? "No content to summarize" : "Test summary");
 		for (const call of calls) {
 			expect(call[0]).toMatchObject({ provider: "faux", id: expectedModel });

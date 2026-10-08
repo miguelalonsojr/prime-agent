@@ -632,6 +632,24 @@ describe("harness refinement", () => {
 		expect(completeSimpleMock.mock.calls[0][2]).toMatchObject({ maxTokens: 32_000 });
 	});
 
+	it("observes each provider retry rather than only the final refinement usage", async () => {
+		const state = loadHarnessState(makeTempDir());
+		const observed: number[] = [];
+		const first = assistantText("");
+		const last = assistantText(JSON.stringify({ summary: "s", rationale: "r", expectedOutcome: "o", edits: [] }));
+		completeSimpleMock.mockResolvedValueOnce({
+			...first,
+			stopReason: "error",
+			usage: { ...first.usage, cacheRead: 7 },
+		});
+		completeSimpleMock.mockResolvedValueOnce({ ...last, usage: { ...last.usage, cacheRead: 11 } });
+		await planRefinement([], state, [], createRefineModel(false), "api-key", {
+			retry: { enabled: true, maxRetries: 1, baseDelayMs: 0, maxRetryDelayMs: 0 },
+			onObservedResponse: (response) => observed.push(response.usage.cacheRead),
+		});
+		expect(observed).toEqual([7, 11]);
+	});
+
 	// A cut-off reply must be reported as truncation, and a complete-but-invalid
 	// reply as a formatting failure: swapping the two sends callers the wrong fix.
 	it.each<{ label: string; reply: string; stopReason?: "length"; error: RegExp }>([
