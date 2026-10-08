@@ -5873,6 +5873,12 @@ export class AgentSession {
 		else LiveContextController.assertWriterSettled(this.sessionManager);
 	}
 
+	/** Recheck helper admission without replacing its captured context or requiring an idle writer. */
+	assertHelperModelRequestAvailable(): void {
+		this.assertModelContextAvailable();
+		this._clmController?.assertHelperRequestAvailable();
+	}
+
 	assertModelContextAvailable(): void {
 		const active = this.clmRecoveryError;
 		if (active) throw active;
@@ -9569,7 +9575,7 @@ export class AgentSession {
 					providerRetryPolicy(this.settingsManager),
 					this.sessionId,
 					(response) => this._recordObservedProviderUsage(usagePin, response),
-					() => this.assertModelContextAvailable(),
+					() => this.assertHelperModelRequestAvailable(),
 				));
 			}
 
@@ -10173,7 +10179,7 @@ export class AgentSession {
 			providerRetryPolicy(this.settingsManager),
 			this.sessionId,
 			(response) => this._recordObservedProviderUsage(usagePin, response),
-			() => this.assertModelContextAvailable(),
+			() => this.assertHelperModelRequestAvailable(),
 		);
 	}
 
@@ -10596,7 +10602,7 @@ export class AgentSession {
 				...options,
 				retry: providerRetryPolicy(this.settingsManager),
 				onObservedResponse: (response) => this._recordObservedProviderUsage(usagePin, response),
-				beforeAttempt: () => this.assertModelContextAvailable(),
+				beforeAttempt: () => this.assertHelperModelRequestAvailable(),
 			},
 			refinementModel.headers,
 			signal,
@@ -15411,7 +15417,7 @@ export class AgentSession {
 					reserveTokens: branchSummarySettings.reserveTokens,
 					retry: providerRetryPolicy(this.settingsManager),
 					onObservedResponse: (response) => this._recordObservedProviderUsage(usagePin, response),
-					beforeAttempt: () => this.assertModelContextAvailable(),
+					beforeAttempt: () => this.assertHelperModelRequestAvailable(),
 				});
 				if (result.aborted) {
 					return { cancelled: true, aborted: true };

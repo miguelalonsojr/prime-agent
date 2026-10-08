@@ -544,9 +544,12 @@ describe("AgentSessionRuntime characterization", () => {
 		{ clm: true, repairFails: false, input: 0 },
 		{ clm: false, repairFails: true, input: 17 },
 		{ clm: false, repairFails: true, input: 0 },
+		{ clm: true, repairFails: false, input: 17, writer: "active" },
+		{ clm: true, repairFails: false, input: 17, writer: "cancelled" },
 	])(
-		"rechecks recap retry admission after receipt recovery (clm=$clm, repairFails=$repairFails, input=$input)",
-		async ({ clm, repairFails, input }) => {
+		"rechecks recap retry admission after receipt recovery (clm=$clm, repairFails=$repairFails, input=$input, writer=$writer)",
+		async ({ clm, repairFails, input, writer }) => {
+			const blocked = (clm && repairFails) || writer === "cancelled";
 			const h = await createHarness({
 				persistSession: true,
 				tools: [],
@@ -625,13 +628,25 @@ describe("AgentSessionRuntime characterization", () => {
 				expect(injected).toBe(true);
 				expect(requests).toHaveLength(1);
 				if (clm && repairFails) expect(() => h.session.assertModelContextAvailable()).toThrow(/repair/);
+				const controller =
+					writer &&
+					(await LiveContextController.open(h.sessionManager, h.sessionManager.getSessionArtifactDir()!));
+				if (controller) await controller.prepareToolAction("retry-writer", new Map());
+				if (controller && writer === "cancelled") controller.abortToolAction("retry-writer");
 				for (const fault of faults) fault.mockRestore();
 				syncBuiltinESMExports();
 				release.resolve();
 				await done.promise;
-				expect(requests).toHaveLength(clm && repairFails ? 1 : 2);
-				expect(h.getPendingResponseCount()).toBe(clm && repairFails ? 1 : 0);
-				if (!clm || !repairFails) {
+				expect(requests).toHaveLength(blocked ? 1 : 2);
+				expect(h.getPendingResponseCount()).toBe(blocked ? 1 : 0);
+				if (controller && writer === "active")
+					await controller.settleToolAction("retry-writer", new Map(), {
+						model: h.getModel(),
+						tools: [],
+						systemPrompt: "",
+					});
+				if (controller && writer === "active") await h.session.restoreClmRevision(pin.epochId!, 0);
+				if (!blocked) {
 					expect(requests[1]).toBe(requests[0]);
 					await h.session.getClmAcceptedView().catch(() => undefined);
 					const receipts = h.sessionManager

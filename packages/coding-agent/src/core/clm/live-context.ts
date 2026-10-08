@@ -226,6 +226,11 @@ export class LiveContextController {
 		this.assertIdle();
 	}
 
+	/** Captured helper requests may overlap a healthy writer, but not a conflicted or stale controller. */
+	assertHelperRequestAvailable(): void {
+		this.assertHealthy();
+	}
+
 	/** A child may be admitted from this exact live tool, but never from an unknown writer. */
 	assertChildAdmissionAvailable(actionId?: string): void {
 		if (actionId === undefined) {

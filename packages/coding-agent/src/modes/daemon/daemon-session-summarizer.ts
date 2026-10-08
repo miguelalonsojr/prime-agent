@@ -455,7 +455,7 @@ export class DaemonSessionSummarizer {
 				isWorking,
 				retryPolicy: providerRetryPolicy(session.settingsManager),
 				signal: controller.signal,
-				beforeAttempt: () => session.assertModelContextAvailable(),
+				beforeAttempt: () => session.assertHelperModelRequestAvailable(),
 				...(usagePin
 					? {
 							onObservedResponse: (response: AssistantMessage) => {
