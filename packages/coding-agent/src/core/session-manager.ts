@@ -1826,12 +1826,11 @@ function foldSessionScanLine(acc: SessionScanAccumulator, lineBuffer: Buffer): v
 	// can exhaust the daemon heap.
 	if (line.length > SESSION_LIST_PARSE_MAX_LINE_CHARS) {
 		const header = line.slice(0, SESSION_LIST_HEADER_PREFIX_MAX_CHARS);
-		const entryType = extractJsonStringPropertyPrefix(header, "type", 32);
+		const entryType = /^\s*\{\s*"type"\s*:\s*"(message|custom_message|custom)"\s*,/.exec(header)?.[1];
 		const isMessage = entryType === "message";
 		// A skipped first CLM boundary must not fall through to raw-count status currency.
 		if (acc.clm) acc.clm.valid = false;
-		else if (!isMessage && entryType !== "custom_message")
-			acc.clm = { acceptedCount: 0, revisionId: "", contentTipId: "", valid: false };
+		else if (entryType === undefined) acc.clm = { acceptedCount: 0, revisionId: "", contentTipId: "", valid: false };
 		if (isMessage) {
 			acc.messageCount++;
 			const summary = extractOversizedMessageSummary(line);

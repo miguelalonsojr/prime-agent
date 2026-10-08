@@ -1,4 +1,4 @@
-import { copyFileSync, mkdtempSync, rmSync } from "node:fs";
+import { copyFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
@@ -227,7 +227,12 @@ describe("buildSessionList", () => {
 		}
 	});
 
-	it.each(["normal", "CLM-off"] as const)("shows fresh %s status after an oversized custom message", async (mode) => {
+	it.each([
+		["normal", "custom_message"],
+		["CLM-off", "custom_message"],
+		["normal", "custom"],
+		["CLM-off", "custom"],
+	] as const)("shows fresh %s status after an oversized %s entry", async (mode, entryType) => {
 		const dir = mkdtempSync(join(tmpdir(), "clm-list-large-custom-"));
 		try {
 			const manager = SessionManager.create(dir, join(dir, "sessions"));
@@ -238,7 +243,8 @@ describe("buildSessionList", () => {
 				manager.appendClmOn(snapshot, id);
 				manager.appendClmOffBoundary(snapshot, id);
 			}
-			manager.appendCustomMessageEntry("large-note", "x".repeat(1_100_000), true);
+			if (entryType === "custom") manager.appendCustomEntry("large-note", { text: "x".repeat(1_100_000) });
+			else manager.appendCustomMessageEntry("large-note", "x".repeat(1_100_000), true);
 			manager.appendAgentStatus({ summary: "new", taskState: "completed", basedOnMessageCount: 1 });
 			manager.flushNow();
 			const saved = (await readSessionInfo(manager.getSessionFile()!))!;
@@ -246,6 +252,52 @@ describe("buildSessionList", () => {
 			expect(saved.agentStatus?.summary).toBe("new");
 			expect(saved.clmStatusCurrent).toBeUndefined();
 			expect(buildSessionList([], [saved])[0]?.taskState).toBe("completed");
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("fails closed when an oversized CLM boundary has a nested type before its root type", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "clm-list-nested-type-"));
+		try {
+			const manager = SessionManager.create(dir, join(dir, "sessions"));
+			const original = { role: "user" as const, content: "a".repeat(1_100_000), timestamp: 1 };
+			const id = manager.appendMessage(original);
+			manager.appendClmOn({ blocks: [{ id, message: original }] }, id);
+			manager.appendAgentStatus({ summary: "old", taskState: "completed", basedOnMessageCount: 1 });
+			manager.flushNow();
+			const path = manager.getSessionFile()!;
+			writeFileSync(
+				path,
+				readFileSync(path, "utf8").replace(
+					'{"type":"clm_on"',
+					'{"opaque":{"type":"custom_message"},"type":"clm_on"',
+				),
+			);
+			await readSessionInfo(path); // Warm the scanner before appending the restored view.
+			const reopened = SessionManager.open(path);
+			reopened.appendClmRevision(
+				{ blocks: [{ id, message: { ...original, content: "b".repeat(1_100_000) } }] },
+				id,
+				"restore:nested-header",
+			);
+			reopened.flushNow();
+			writeFileSync(
+				path,
+				readFileSync(path, "utf8").replace(
+					'{"type":"clm_revision"',
+					'{"opaque":{"type":"custom_message"},"type":"clm_revision"',
+				),
+			);
+			expect(SessionManager.open(path).getClmBranchState().revision).toBe(1);
+			const coldPath = join(dir, "cold.jsonl");
+			copyFileSync(path, coldPath);
+			for (const scanPath of [path, coldPath]) {
+				const saved = (await readSessionInfo(scanPath))!;
+				expect(saved.messageCount).toBe(1);
+				expect(saved.clmStatusCurrent).toBe(false);
+				expect(buildSessionList([], [saved])[0]?.taskState).toBeUndefined();
+			}
 		} finally {
 			rmSync(dir, { recursive: true, force: true });
 		}
