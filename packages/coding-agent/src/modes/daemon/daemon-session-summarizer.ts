@@ -341,113 +341,113 @@ export class DaemonSessionSummarizer {
 			return;
 		}
 		const session = state.runtime.session;
-		let messages = session.messages;
-		let usagePin: ClmUsagePin | undefined;
-		try {
-			if (session.sessionManager.getClmBranchState?.().mode === "on") {
-				const accepted = await session.getClmAcceptedViewWithUsagePin();
-				messages = accepted.view.messages;
-				usagePin = accepted.pin;
-			} else {
-				usagePin = session.sessionManager.captureClmUsagePin?.();
-			}
-		} catch {
-			return;
-		}
-		if (messages.length === 0) {
-			return;
-		}
-		const messageCount = messages.length;
-		const clmIdentity = usagePin?.mode === "on" ? this.acceptedStatusKey(usagePin) : undefined;
-		const isWorking = session.isSessionActive;
-		const previous = state.summaryState;
-		// Idle sessions with a current verdict need no refresh — except a
-		// transcript whose terminal turn errored (owesErrorVerdict below) —
-		// while working sessions always refresh so the recap keeps up with the
-		// in-progress turn.
-		const contentUnchanged =
-			previous?.basedOnMessageCount === messageCount &&
-			(clmIdentity === undefined || this.settledClmIdentity.get(id) === clmIdentity);
-		const owesIdleVerdict = !isWorking && previous?.taskState === undefined;
-		// A blank recap means the model call hasn't succeeded yet (e.g. the
-		// needs_input fallback fired on a transient failure); keep retrying until a
-		// real summary lands so the recap isn't left permanently empty.
-		const owesSummary = !isWorking && !previous?.summary;
-		// A turn that errored produced no final answer. Only a real final answer may
-		// earn a completed verdict, so skip the classifier entirely — it sees the
-		// task text with no evidence of the failure and would invent work — and
-		// settle the verdict from the transcript's actual last event instead.
-		// The pass below is synchronous, so no stale-state discard is needed.
-		const turnError = !isWorking ? terminalTurnError(messages) : undefined;
-		// A daemon restart seeds the latest persisted verdict, which pre-fix code
-		// may have fabricated as `completed` for a transcript whose terminal turn
-		// errored at this same message count. Only the error branch below repairs
-		// it, so exempt terminal errors from the unchanged-content fast return.
-		const owesErrorVerdict = turnError !== undefined && previous?.taskState !== "error";
-		if (contentUnchanged && !isWorking && !owesIdleVerdict && !owesSummary && !owesErrorVerdict) {
-			return;
-		}
-		if (turnError !== undefined) {
-			this.failedIdleGenerations.delete(id);
-			const status: AgentStatus = {
-				summary: turnError,
-				taskState: "error",
-				basedOnMessageCount: messageCount,
-			};
-			this.commitStatus(state, session, status, {
-				isWorking,
-				previous,
-				persist: true,
-				acceptedIdentity: clmIdentity,
-			});
-			if (clmIdentity) this.settledClmIdentity.set(id, clmIdentity);
-			return;
-		}
-		// Usage and status entries move the leaf without changing the model-visible content.
-		const branch = session.sessionManager.getBranch?.();
-		let contentTip: string | undefined;
-		if (branch) {
-			for (let index = branch.length - 1; index >= 0; index--) {
-				const entry = branch[index]!;
-				if (
-					[
-						"message",
-						"custom_message",
-						"branch_summary",
-						"compaction",
-						"clm_on",
-						"clm_revision",
-						"clm_off_boundary",
-					].includes(entry.type)
-				) {
-					contentTip = entry.id;
-					break;
-				}
-			}
-		}
-		contentTip ??= session.sessionManager.getLeafId() ?? "root";
-		const contentKey = `${clmIdentity ?? ""}:${contentTip}:${messageCount}`;
-		const failed = this.failedIdleGenerations.get(id);
-		if (
-			!isWorking &&
-			failed?.contentKey === contentKey &&
-			failed.attempts >= IDLE_GENERATION_ATTEMPT_LIMIT &&
-			Date.now() - failed.lastFailureAt < IDLE_GENERATION_RETRY_BACKOFF_MS
-		) {
-			return;
-		}
-		// Include the in-progress message so a long streaming turn gets a live recap.
-		const streaming = isWorking ? session.state.streamingMessage : undefined;
-		const contextMessages = streaming ? [...messages, streaming] : messages;
-
 		if (this.inFlight.size >= MAX_CONCURRENT_SUMMARY_GENERATIONS) {
 			this.waitingForSlot.set(id, state);
 			return;
 		}
-
 		const controller = new AbortController();
 		this.inFlight.set(id, controller);
+		this.waitingForSlot.delete(id);
 		try {
+			let messages = session.messages;
+			let usagePin: ClmUsagePin | undefined;
+			try {
+				if (session.sessionManager.getClmBranchState?.().mode === "on") {
+					const accepted = await session.getClmAcceptedViewWithUsagePin();
+					messages = accepted.view.messages;
+					usagePin = accepted.pin;
+				} else {
+					usagePin = session.sessionManager.captureClmUsagePin?.();
+				}
+			} catch {
+				return;
+			}
+			if (controller.signal.aborted || state.runtime.session !== session) return;
+			if (messages.length === 0) {
+				return;
+			}
+			const messageCount = messages.length;
+			const clmIdentity = usagePin?.mode === "on" ? this.acceptedStatusKey(usagePin) : undefined;
+			const isWorking = session.isSessionActive;
+			const previous = state.summaryState;
+			// Idle sessions with a current verdict need no refresh — except a
+			// transcript whose terminal turn errored (owesErrorVerdict below) —
+			// while working sessions always refresh so the recap keeps up with the
+			// in-progress turn.
+			const contentUnchanged =
+				previous?.basedOnMessageCount === messageCount &&
+				(clmIdentity === undefined || this.settledClmIdentity.get(id) === clmIdentity);
+			const owesIdleVerdict = !isWorking && previous?.taskState === undefined;
+			// A blank recap means the model call hasn't succeeded yet (e.g. the
+			// needs_input fallback fired on a transient failure); keep retrying until a
+			// real summary lands so the recap isn't left permanently empty.
+			const owesSummary = !isWorking && !previous?.summary;
+			// A turn that errored produced no final answer. Only a real final answer may
+			// earn a completed verdict, so skip the classifier entirely — it sees the
+			// task text with no evidence of the failure and would invent work — and
+			// settle the verdict from the transcript's actual last event instead.
+			// The pass below is synchronous, so no stale-state discard is needed.
+			const turnError = !isWorking ? terminalTurnError(messages) : undefined;
+			// A daemon restart seeds the latest persisted verdict, which pre-fix code
+			// may have fabricated as `completed` for a transcript whose terminal turn
+			// errored at this same message count. Only the error branch below repairs
+			// it, so exempt terminal errors from the unchanged-content fast return.
+			const owesErrorVerdict = turnError !== undefined && previous?.taskState !== "error";
+			if (contentUnchanged && !isWorking && !owesIdleVerdict && !owesSummary && !owesErrorVerdict) {
+				return;
+			}
+			if (turnError !== undefined) {
+				this.failedIdleGenerations.delete(id);
+				const status: AgentStatus = {
+					summary: turnError,
+					taskState: "error",
+					basedOnMessageCount: messageCount,
+				};
+				this.commitStatus(state, session, status, {
+					isWorking,
+					previous,
+					persist: true,
+					acceptedIdentity: clmIdentity,
+				});
+				if (clmIdentity) this.settledClmIdentity.set(id, clmIdentity);
+				return;
+			}
+			// Usage and status entries move the leaf without changing the model-visible content.
+			const branch = session.sessionManager.getBranch?.();
+			let contentTip: string | undefined;
+			if (branch) {
+				for (let index = branch.length - 1; index >= 0; index--) {
+					const entry = branch[index]!;
+					if (
+						[
+							"message",
+							"custom_message",
+							"branch_summary",
+							"compaction",
+							"clm_on",
+							"clm_revision",
+							"clm_off_boundary",
+						].includes(entry.type)
+					) {
+						contentTip = entry.id;
+						break;
+					}
+				}
+			}
+			contentTip ??= session.sessionManager.getLeafId() ?? "root";
+			const contentKey = `${clmIdentity ?? ""}:${contentTip}:${messageCount}`;
+			const failed = this.failedIdleGenerations.get(id);
+			if (
+				!isWorking &&
+				failed?.contentKey === contentKey &&
+				failed.attempts >= IDLE_GENERATION_ATTEMPT_LIMIT &&
+				Date.now() - failed.lastFailureAt < IDLE_GENERATION_RETRY_BACKOFF_MS
+			) {
+				return;
+			}
+			// Include the in-progress message so a long streaming turn gets a live recap.
+			const streaming = isWorking ? session.state.streamingMessage : undefined;
+			const contextMessages = streaming ? [...messages, streaming] : messages;
 			const generated = await this.generate({
 				registry: session.modelRegistry,
 				messages: contextMessages,
@@ -463,6 +463,7 @@ export class DaemonSessionSummarizer {
 						}
 					: {}),
 			});
+			if (controller.signal.aborted || state.runtime.session !== session) return;
 			if (generated) {
 				this.failedIdleGenerations.delete(id);
 			} else if (!isWorking && !controller.signal.aborted) {
@@ -516,11 +517,13 @@ export class DaemonSessionSummarizer {
 			);
 			if (clmIdentity) this.settledClmIdentity.set(id, clmIdentity);
 		} finally {
-			this.inFlight.delete(id);
-			this.admitNextWaitingSession();
-			// Re-debounce a request that arrived mid-pass instead of dropping it.
-			if (this.rerunRequested.delete(id)) {
-				this.notifyActivity(state);
+			if (this.inFlight.get(id) === controller) {
+				this.inFlight.delete(id);
+				this.admitNextWaitingSession();
+				// Re-debounce a request that arrived mid-pass instead of dropping it.
+				if (this.rerunRequested.delete(id) && !controller.signal.aborted && state.runtime.session === session) {
+					this.notifyActivity(state);
+				}
 			}
 		}
 	}
@@ -530,8 +533,8 @@ export class DaemonSessionSummarizer {
 	}
 
 	/**
-	 * Admit the most recently active waiters while slots are free. summarize() claims its slot before
-	 * its first await, so a waiter that returns early without one leaves inFlight unchanged.
+	 * Admit the most recently active waiters while slots are free. Each pass reserves a slot before
+	 * reading accepted context and releases its own reservation even when it returns early.
 	 */
 	private admitNextWaitingSession(): void {
 		while (this.inFlight.size < MAX_CONCURRENT_SUMMARY_GENERATIONS && this.waitingForSlot.size > 0) {

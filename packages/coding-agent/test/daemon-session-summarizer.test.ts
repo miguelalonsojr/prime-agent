@@ -614,6 +614,109 @@ describe("daemon session summarizer", () => {
 			expect(internal.failedIdleGenerations.size).toBe(0);
 		});
 
+		test.each([1, 4])("reserves CLM reads across sweep/activity for a fleet of %s", async (count) => {
+			vi.useFakeTimers();
+			const [viewGate, firstReadGate, generationGate] = [createDeferred(), createDeferred(), createDeferred()];
+			const calls: GenerateAgentStatusParams[] = [];
+			const persisted: AgentStatus[] = [];
+			const states = Array.from({ length: count }, (_, index) => {
+				const messages = [userMessage(`task-${index}`)];
+				let reads = 0;
+				return makeState({
+					activeSessionId: `s${index}`,
+					messages,
+					isSessionActive: false,
+					clmView: async () => {
+						const first = index === count - 1 && reads++ === 0;
+						await viewGate.promise;
+						if (first) await firstReadGate.promise;
+						return { view: { messages }, pin: { mode: "on", branchId: "entry", epochId: "epoch", revision: 0 } };
+					},
+					appendAgentStatus: (status) => persisted.push(status),
+				});
+			});
+			const summarizer = new DaemonSessionSummarizer(
+				() => states,
+				undefined,
+				async (params) => {
+					calls.push(params);
+					await generationGate.promise;
+					return { summary: `done-${calls.indexOf(params)}`, taskState: "completed" };
+				},
+			);
+			try {
+				summarizer.start();
+				await vi.advanceTimersByTimeAsync(25_000);
+				summarizer.notifyActivity(states[0]!);
+				await vi.advanceTimersByTimeAsync(2_000);
+				viewGate.resolve();
+				await vi.advanceTimersByTimeAsync(0);
+				firstReadGate.resolve();
+				await vi.advanceTimersByTimeAsync(0);
+				expect(calls).toHaveLength(Math.min(count, 4));
+				expect(new Set(calls.map((call) => call.messages)).size).toBe(calls.length);
+				generationGate.resolve();
+				await vi.advanceTimersByTimeAsync(2_000);
+				expect(calls).toHaveLength(count);
+				expect(persisted).toHaveLength(count);
+			} finally {
+				summarizer.stop();
+				viewGate.resolve();
+				firstReadGate.resolve();
+				generationGate.resolve();
+				await vi.advanceTimersByTimeAsync(0);
+				vi.useRealTimers();
+			}
+		});
+
+		test.each(["forget", "stop", "replace"] as const)(
+			"%s during an accepted read prevents generation and status writes",
+			async (action) => {
+				vi.useFakeTimers();
+				const gate = createDeferred();
+				const messages = [userMessage("task")];
+				const persisted: AgentStatus[] = [];
+				let generations = 0;
+				const state = makeState({
+					messages,
+					isSessionActive: false,
+					clmView: async () => {
+						await gate.promise;
+						return { view: { messages }, pin: { mode: "on", branchId: "entry", epochId: "epoch", revision: 0 } };
+					},
+					appendAgentStatus: (status) => persisted.push(status),
+				});
+				const summarizer = new DaemonSessionSummarizer(
+					() => [state],
+					undefined,
+					async () => {
+						generations++;
+						return { summary: "stale", taskState: "completed" };
+					},
+				);
+				try {
+					summarizer.start();
+					await vi.advanceTimersByTimeAsync(25_000);
+					if (action === "forget") summarizer.forget(state.activeSessionId);
+					else if (action === "stop") summarizer.stop();
+					else
+						Object.assign(state.runtime, {
+							session: makeState({ messages, isSessionActive: false }).runtime.session,
+						});
+					gate.resolve();
+					await vi.advanceTimersByTimeAsync(0);
+					expect(generations).toBe(0);
+					expect(persisted).toHaveLength(0);
+					expect(state.summaryState).toBeUndefined();
+				} finally {
+					summarizer.stop();
+					gate.resolve();
+					await vi.advanceTimersByTimeAsync(0);
+					vi.useRealTimers();
+				}
+			},
+		);
+
 		test("caps concurrent generations and admits the most recently active waiter first", async () => {
 			const pendingGates: Array<() => void> = [];
 			const generate = vi.fn((_params: GenerateAgentStatusParams) =>
