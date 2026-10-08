@@ -47,6 +47,7 @@ import {
 	visibleWidth,
 } from "@earendil-works/pi-tui";
 import { spawnSync } from "child_process";
+import stripAnsi from "strip-ansi";
 import {
 	buildDaemonUpdateRestartReport,
 	launchDaemonUpdateRestartCoordinator,
@@ -12131,7 +12132,7 @@ export class InteractiveMode {
 			let status: ClmStatus;
 			if (restore) {
 				const revision = Number(restore[2]);
-				if (!Number.isSafeInteger(revision) || revision < 1) {
+				if (!Number.isSafeInteger(revision) || revision < 0) {
 					this.showError("Usage: /clm restore <epoch:revision>");
 					return;
 				}
@@ -12166,7 +12167,9 @@ export class InteractiveMode {
 
 	private showClmText(text: string): void {
 		this.chatContainer.addChild(new Spacer(1));
-		this.chatContainer.addChild(new Text(text, 1, 0));
+		// Accepted model text is untrusted. Remove terminal controls before Text renders it.
+		const safeText = stripAnsi(text).replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, "");
+		this.chatContainer.addChild(new Text(safeText, 1, 0));
 		this.ui.requestRender();
 	}
 

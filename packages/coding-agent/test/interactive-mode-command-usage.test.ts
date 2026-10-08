@@ -165,13 +165,29 @@ describe("CLM interactive commands", () => {
 		expect(calls.join("\n")).toContain("user: accepted text");
 		expect(calls.join("\n")).not.toContain("deleted audit and pending bytes");
 	});
-	it("validates restore before connection and keeps malformed commands out of chat", async () => {
-		const { submit, connection, context } = setup();
-		await submit("/clm restore bad");
-		expect(context.showError).toHaveBeenCalledWith(expect.stringContaining("Usage: /clm"));
+	it("renders accepted terminal controls as inert text while keeping newlines", async () => {
+		const { submit, connection, calls } = setup();
+		connection.getClmModelSnapshot.mockResolvedValueOnce({
+			epochId: "epoch",
+			revision: 2,
+			messages: [{ role: "user", content: "top\n\x1b[2J\x1b[H\x1b]52;c;YQ==\x07bottom\x9b2J" }],
+		});
+		await submit("/clm view");
+		const rendered = calls.join("\n");
+		expect(rendered).toMatch(/user: top[^\n]*\n/);
+		expect(rendered).toContain("bottom");
+		expect(rendered).not.toMatch(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/);
+	});
+	it("accepts revision zero and rejects invalid restore targets before the adapter", async () => {
+		const { submit, connection, context, calls } = setup();
+		for (const target of ["bad", "epoch:-1", "epoch:9007199254740992"]) {
+			await submit(`/clm restore ${target}`);
+			expect(context.showError).toHaveBeenCalledWith(expect.stringContaining("Usage: /clm"));
+		}
 		expect(connection.restoreClmRevision).not.toHaveBeenCalled();
-		await submit("/clm restore epoch:2");
-		expect(connection.restoreClmRevision).toHaveBeenCalledWith("epoch", 2);
+		await submit("/clm restore epoch:0");
+		expect(connection.restoreClmRevision).toHaveBeenCalledWith("epoch", 0);
+		expect(calls.join("\n")).toContain("Accepted revision: epoch:2");
 		expect(connection.prompt).not.toHaveBeenCalled();
 	});
 	it("keeps old-daemon errors local and the audit report usable", async () => {
