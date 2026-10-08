@@ -63,7 +63,7 @@ runtime keeps serving. Closing stdin is equivalent to `shutdown`.
   `ValueError` in the calling cell. `id` rides task
   context: an asyncio task spawned by a cell keeps that cell's id even after
   the cell finishes; user threads emit `null`.
-- `{"event":"host_request","id":str,"data":{...}}` — one typed request from
+- `{"event":"host_request","id":str,"cell_id":str|null,"data":{...}}` — one typed request from
   runtime code to the host; the host answers with a `host_reply` request
   carrying the same id. `data` is subject to the same encoding cap as a
   `display` payload: `host_request()` raises `ValueError` in the calling cell
@@ -142,7 +142,22 @@ strings; the dict is forwarded verbatim as the event's `data`.
 
 `await rlm.repl.host_request(data)` ships a `host_request` event with a
 runtime-minted id and awaits the matching `host_reply`, returning its `data`
-dict verbatim. Replies are routed on the reader thread like `interrupt` —
+dict verbatim. The optional top-level `cell_id` comes from the runtime's
+`_current_cell` ContextVar, not from `data` or spawn kwargs. Detached asyncio
+tasks retain their creating cell's ID; requests without a cell carry null.
+The host grants active-tool ownership only when this ID matches its live,
+non-cancelled execute request bound to an ipython tool call. Old, missing,
+internal, and completed origins cannot borrow the current tool's CLM writer.
+The verified tool ID is captured before handler awaits and passed separately
+from payload data. Healthy idle and non-CLM admissions remain available.
+
+This optional protocol-3 event field is backward-compatible: older hosts
+ignore it; newer hosts treat its absence as unverified origin and reject
+active-writer CLM admission. No daemon wire field or protocol version changes.
+This prevents ordinary payload forgery and detached-task misattribution, not
+Python code modifying private runtime internals or writing raw protocol frames.
+
+Replies are routed on the reader thread like `interrupt` —
 never through the request queue, since the awaiting cell is itself the
 in-flight execute. Replies for unknown ids, or for a request whose awaiting
 cell was cancelled, are dropped. `rlm.repl.is_active()` reports whether the

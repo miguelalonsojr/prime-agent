@@ -1,5 +1,6 @@
 import { writeFileSync } from "node:fs";
 import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
+import { Type } from "typebox";
 import { describe, expect, it, vi } from "vitest";
 import { createHarness } from "./harness.js";
 import { createDeferred } from "./scheduling.js";
@@ -73,6 +74,158 @@ describe("subagent default model setting", () => {
 				resumed.cleanup();
 			}
 		} finally {
+			await h.session.disposeAsync();
+			h.cleanup();
+		}
+	});
+
+	it("rejects public child admission while an unrelated CLM tool owns the writer", async () => {
+		const started = createDeferred();
+		const release = createDeferred();
+		const h = await createHarness({
+			persistSession: true,
+			tools: [
+				{
+					name: "hold",
+					label: "hold",
+					description: "Hold the tool writer",
+					parameters: Type.Object({}),
+					execute: async () => {
+						started.resolve();
+						await release.promise;
+						return { content: [], details: {} };
+					},
+				},
+			],
+		});
+		let turn: Promise<void> | undefined;
+		try {
+			await h.session.setClmMode(true);
+			h.setResponses([
+				fauxAssistantMessage(fauxToolCall("hold", {}), { stopReason: "toolUse" }),
+				...Array.from({ length: 3 }, () => fauxAssistantMessage("done")),
+			]);
+			turn = h.session.prompt("hold the writer");
+			await started.promise;
+			await expect(h.session.runRlmChild("unrelated public call")).rejects.toThrow(/CLM/);
+			expect((await h.session.listRlmSubagents()).subagents).toEqual([]);
+			expect(h.faux.state.callCount).toBe(1);
+		} finally {
+			release.resolve();
+			await turn;
+			await h.session.disposeAsync();
+			h.cleanup();
+		}
+	});
+
+	it.each([
+		["detached", true],
+		["missing", true],
+		["missing", false],
+	] as const)("checks %s cell origin with CLM %s without blocking the current cell", async (kind, clm) => {
+		const h = await createHarness({ persistSession: true });
+		try {
+			if (clm) await h.session.setClmMode(true);
+			h.session.setActiveToolsByName(["ipython"]);
+			const setup = [
+				"import asyncio",
+				"from rlm import host_request",
+				"import rlm.repl as repl",
+				"gate = asyncio.Event()",
+				"async def old_spawn():",
+				"    await gate.wait()",
+				"    try:",
+				"        await host_request('rlm.run', {'prompt': 'old task', 'kwargs': {'name': 'old'}, 'cell_id': 'cell-b', 'toolCallId': 'cell-b', 'verifiedToolCallId': 'cell-b'})",
+				"        return 'admitted'",
+				"    except RuntimeError as error:",
+				"        return str(error)",
+				...(kind === "detached" ? ["old_task = asyncio.create_task(old_spawn())"] : []),
+			].join("\n");
+			const run = [
+				"gate.set()",
+				...(kind === "missing"
+					? [
+							"original_send = repl._send",
+							"def missing_origin(event):",
+							"    event.pop('cell_id', None)",
+							"    original_send(event)",
+							"repl._send = missing_origin",
+							"try:",
+							"    old_result = await old_spawn()",
+							"finally:",
+							"    repl._send = original_send",
+						]
+					: ["old_result = await old_task"]),
+				"print('old_result=' + old_result)",
+				"child = await rlm.spawn('current task', name='current')",
+			].join("\n");
+			h.setResponses([
+				fauxAssistantMessage(fauxToolCall("ipython", { code: setup }), { stopReason: "toolUse" }),
+				fauxAssistantMessage(fauxToolCall("ipython", { code: run }), { stopReason: "toolUse" }),
+				...Array.from({ length: 4 }, () => fauxAssistantMessage("done")),
+			]);
+			await h.session.prompt("check cell origin");
+			const collected = await h.session.collectRlmChildren([], 10_000);
+			expect(collected.results.map((child) => child.session_name).sort()).toEqual(
+				clm ? ["current"] : ["current", "old"],
+			);
+			expect(collected.results[0].status).toBe("done");
+			expect(JSON.stringify(h.sessionManager.getEntries())).toContain(
+				clm ? "old_result=CLM" : "old_result=admitted",
+			);
+		} finally {
+			await h.session.disposeAsync();
+			h.cleanup();
+		}
+	});
+
+	it("does not reassign an authenticated request to a later ipython writer", async () => {
+		const h = await createHarness({ persistSession: true });
+		const started = createDeferred();
+		const release = createDeferred();
+		const auth = h.session.modelRegistry.getApiKeyAndHeaders.bind(h.session.modelRegistry);
+		const held = vi.spyOn(h.session.modelRegistry, "getApiKeyAndHeaders").mockImplementationOnce(async (model) => {
+			started.resolve();
+			await release.promise;
+			return auth(model);
+		});
+		const unsubscribe = h.session.subscribe((event) => {
+			if (event.type === "tool_execution_update" && JSON.stringify(event.partialResult).includes("origin-switched"))
+				release.resolve();
+		});
+		try {
+			await h.session.setClmMode(true);
+			h.session.setActiveToolsByName(["ipython"]);
+			const selector = `${h.getModel().provider}/${h.getModel().id}`;
+			const code = [
+				"import asyncio",
+				"started = asyncio.Event()",
+				"async def delayed():",
+				"    started.set()",
+				`    return await rlm.spawn('delayed task', name='delayed', model=${JSON.stringify(selector)})`,
+				"pending = asyncio.create_task(delayed())",
+				"await started.wait()",
+			].join("\n");
+			h.setResponses([
+				fauxAssistantMessage(fauxToolCall("ipython", { code }), { stopReason: "toolUse" }),
+				async () => {
+					await started.promise;
+					return fauxAssistantMessage(
+						fauxToolCall("ipython", {
+							code: "print('origin-switched', flush=True)\ntry:\n    await pending\nexcept RuntimeError as error:\n    print('delayed-rejected=' + str(error))",
+						}),
+						{ stopReason: "toolUse" },
+					);
+				},
+				...Array.from({ length: 3 }, () => fauxAssistantMessage("done")),
+			]);
+			await h.session.prompt("switch writers during auth");
+			expect((await h.session.listRlmSubagents()).subagents).toEqual([]);
+			expect(JSON.stringify(h.sessionManager.getEntries())).toContain("delayed-rejected=CLM");
+		} finally {
+			release.resolve();
+			held.mockRestore();
+			unsubscribe();
 			await h.session.disposeAsync();
 			h.cleanup();
 		}

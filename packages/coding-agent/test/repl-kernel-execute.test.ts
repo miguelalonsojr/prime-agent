@@ -202,3 +202,58 @@ describeIf("ReplKernelManager execute (real runtime)", () => {
 		expect(second.backgroundOutput ?? "").toContain("SECRET-thread");
 	}, 30_000);
 });
+
+it("binds host origin only to the live tool, not detached or spoofed payloads", async () => {
+	if (!python) throw new Error("Real kernel origin test requires an existing Python runtime with rlm.repl and dill");
+	const dir = mkdtempSync(join(tmpdir(), "prime-agent-repl-origin-"));
+	const owners: Array<string | undefined> = [];
+	const cancel = new AbortController();
+	const manager = new ReplKernelManager({
+		python: python as string,
+		cwd: dir,
+		hostHandlers: {
+			"test.origin": async (_payload, toolCallId?: string) => {
+				owners.push(toolCallId);
+				return {};
+			},
+			"test.cancel": async () => {
+				cancel.abort();
+				return {};
+			},
+		},
+	});
+	try {
+		const a = { maxOutputChars: 4096, toolCallId: "tool-a" };
+		const b = { maxOutputChars: 4096, toolCallId: "tool-b" };
+		const first = await manager.execute(
+			[
+				"import asyncio, rlm",
+				"gate = asyncio.Event()",
+				"async def detached():",
+				"    await gate.wait()",
+				"    await rlm.host_request('test.origin', {'toolCallId': 'tool-b', 'cell_id': 'spoof'})",
+				"task = asyncio.create_task(detached())",
+			].join("\n"),
+			a,
+		);
+		expect(first.status).toBe("ok");
+		const second = await manager.execute(
+			"gate.set()\nawait task\nawait rlm.host_request('test.origin', {'toolCallId': 'spoof'})",
+			b,
+		);
+		expect(second.status).toBe("ok");
+		expect(owners).toEqual([undefined, "tool-b"]);
+		const internal = await manager.execute("await rlm.host_request('test.origin')", { ...b, internal: true });
+		expect(internal.status).toBe("ok");
+		expect(owners).toEqual([undefined, "tool-b", undefined]);
+		const cancelled = await manager.execute(
+			"try:\n    await rlm.host_request('test.cancel')\nexcept BaseException:\n    await rlm.host_request('test.origin')",
+			{ ...b, signal: cancel.signal },
+		);
+		expect(cancelled.status).toBe("aborted");
+		expect(owners).toEqual([undefined, "tool-b", undefined, undefined]);
+	} finally {
+		await manager.shutdown({ drainHostRequests: true });
+		rmSync(dir, { recursive: true, force: true });
+	}
+});

@@ -11492,8 +11492,8 @@ export class AgentSession {
 
 	private _createKernelHostHandlers(): HostRequestHandlers {
 		const handlers: HostRequestHandlers = {
-			"rlm.run": createRlmRunHostHandler(async ({ prompt, kwargs, cellSourceCode }) => ({
-				...(await this.runRlmChild(prompt, kwargs, cellSourceCode)),
+			"rlm.run": createRlmRunHostHandler(async ({ prompt, kwargs, cellSourceCode }, verifiedToolCallId) => ({
+				...(await this._startRlmChildRun(prompt, kwargs, cellSourceCode, verifiedToolCallId)),
 			})),
 			"rlm.create_session": createRlmCreateSessionHostHandler(async ({ prompt, kwargs }) => ({
 				...(await this.createRlmSession(prompt, kwargs)),
@@ -11775,9 +11775,9 @@ export class AgentSession {
 			.find((entry): entry is SessionMessageEntry => entry.type === "message" && entry.message === message);
 	}
 
-	private _assertRlmChildAdmissionAvailable(): void {
+	private _assertRlmChildAdmissionAvailable(verifiedToolCallId?: string): void {
 		this.assertModelContextAvailable();
-		if (this._clmController) this._clmController.assertChildAdmissionAvailable(this._clmToolFence?.id);
+		if (this._clmController) this._clmController.assertChildAdmissionAvailable(verifiedToolCallId);
 		else LiveContextController.assertWriterSettled(this.sessionManager);
 	}
 
@@ -13168,11 +13168,12 @@ export class AgentSession {
 		prompt: string,
 		kwargs: Record<string, unknown> = {},
 		spawnCode?: string,
+		verifiedToolCallId?: string,
 	): Promise<RlmSpawnHandle> {
 		// Snapshot before any await: the spawning request is the turn whose tool call is
 		// executing now. A spawn arriving outside an active run (a detached kernel task
 		// firing while the parent is idle) has no such turn; an absent edge beats a wrong one.
-		this._assertRlmChildAdmissionAvailable();
+		this._assertRlmChildAdmissionAvailable(verifiedToolCallId);
 		const inheritedClmMode = this.sessionManager.getClmBranchState().mode === "on";
 		const spawnedByRequestId = this.isStreaming ? this._semanticEdges.lastTurnRequestId : undefined;
 		const { name: rawName, model: rawModel, thinking: rawThinking, ...unsupported } = kwargs;
@@ -13222,7 +13223,7 @@ export class AgentSession {
 			if (this._disposed || this._disposing) {
 				throw new Error("Cannot spawn a subagent after its parent was disposed");
 			}
-			this._assertRlmChildAdmissionAvailable();
+			this._assertRlmChildAdmissionAvailable(verifiedToolCallId);
 			childSessionDir = this._createChildRlmSessionDir();
 		} catch (error) {
 			releaseReservedSessionName();
@@ -13232,7 +13233,7 @@ export class AgentSession {
 		const sessionName = requestedSessionName ?? createDefaultRlmSubagentSessionName(prompt, childNodeId);
 		try {
 			if (!requestedSessionName) await this._assertRlmSubagentSessionNameAvailable(sessionName);
-			this._assertRlmChildAdmissionAvailable();
+			this._assertRlmChildAdmissionAvailable(verifiedToolCallId);
 		} catch (error) {
 			releaseReservedSessionName();
 			throw error;

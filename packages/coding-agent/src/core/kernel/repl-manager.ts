@@ -888,7 +888,7 @@ export class ReplKernelManager {
 			return;
 		}
 		if (type === "host_request") {
-			if (typeof event.id === "string") this.startHostRequest(event.id, event.data);
+			if (typeof event.id === "string") this.startHostRequest(event.id, event.data, event.cell_id);
 			return;
 		}
 
@@ -1336,7 +1336,7 @@ export class ReplKernelManager {
 		}
 	}
 
-	private startHostRequest(requestId: string, data: unknown): void {
+	private startHostRequest(requestId: string, data: unknown, cellId: unknown): void {
 		if (this.handledHostRequestIds.has(requestId)) {
 			return;
 		}
@@ -1347,9 +1347,19 @@ export class ReplKernelManager {
 			this.handledHostRequestIds.delete(oldest);
 		}
 
+		const execution = this.activeExecution;
+		const verifiedToolCallId =
+			execution &&
+			cellId === execution.requestId &&
+			!execution.settled &&
+			!execution.opts.internal &&
+			!execution.opts.signal?.aborted &&
+			execution.status === "ok"
+				? execution.opts.toolCallId
+				: undefined;
 		const task = (async () => {
 			try {
-				const result = await this.handleHostRequest(data);
+				const result = await this.handleHostRequest(data, verifiedToolCallId);
 				try {
 					await this.writeLine({ type: "host_reply", id: requestId, data: { status: "ok", result } });
 				} catch (replyError) {
@@ -1378,7 +1388,7 @@ export class ReplKernelManager {
 		});
 	}
 
-	private async handleHostRequest(data: unknown): Promise<Record<string, unknown>> {
+	private async handleHostRequest(data: unknown, verifiedToolCallId?: string): Promise<Record<string, unknown>> {
 		if (!isRecord(data)) {
 			throw new Error("host request payload must be an object");
 		}
@@ -1394,7 +1404,7 @@ export class ReplKernelManager {
 		// the in-flight execution; detached spawns (asyncio.create_task) fire after
 		// the scheduling cell goes idle, so fall back to that last cell's source.
 		const cellSourceCode = capCellSourceCode(this.activeExecution?.code ?? this.lastCellCode);
-		return handler({ ...data, cellSourceCode });
+		return handler({ ...data, cellSourceCode }, verifiedToolCallId);
 	}
 
 	private async interrupt(): Promise<void> {

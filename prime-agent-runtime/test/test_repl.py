@@ -1303,6 +1303,34 @@ class ReplTest(unittest.TestCase):
         self.assertNotIn(1, done["names"])
         self.assertEqual(done["names"], sorted(done["names"]))
 
+    def test_host_request_origin_stays_with_creating_cell_not_payload(self):
+        code = "\n".join([
+            "import asyncio",
+            "from rlm.repl import host_request",
+            "gate = asyncio.Event()",
+            "async def later():",
+            "    await gate.wait()",
+            "    await host_request({'type': 'demo', 'cell_id': 'cell-b'})",
+            "task = asyncio.create_task(later())",
+        ])
+        self.assertEqual(one(self.repl.execute("cell-a", code), "done")["status"], "ok")
+        self.repl.send({"type": "execute", "id": "cell-b", "code": "gate.set()\nawait task\nawait host_request({'type': 'demo', 'cell_id': 'fake'})"})
+        old = wait_for_host_request(self.repl, [])
+        self.assertEqual(old.get("cell_id"), "cell-a")
+        self.assertEqual(old["data"]["cell_id"], "cell-b")
+        reply_ok(self.repl, old)
+        current = wait_for_host_request(self.repl, [])
+        self.assertEqual(current.get("cell_id"), "cell-b")
+        self.assertNotEqual(current["id"], current["cell_id"])
+        reply_ok(self.repl, current)
+        self.assertEqual(one(self.repl.until_done("cell-b"), "done")["status"], "ok")
+        self.repl.send({"type": "execute", "id": "unowned", "code": "import contextvars\nawait asyncio.create_task(host_request({'type': 'demo'}), context=contextvars.Context())"})
+        unowned = wait_for_host_request(self.repl, [])
+        self.assertIn("cell_id", unowned)
+        self.assertIsNone(unowned["cell_id"])
+        reply_ok(self.repl, unowned)
+        self.assertEqual(one(self.repl.until_done("unowned"), "done")["status"], "ok")
+
     def test_host_request_round_trip(self):
         code = "\n".join(
             [

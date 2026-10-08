@@ -108,7 +108,7 @@ export interface RlmCollectResult {
 
 export type RlmCollectHandler = (targets: string[], timeoutMs: number) => Promise<RlmCollectResult>;
 
-export type RlmRunHandler = (request: RlmRunRequest) => Promise<Record<string, unknown>>;
+export type RlmRunHandler = (request: RlmRunRequest, verifiedToolCallId?: string) => Promise<Record<string, unknown>>;
 type RlmCreateSessionHandler = (request: RlmCreateSessionRequest) => Promise<RlmCreateSessionResult>;
 
 interface AsyncBashCompletionRequest {
@@ -298,17 +298,20 @@ export function createRlmCreateSessionHostHandler(handler: RlmCreateSessionHandl
 
 /** Adapt an RlmRunHandler into the typed `rlm.run` kernel host handler. */
 export function createRlmRunHostHandler(handler: RlmRunHandler): HostRequestHandler {
-	return async (payload) => {
+	return async (payload, verifiedToolCallId) => {
 		if (typeof payload.prompt !== "string") {
 			throw new Error("rlm.spawn prompt must be a string");
 		}
 		const kwargs = isRecord(payload.kwargs) ? payload.kwargs : {};
 		const cellSourceCode = typeof payload.cellSourceCode === "string" ? payload.cellSourceCode : undefined;
-		const result = await handler({
-			prompt: payload.prompt,
-			kwargs,
-			cellSourceCode,
-		});
+		const result = await handler(
+			{
+				prompt: payload.prompt,
+				kwargs,
+				cellSourceCode,
+			},
+			verifiedToolCallId,
+		);
 		return result as unknown as Record<string, unknown>;
 	};
 }

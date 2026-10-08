@@ -671,6 +671,7 @@ async function executeWithBusyKernelChoice(
 		try {
 			return {
 				result: await m.execute(code, {
+					toolCallId,
 					signal,
 					onStream,
 					onLateSentAgentMessage: onLateSentAgentMessage
