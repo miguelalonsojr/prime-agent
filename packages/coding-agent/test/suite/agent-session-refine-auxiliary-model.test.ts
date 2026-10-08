@@ -3,6 +3,7 @@ import type * as PiAi from "@earendil-works/pi-ai";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { userMsg } from "../utilities.js";
+import { createDeferred } from "./scheduling.js";
 
 const { completeSimpleMock, original } = vi.hoisted(() => ({
 	completeSimpleMock: vi.fn(),
@@ -70,6 +71,63 @@ describe("AgentSession refinement auxiliary model", () => {
 		harnesses.push(harness);
 		return harness;
 	}
+
+	it.each(["on", "off", "plain"])("lets %s refinement completion hooks read accepted context", async (mode) => {
+		const completed = createDeferred();
+		const release = createDeferred();
+		const order: string[] = [];
+		let observed = "";
+		let persisted = false;
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const h = await createHarness({
+			persistSession: true,
+			extensionFactories: [
+				(pi) => {
+					pi.on("refine_complete", async (event) => {
+						await Promise.race([
+							h.session.getAcceptedModelContextSnapshot().then((messages) => {
+								observed = JSON.stringify(messages);
+								persisted = JSON.stringify(h.sessionManager.getEntries()).includes(event.id);
+								order.push("extension");
+								completed.resolve();
+							}),
+							release.promise,
+						]);
+						throw new Error("completion listener failed after persistence");
+					});
+				},
+			],
+		});
+		const unsubscribe = h.session.subscribe((event) => {
+			if (event.type === "refine_complete") order.push("session");
+		});
+		let refinement: ReturnType<typeof h.session.refine> | undefined;
+		try {
+			await h.session.prompt("accepted hook context");
+			if (mode !== "plain") await h.session.setClmMode(true);
+			if (mode === "off") await h.session.setClmMode(false);
+			completeSimpleMock.mockImplementation(original.completeSimple);
+			h.setResponses([emptyProposalResponse()]);
+			refinement = h.session.refine();
+			const timeout = new Promise<boolean>((resolve) => {
+				// test-policy: allow wall-clock-timer -- Bounds a deadlocked completion hook; only the deferred snapshot can pass.
+				timer = setTimeout(() => resolve(false), 2000);
+			});
+			expect(await Promise.race([completed.promise.then(() => true), timeout])).toBe(true);
+			await refinement;
+			order.push("returned");
+			expect(observed).toContain("accepted hook context");
+			expect(persisted).toBe(true);
+			expect(order).toEqual(["session", "extension", "returned"]);
+		} finally {
+			clearTimeout(timer);
+			release.resolve();
+			await refinement;
+			unsubscribe();
+			await h.session.disposeAsync();
+			h.cleanup();
+		}
+	});
 
 	it.each(["manual", "automatic", "off", "marker", "apply-marker"])(
 		"pins accepted-only context for %s refinement",

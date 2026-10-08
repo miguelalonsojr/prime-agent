@@ -10526,6 +10526,7 @@ export class AgentSession {
 		const clmFence = this.sessionManager.getClmBranchState().epochId
 			? await this._acquireSessionActionCommitFence()
 			: undefined;
+		let result: RefinementResult;
 		// The caller has already set _refineInFlight and waited for agent idle.
 		// Disconnect only for the brief apply + save + reconnect critical section.
 		try {
@@ -10575,7 +10576,7 @@ export class AgentSession {
 			if (this._disposed || refineAbort.signal.aborted) {
 				throw new Error("Refinement cancelled because the session was disposed.");
 			}
-			const result = applyRefinementProposal(state, proposal, {
+			result = applyRefinementProposal(state, proposal, {
 				id: plan.id,
 				rollbackOf: plan.rollbackOf,
 				scope: targetScope,
@@ -10599,25 +10600,6 @@ export class AgentSession {
 			if (refinementAuditAppendError) throw refinementAuditAppendError.error;
 			// The prompt stays byte-identical so the provider prefix cache survives; the notice carries the change.
 			this._recordRefinementNotice(result, source);
-			try {
-				this._emit({ type: "refine_complete", result });
-			} catch {
-				// Listener failures must not flip a successful refinement into
-				// a reported failure — the refinement is already persisted.
-			}
-			try {
-				await this._extensionRunner.emit({
-					type: "refine_complete",
-					id: result.id,
-					summary: result.summary,
-					appliedEdits: result.appliedEdits.filter((edit) => edit.applied).length,
-					scope: result.scope ?? "local",
-				});
-			} catch {
-				// Extension emit failures must not flip a successful refinement
-				// into a reported failure — the refinement is already persisted.
-			}
-			return result;
 		} finally {
 			if (this._refineAbortController === refineAbort) {
 				this._refineAbortController = undefined;
@@ -10628,6 +10610,26 @@ export class AgentSession {
 				clmFence?.release();
 			}
 		}
+
+		try {
+			this._emit({ type: "refine_complete", result });
+		} catch {
+			// Listener failures must not flip a successful refinement into
+			// a reported failure — the refinement is already persisted.
+		}
+		try {
+			await this._extensionRunner.emit({
+				type: "refine_complete",
+				id: result.id,
+				summary: result.summary,
+				appliedEdits: result.appliedEdits.filter((edit) => edit.applied).length,
+				scope: result.scope ?? "local",
+			});
+		} catch {
+			// Extension emit failures must not flip a successful refinement
+			// into a reported failure — the refinement is already persisted.
+		}
+		return result;
 	}
 
 	abortBranchSummary(): void {
