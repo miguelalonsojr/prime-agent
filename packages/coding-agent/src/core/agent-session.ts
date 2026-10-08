@@ -2193,7 +2193,7 @@ export class AgentSession {
 			this._clmController = await LiveContextController.open(this.sessionManager, artifactDir);
 		}
 		const path = this._clmController.getClmStatus().path;
-		this._clmPrompt = `\n\nCLM working context: ${path}\nEdit this file only within one awaited tool action. Use an atomic save. Do not use detached or concurrent writers. Cancellation of bash, Python, custom, or detached writers cannot prove physical settlement and leaves CLM blocked. Preserve every CTX_PROTECTED reference. Invalid edits retain the accepted revision.`;
+		this._clmPrompt = `\n\nCLM working context: ${path}\nManage older, completed context proactively when large outputs, dead ends, or superseded notes consume useful space. Finish the current work unit before editing unless near the context limit. Batch stale spans into specific notes rather than repeatedly shortening small early sections; keep recent work you still need. Preserve decisions, exact commands and queries tried, ruled-out options with reasons not to retry them, facts marked VERIFIED or UNVERIFIED, and the NEXT action. Locate spans by existing CTX_TURN IDs or unique anchors instead of retyping the document.\nEdit this file only within one awaited tool action. Use an atomic save. Do not use detached or concurrent writers. Cancellation of bash, Python, custom, or detached writers cannot prove physical settlement and leaves CLM blocked. Preserve every CTX_PROTECTED reference. Invalid edits retain the accepted revision.`;
 		if (!this.agent.state.systemPrompt.includes(this._clmPrompt)) this.agent.state.systemPrompt += this._clmPrompt;
 		return this._clmController;
 	}

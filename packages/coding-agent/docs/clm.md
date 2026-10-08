@@ -10,7 +10,22 @@ Please shorten older context using the model tool and the CLM context.txt path i
 /clm off
 ```
 
-The model must save an edit through one awaited tool action. It must keep protected request references intact. `/clm status` identifies the accepted epoch, revision, working file, estimated occupancy, and any known measured usage. `/clm view` reads the accepted model context. Pending file changes are not accepted until the tool action settles and validation succeeds. `/clm restore <epoch:revision>` makes a new revision from an accepted revision on the selected branch in the current epoch. Restore does not erase audit entries. Turning CLM off freezes the accepted context as a self-contained boundary. A later `/clm on` starts a new epoch from the current normal context. If the saved CLM-off boundary exceeds 1 MiB, the inactive daemon session list may omit the recap and verdict, even after a later status update. The audit remains available, and a valid session can still be reopened.
+## Managing context
+
+While CLM is on, the model can edit older, completed messages without a separate compaction command. Let useful recent work stay intact. After a work unit, replace stale tool output, dead ends, or superseded notes with a specific summary; edit sooner if the context is near its budget. Batch related edits so an early change does not repeatedly force the unchanged later context to be read again. A shorter context alone does not prove lower billed cost.
+
+Keep the facts needed to finish the task: decisions and their evidence, exact commands or queries already tried, ruled-out approaches and why not to retry them, values marked VERIFIED or UNVERIFIED, and the next action. For example, replacement text inside an existing completed turn might be:
+
+```text
+VERIFIED: parser.ts:142 drops quoted commas; csv.reader handles them.
+TRIED: grep -n "split(',')" src/parser.ts
+RULED OUT: retrying string.split; it loses quoted fields. Do not retry.
+NEXT: change the parser and run the focused parser test.
+```
+
+Find the span by its existing `[[CTX_TURN id=... role=...]]` header or a unique anchor. Change the body or remove completed blocks, but do not invent IDs or alter any `[[CTX_PROTECTED id=...]]` reference. Keep needed image references and native tool groups intact; editing a tool group turns it into historical text. Save atomically in one awaited tool action, without a detached or concurrent writer. Do not copy the reference harness's numbered headers, free-edit accounting, or budget thresholds into this branch. See the [CLM paper](https://arxiv.org/abs/2609.37725) and [reference prompt](https://github.com/facebookresearch/context-language-models/blob/18dc11115f50f261233c5bba7937834491e307e8/clm/clm_harness/clm_agent/prompts.yaml) for the original approach.
+
+`/clm status` identifies the accepted epoch, revision, working file, estimated occupancy, and any known measured usage. `/clm view` reads the accepted model context. Pending file changes are not accepted until the tool action settles and validation succeeds. `/clm restore <epoch:revision>` makes a new revision from an accepted revision on the selected branch in the current epoch. Restore does not erase audit entries. Turning CLM off freezes the accepted context as a self-contained boundary. A later `/clm on` starts a new epoch from the current normal context. If the saved CLM-off boundary exceeds 1 MiB, the inactive daemon session list may omit the recap and verdict, even after a later status update. The audit remains available, and a valid session can still be reopened.
 
 CLM keeps original message entries in the session audit. Removed text can remain in audit, older revisions, external files, and provider records. CLM does not provide secure deletion. An invalid edit leaves the last accepted revision in place; a corrupt or unavailable accepted view blocks model requests rather than reverting to audit history. Host-owned failed-provider cleanup removes only the known failed assistant entry from accepted model context. It does not delete audit or create a billed-usage receipt without an observed provider result.
 
