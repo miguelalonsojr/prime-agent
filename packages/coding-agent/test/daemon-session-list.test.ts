@@ -303,36 +303,58 @@ describe("buildSessionList", () => {
 		}
 	});
 
-	it("hides the old verdict at an oversized CLM-off boundary and shows only a later fresh off verdict", async () => {
-		const dir = mkdtempSync(join(tmpdir(), "clm-list-large-off-"));
-		try {
-			const manager = SessionManager.create(dir, join(dir, "sessions"));
-			const user = { role: "user" as const, content: "x".repeat(1_100_000), timestamp: 1 };
-			const id = manager.appendMessage(user);
-			const snapshot = { blocks: [{ id, message: user }] };
-			manager.appendClmOn(snapshot, id);
-			manager.appendAgentStatus({ summary: "old on", taskState: "completed", basedOnMessageCount: 1 });
-			manager.appendClmOffBoundary(snapshot, id);
-			manager.flushNow();
-			const path = manager.getSessionFile()!;
-			const stale = (await readSessionInfo(path))!;
-			expect(buildSessionList([], [stale])[0]?.taskState).toBeUndefined();
-			manager.appendAgentStatus({ summary: "fresh off", taskState: "completed", basedOnMessageCount: 1 });
-			manager.flushNow();
-			const coldPath = join(dir, "cold.jsonl");
-			copyFileSync(path, coldPath);
-			expect(SessionManager.open(path).getClmBranchState().mode).toBe("off");
-			for (const scanPath of [path, coldPath]) {
-				const saved = (await readSessionInfo(scanPath))!;
-				expect(saved.messageCount).toBe(1);
-				expect(saved.agentStatus?.summary).toBe("fresh off");
-				expect(saved.clmStatusCurrent).toBeUndefined();
-				expect(buildSessionList([], [saved])[0]?.taskState).toBe("completed");
+	it.each(["current", "legacy"] as const)(
+		"keeps inactive status uncertain after a %s oversized CLM-off boundary",
+		async (format) => {
+			const dir = mkdtempSync(join(tmpdir(), "clm-list-large-off-"));
+			try {
+				const manager = SessionManager.create(dir, join(dir, "sessions"));
+				const user = { role: "user" as const, content: "x".repeat(1_100_000), timestamp: 1 };
+				const id = manager.appendMessage(user);
+				const snapshot = { blocks: [{ id, message: user }] };
+				manager.appendClmOn(snapshot, id);
+				manager.appendAgentStatus({ summary: "old on", taskState: "completed", basedOnMessageCount: 1 });
+				const offId = manager.appendClmOffBoundary(snapshot, id);
+				manager.flushNow();
+				const path = manager.getSessionFile()!;
+				if (format === "legacy") {
+					writeFileSync(
+						path,
+						readFileSync(path, "utf8").replace(
+							'{"type":"clm_off_boundary","modeSource":"session-override",',
+							'{"type":"clm_off_boundary",',
+						),
+					);
+				}
+				const stale = (await readSessionInfo(path))!;
+				expect(buildSessionList([], [stale])[0]?.summary).toBeUndefined();
+				expect(buildSessionList([], [stale])[0]?.taskState).toBeUndefined();
+				appendFileSync(
+					path,
+					`${JSON.stringify({
+						type: "agent_status",
+						id: "fresh-off-status",
+						parentId: offId,
+						timestamp: new Date().toISOString(),
+						status: { summary: "fresh off", taskState: "completed", basedOnMessageCount: 1 },
+					})}\n`,
+				);
+				const coldPath = join(dir, "cold.jsonl");
+				copyFileSync(path, coldPath);
+				expect(SessionManager.open(path).getClmBranchState().mode).toBe("off");
+				for (const scanPath of [path, coldPath]) {
+					const saved = (await readSessionInfo(scanPath))!;
+					expect(saved.messageCount).toBe(1);
+					expect(saved.agentStatus?.summary).toBe("fresh off");
+					expect(saved.clmStatusCurrent).toBe(false);
+					expect(buildSessionList([], [saved])[0]?.summary).toBeUndefined();
+					expect(buildSessionList([], [saved])[0]?.taskState).toBeUndefined();
+				}
+			} finally {
+				rmSync(dir, { recursive: true, force: true });
 			}
-		} finally {
-			rmSync(dir, { recursive: true, force: true });
-		}
-	});
+		},
+	);
 
 	it.each(["nested", "truncated", "missing fields"] as const)(
 		"keeps a %s oversized fake off boundary uncertain",
@@ -366,6 +388,57 @@ describe("buildSessionList", () => {
 				expect(saved.messageCount).toBe(1);
 				expect(saved.clmStatusCurrent).toBe(false);
 				expect(buildSessionList([], [saved])[0]?.taskState).toBeUndefined();
+			} finally {
+				rmSync(dir, { recursive: true, force: true });
+			}
+		},
+	);
+
+	it.each(["malformed body", "wrong parent"] as const)(
+		"does not advertise status after a %s oversized off boundary",
+		async (shape) => {
+			const dir = mkdtempSync(join(tmpdir(), "clm-list-invalid-large-off-"));
+			try {
+				const manager = SessionManager.create(dir, join(dir, "sessions"));
+				const user = { role: "user" as const, content: "x".repeat(1_100_000), timestamp: 1 };
+				const id = manager.appendMessage(user);
+				const snapshot = { blocks: [{ id, message: user }] };
+				manager.appendClmOn(snapshot, id);
+				manager.appendAgentStatus({ summary: "old", taskState: "completed", basedOnMessageCount: 1 });
+				const offId = manager.appendClmOffBoundary(snapshot, id);
+				manager.flushNow();
+				const path = manager.getSessionFile()!;
+				const file = readFileSync(path, "utf8");
+				writeFileSync(
+					path,
+					shape === "malformed body"
+						? file.replace(',"auditWatermark":', ',BROKEN"auditWatermark":')
+						: file.replace(
+								/("type":"clm_off_boundary","modeSource":"session-override","id":"[^"]+","parentId":")[^"]+/,
+								"$1missing-parent",
+							),
+				);
+				await readSessionInfo(path); // Warm the scan before the later status.
+				appendFileSync(
+					path,
+					`${JSON.stringify({
+						type: "agent_status",
+						id: "fresh-status",
+						parentId: offId,
+						timestamp: new Date().toISOString(),
+						status: { summary: "fresh", taskState: "completed", basedOnMessageCount: 1 },
+					})}\n`,
+				);
+				const coldPath = join(dir, "cold.jsonl");
+				copyFileSync(path, coldPath);
+				for (const scanPath of [path, coldPath]) {
+					const saved = (await readSessionInfo(scanPath))!;
+					expect(saved.messageCount).toBe(1);
+					expect(saved.agentStatus?.summary).toBe("fresh");
+					expect(saved.clmStatusCurrent).toBe(false);
+					expect(buildSessionList([], [saved])[0]?.taskState).toBeUndefined();
+				}
+				expect(() => SessionManager.open(path).getClmBranchState()).toThrow();
 			} finally {
 				rmSync(dir, { recursive: true, force: true });
 			}
