@@ -193,6 +193,30 @@ describe("session tree metadata", () => {
 	}
 
 	describe("CLM recovery", () => {
+		it("keeps revision IDs and transition source on the selected branch across reopen", () => {
+			const source = SessionManager.create(tempDir, tempDir);
+			const on = source.appendClmOn({ blocks: [] }, null, "inherited-child");
+			for (let index = 0; index < 12; index++) source.appendClmRevision({ blocks: [] }, null, "edit");
+			const reopened = SessionManager.open(source.getSessionFile()!);
+			expect(reopened.getClmModeMetadata().recentRevisions.map((item) => item.revision)).toEqual([
+				12, 11, 10, 9, 8, 7, 6, 5, 4, 3,
+			]);
+			reopened.branch(on);
+			expect(reopened.getClmModeMetadata()).toMatchObject({
+				modeSource: "inherited-child",
+				recentRevisions: [{ revision: 0 }],
+			});
+			reopened.appendClmOffBoundary({ blocks: [] }, null);
+			reopened.appendClmOn({ blocks: [] }, null);
+			expect(reopened.getClmModeMetadata()).toMatchObject({
+				modeSource: "session-override",
+				recentRevisions: [{ revision: 0 }],
+			});
+			const file = reopened.getSessionFile()!;
+			writeFileSync(file, readFileSync(file, "utf8").replace(/,"modeSource":"[^"]+"/g, ""));
+			expect(SessionManager.open(file).getClmModeMetadata().modeSource).toBe("unknown");
+		});
+
 		it.each(["branch", "fork"])("forks a frozen CLM boundary without source artifacts (%s)", (method) => {
 			const source = SessionManager.create(tempDir, join(tempDir, "sessions"));
 			const watermark = source.appendMessage({ role: "user", content: "obsolete", timestamp: 1 });

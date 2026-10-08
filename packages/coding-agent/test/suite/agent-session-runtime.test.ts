@@ -237,6 +237,7 @@ describe("AgentSessionRuntime characterization", () => {
 			expect(snapshot.sessionTree?.tree.length).toBeGreaterThan(0);
 			expect(snapshot.sessionContext).toBeUndefined();
 			expect(runtime.session.agent.state.messages).toEqual([]);
+			await expect(runtime.session.getClmAcceptedView()).rejects.toMatchObject({ name: "ClmRecoveryError" });
 			await expect(connection.getSessionContext()).rejects.toMatchObject({ name: "ClmRecoveryError" });
 			for (const request of [
 				() => connection.prompt("new request"),
@@ -281,6 +282,10 @@ describe("AgentSessionRuntime characterization", () => {
 			},
 		]);
 		await session.prompt("continue");
+		const view = await session.getClmAcceptedView();
+		expect(view).toMatchObject({ epochId: on.epochId, revision: 2 });
+		expect(JSON.stringify(view.messages)).not.toContain("obsolete");
+		expect(JSON.stringify(view.messages)).toContain("after off");
 		const reopened = await session.setClmMode(true);
 		expect(reopened.epochId).not.toBe(on.epochId);
 		expect(reopened.revision).toBe(0);
@@ -290,23 +295,55 @@ describe("AgentSessionRuntime characterization", () => {
 		await expect(session.restoreClmRevision(on.epochId!, 0)).rejects.toThrow(/CLM/);
 	});
 
+	it("reads accepted bytes without opening the mirror or admitting a provider request", async () => {
+		const h = await createHarness({ persistSession: true, settings: { clm: { enabled: true } } });
+		cleanups.push(h.cleanup);
+		const path = join(h.sessionManager.getSessionArtifactDir()!, "clm", "context.txt");
+		mkdirSync(join(path, ".."), { recursive: true });
+		writeFileSync(path, "pending external edit");
+		const view = await h.session.getClmAcceptedView();
+		expect(view).toMatchObject({ revision: 0, messages: [] });
+		expect(readFileSync(path, "utf8")).toBe("pending external edit");
+		expect(h.faux.state.callCount).toBe(0);
+		view.messages.push(userMsg("caller mutation"));
+		expect((await h.session.getClmAcceptedView()).messages).toEqual([]);
+		const { runtime } = await createRuntimeForTest(() => {});
+		await runtime.switchSession(runtime.session.sessionFile!);
+		const status = await runtime.session.getClmStatus();
+		expect([status.mode, status.modeSource, status.recentRevisions]).toEqual(["off", "unknown", []]);
+		await expect(runtime.session.getClmAcceptedView()).rejects.toThrow(/accepted boundary/);
+	});
+
 	it("uses defaults only for new sessions and persists explicit mode across reload and resume", async () => {
 		const h = await createHarness({ persistSession: true, settings: { clm: { enabled: true } } });
 		cleanups.push(h.cleanup);
-		expect(h.sessionManager.getClmBranchState().mode).toBe("on");
+		expect(await h.session.getClmStatus()).toMatchObject({
+			mode: "on",
+			modeSource: "configured-default",
+			configuredDefault: true,
+		});
+		expect((await h.session.setClmMode(true)).modeSource).toBe("configured-default");
 		h.settingsManager.applyOverrides({ clm: { enabled: false } });
 		await h.settingsManager.reload();
 		expect((await h.session.getClmStatus()).mode).toBe("on");
 		const path = h.session.sessionFile!;
 		await h.session.disposeAsync();
 		const { runtime, tempDir } = await createRuntimeForTest(() => {}, { sessionManager: SessionManager.open(path) });
-		expect((await runtime.session.getClmStatus()).mode).toBe("on");
+		expect(await runtime.session.getClmStatus()).toMatchObject({
+			mode: "on",
+			modeSource: "configured-default",
+			configuredDefault: false,
+		});
 		await runtime.session.setClmMode(false);
 		writeFileSync(join(tempDir, "settings.json"), JSON.stringify({ clm: { enabled: true } }));
 		await runtime.services.settingsManager.reload();
 		expect((await runtime.session.getClmStatus()).mode).toBe("off");
 		await runtime.switchSession(path);
-		expect((await runtime.session.getClmStatus()).mode).toBe("off");
+		expect(await runtime.session.getClmStatus()).toMatchObject({
+			mode: "off",
+			modeSource: "session-override",
+			configuredDefault: true,
+		});
 		await runtime.newSession();
 		expect((await runtime.session.getClmStatus()).mode).toBe("on");
 	});
@@ -321,7 +358,28 @@ describe("AgentSessionRuntime characterization", () => {
 			.getBranch()
 			.filter((e) => e.type === "message")
 			.at(-1)!.id;
-		await s.restoreClmRevision(on.epochId!, 0);
+		const [captured, release] = [createDeferred(), createDeferred()];
+		const read = LiveContextController.readAcceptedView;
+		const held = vi.spyOn(LiveContextController, "readAcceptedView").mockImplementationOnce(async (manager) => {
+			const view = await read(manager);
+			captured.resolve();
+			await release.promise;
+			return view;
+		});
+		const reading = s.getClmAcceptedView();
+		try {
+			await captured.promise;
+			const restoring = s.restoreClmRevision(on.epochId!, 0);
+			release.resolve();
+			const [view] = await Promise.all([reading, restoring]);
+			expect(view).toMatchObject({ epochId: on.epochId, revision: 0 });
+			expect(JSON.stringify(view.messages)).toContain("later");
+		} finally {
+			release.resolve();
+			await reading;
+			held.mockRestore();
+		}
+		expect((await s.getClmAcceptedView()).revision).toBe(1);
 		expect(s.sessionManager.getClmBranchState()).toMatchObject({ revision: 1, auditWatermark: watermark });
 		expect(JSON.stringify(s.buildSessionContext().messages)).not.toContain("later");
 		const ancestor = s.sessionManager.getLeafId()!;
@@ -525,6 +583,7 @@ describe("AgentSessionRuntime characterization", () => {
 				observedActionId: `failed-provider:${failed.id}`,
 			});
 			await expect(s.getClmStatus()).resolves.toMatchObject({ mode: "on", revision: 2 });
+			expect((await s.getClmAcceptedView()).revision).toBe(2);
 			await s.disposeAsync();
 			const resumed = await createHarness({ existingSessionFile: s.sessionFile!, models, settings });
 			cleanups.push(resumed.cleanup);
@@ -765,7 +824,11 @@ describe("AgentSessionRuntime characterization", () => {
 			await daemon.closeSession(child, "shutdown");
 			const resumed = await daemon.createRuntime({ type: "create", sessionPath: path });
 			expect(resumed.runtime.metadata.rehydratedCompleted).toBe(true);
-			expect(await resumed.runtime.session.getClmStatus()).toMatchObject({ mode: "on", epochId: status.epochId });
+			expect(await resumed.runtime.session.getClmStatus()).toMatchObject({
+				mode: "on",
+				epochId: status.epochId,
+				modeSource: "inherited-child",
+			});
 		} finally {
 			for (const state of [...daemon.sessions.values()].reverse()) await daemon.closeSession(state, "shutdown");
 		}
@@ -778,7 +841,7 @@ describe("AgentSessionRuntime characterization", () => {
 		const spawned = await runtime.session.runRlmChild("runtime child task");
 		await runtime.session.collectRlmChildren([spawned.rlm_child_id], 10_000);
 		const child = runtime.listSubagentRuntimes()[0].session;
-		expect(await child.getClmStatus()).toMatchObject({ mode: "on" });
+		expect(await child.getClmStatus()).toMatchObject({ mode: "on", modeSource: "inherited-child" });
 		expect((await child.getClmStatus()).path).not.toBe(parent.path);
 		expect(JSON.stringify(child.sessionManager.buildSessionContext().messages)).toContain("runtime child task");
 		await runtime.session.waitForSessionInputIdle();

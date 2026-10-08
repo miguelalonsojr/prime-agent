@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type Api, fauxAssistantMessage, fauxToolCall, type Model } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { renderContextDocument } from "../../src/core/clm/context-document.js";
 import { LiveContextController } from "../../src/core/clm/live-context.js";
 import { type ClmBlock, SessionManager } from "../../src/core/session-manager.js";
 import { emptyUsage } from "../../src/core/usage.js";
@@ -50,6 +51,23 @@ async function fixture(messages: AuditMessage[] = [user("obsolete"), user("curre
 }
 
 describe("CLM live context", () => {
+	it("pins a read behind restore without importing pending mirror bytes", async () => {
+		const f = await fixture();
+		await f.prepare();
+		await f.change((text) => text.replace("obsolete", "summary"));
+		await f.settle();
+		const epoch = f.manager.getClmBranchState().epochId!;
+		const restoring = f.controller.restoreRevision(epoch, 0);
+		const reading = LiveContextController.readAcceptedView(f.manager);
+		await restoring;
+		expect(await reading).toEqual({ epochId: epoch, revision: 2, messages: f.blocks.map((block) => block.message) });
+		f.blocks[0].message = user("pending edit");
+		await writeFile(f.path, renderContextDocument({ blocks: f.blocks }, new Set()));
+		expect(JSON.stringify(await LiveContextController.readAcceptedView(f.manager))).not.toContain("pending edit");
+		expect(await readFile(f.path, "utf8")).toContain("pending edit");
+		expect(f.manager.getClmBranchState().revision).toBe(2);
+	});
+
 	it("admits only the healthy owned writer and rejects cancellation or unknown markers", async () => {
 		const f = await fixture();
 		await f.prepare();

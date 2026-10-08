@@ -5,7 +5,15 @@ import { dirname, resolve } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { Api, Model, Tool } from "@earendil-works/pi-ai";
-import type { ClmBlock, ClmBranchState, ClmRevisionEntry, ClmSnapshot, SessionManager } from "../session-manager.js";
+import type {
+	ClmBlock,
+	ClmBranchState,
+	ClmModeMetadata,
+	ClmModeSource,
+	ClmRevisionEntry,
+	ClmSnapshot,
+	SessionManager,
+} from "../session-manager.js";
 import { type ClmRequestBudget, estimateClmRequestTokens } from "./budget.js";
 import { parseContextDocument, renderContextDocument } from "./context-document.js";
 
@@ -17,7 +25,13 @@ export interface ClmRequestInputs {
 	tools: Tool[];
 	model: Model<Api>;
 }
-export interface ClmStatus {
+export interface ClmAcceptedView {
+	epochId: string;
+	revision: number;
+	messages: AgentMessage[];
+}
+export interface ClmStatus extends ClmModeMetadata {
+	configuredDefault: boolean;
 	mode: "on" | "off";
 	epochId?: string;
 	revision?: number;
@@ -43,7 +57,7 @@ export class LiveContextController {
 	private publishedHash = "";
 	private action?: ToolAction;
 	private conflict?: string;
-	private status: ClmStatus;
+	private status: Omit<ClmStatus, keyof ClmModeMetadata | "configuredDefault">;
 	private cancelled?: { settled: boolean };
 	private markerArmed = false;
 
@@ -55,14 +69,14 @@ export class LiveContextController {
 		this.status = { mode: state.mode, epochId: state.epochId, revision: state.revision, path };
 	}
 
-	static initializeEpoch(sessionManager: SessionManager): void {
+	static initializeEpoch(sessionManager: SessionManager, modeSource: ClmModeSource = "session-override"): void {
 		LiveContextController.assertWriterSettled(sessionManager);
 		const { snapshot, watermark } = sessionManager.captureClmContext();
 		const document = renderContextDocument(snapshot, new Set());
 		LiveContextController.checkDocumentSize(document);
 		LiveContextController.checkSnapshotCap(snapshot, sessionManager);
 		parseContextDocument(document, snapshot);
-		sessionManager.appendClmOn(snapshot, watermark);
+		sessionManager.appendClmOn(snapshot, watermark, modeSource);
 	}
 
 	static async open(sessionManager: SessionManager, artifactDir: string): Promise<LiveContextController> {
@@ -209,8 +223,37 @@ export class LiveContextController {
 		if (!lstatSync(this.markerPath()).isFile()) throw new Error("CLM writer marker is invalid");
 	}
 
-	getClmStatus(): ClmStatus {
-		return structuredClone(this.status);
+	getClmStatus(configuredDefault = false): ClmStatus {
+		return {
+			...structuredClone(this.status),
+			...this.sessionManager.getClmModeMetadata(),
+			configuredDefault,
+		};
+	}
+
+	/** Read accepted JSONL only; opening a controller would republish pending mirror bytes. */
+	static async readAcceptedView(sessionManager: SessionManager): Promise<ClmAcceptedView> {
+		const existing = LiveContextController.controllers.get(sessionManager);
+		const controller = existing ? await existing : new LiveContextController(sessionManager, "");
+		return controller.enqueue(async () => controller.captureAcceptedView());
+	}
+
+	private captureAcceptedView(): ClmAcceptedView {
+		LiveContextController.assertWriterSettled(this.sessionManager);
+		const state = this.sessionManager.getClmBranchState();
+		if (!state.epochId || state.revision === undefined || !state.snapshot)
+			throw new Error("CLM has no accepted boundary on the selected branch");
+		let messages: AgentMessage[];
+		if (state.mode === "on") {
+			this.assertIdle();
+			const { snapshot, pending } = this.acceptedContext();
+			messages = [...snapshot.blocks, ...pending].map((block) => block.message);
+		} else {
+			parseContextDocument(renderContextDocument(state.snapshot, new Set()), state.snapshot);
+			messages = this.sessionManager.buildSessionContext().messages;
+		}
+		// Identity and messages are read synchronously inside the same writer operation.
+		return structuredClone({ epochId: state.epochId, revision: state.revision, messages });
 	}
 
 	closeEpoch(): Promise<void> {

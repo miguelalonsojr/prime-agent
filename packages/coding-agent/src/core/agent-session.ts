@@ -107,7 +107,12 @@ import {
 } from "./autonomous.js";
 import { type BashResult, executeBashWithOperations } from "./bash-executor.js";
 import { estimateClmRequestTokens } from "./clm/budget.js";
-import { type ClmRequestInputs, type ClmStatus, LiveContextController } from "./clm/live-context.js";
+import {
+	type ClmAcceptedView,
+	type ClmRequestInputs,
+	type ClmStatus,
+	LiveContextController,
+} from "./clm/live-context.js";
 import {
 	COMPACT_SKILL_NAME,
 	type CompactionResult,
@@ -1961,7 +1966,10 @@ export class AgentSession {
 		});
 		if (applyClmDefault && (config.inheritedClmMode ?? this.settingsManager.getClmEnabled())) {
 			this.assertModelContextAvailable();
-			LiveContextController.initializeEpoch(this.sessionManager);
+			LiveContextController.initializeEpoch(
+				this.sessionManager,
+				config.inheritedClmMode === undefined ? "configured-default" : "inherited-child",
+			);
 			this.syncClmMode();
 		}
 		this._ensureHarnessDigestContext();
@@ -2056,17 +2064,34 @@ export class AgentSession {
 		this.assertModelContextAvailable();
 		const state = this.sessionManager.getClmBranchState();
 		if (state.mode === "on") {
-			const status = (await this._getClmController()).getClmStatus();
+			const status = (await this._getClmController()).getClmStatus(this.settingsManager.getClmEnabled());
 			status.warning ??= "CLM sessions cannot be resumed by older binaries; downgrade is unsupported";
 			return status;
 		}
 		const artifactDir = this.sessionManager.getSessionArtifactDir();
 		return {
 			mode: "off",
+			...this.sessionManager.getClmModeMetadata(),
+			configuredDefault: this.settingsManager.getClmEnabled(),
 			epochId: state.epochId,
 			revision: state.revision,
 			path: artifactDir ? join(artifactDir, "clm", "context.txt") : "",
 		};
+	}
+
+	/** Optional inspection does not import the mirror or perform provider admission. */
+	async getClmAcceptedView(): Promise<ClmAcceptedView> {
+		const pause = this.acquireQueuedWorkPause();
+		let fence: { owner: symbol; release(): void } | undefined;
+		try {
+			fence = await this._acquireSessionActionCommitFence();
+			await this._agentEventQueue;
+			this.assertModelContextAvailable();
+			return await LiveContextController.readAcceptedView(this.sessionManager);
+		} finally {
+			fence?.release();
+			pause.release();
+		}
 	}
 
 	async restoreClmRevision(epochId: string, revision: number): Promise<ClmStatus> {

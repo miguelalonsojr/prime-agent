@@ -138,6 +138,13 @@ export interface ClmSnapshot {
 	blocks: ClmBlock[];
 }
 
+export type ClmModeSource = "configured-default" | "inherited-child" | "session-override";
+
+export interface ClmModeMetadata {
+	modeSource: ClmModeSource | "unknown";
+	recentRevisions: { epochId: string; revision: number }[];
+}
+
 export interface ClmBranchState {
 	mode: "on" | "off";
 	epochId?: string;
@@ -155,6 +162,7 @@ interface ClmEntryBase extends SessionEntryBase {
 
 export interface ClmOnEntry extends ClmEntryBase {
 	type: "clm_on";
+	modeSource?: ClmModeSource;
 }
 
 export interface ClmRevisionEntry extends ClmEntryBase {
@@ -166,6 +174,7 @@ export interface ClmRevisionEntry extends ClmEntryBase {
 
 export interface ClmOffBoundaryEntry extends ClmEntryBase {
 	type: "clm_off_boundary";
+	modeSource?: ClmModeSource;
 }
 
 type AssistantSessionMessageEntry = SessionMessageEntry & { message: AssistantMessage };
@@ -2341,6 +2350,27 @@ export class SessionManager {
 			: { mode: "off", auditWatermark: null };
 	}
 
+	getClmModeMetadata(): ClmModeMetadata {
+		const state = this.getClmBranchState();
+		const branch = this.getBranch();
+		const transition = branch
+			.slice()
+			.reverse()
+			.find((entry) => entry.type === "clm_on" || entry.type === "clm_off_boundary");
+		const source =
+			transition?.type === "clm_on" || transition?.type === "clm_off_boundary" ? transition.modeSource : undefined;
+		const modeSource =
+			source === "configured-default" || source === "inherited-child" || source === "session-override"
+				? source
+				: "unknown";
+		const recentRevisions = branch
+			.filter((entry): entry is ClmEntry => isClmEntry(entry) && entry.epochId === state.epochId)
+			.slice(-10)
+			.reverse()
+			.map(({ epochId, revision }) => ({ epochId, revision }));
+		return { modeSource, recentRevisions };
+	}
+
 	/** Defaults are consumed once, and never applied to a loaded or seeded transcript. */
 	consumeClmDefaultEligibility(): boolean {
 		const eligible = this.clmDefaultEligible;
@@ -2418,10 +2448,15 @@ export class SessionManager {
 		return { snapshot: { blocks }, watermark };
 	}
 
-	appendClmOn(snapshot: ClmSnapshot, watermark: string | null): string {
+	appendClmOn(
+		snapshot: ClmSnapshot,
+		watermark: string | null,
+		modeSource: ClmModeSource = "session-override",
+	): string {
 		if (this.getClmBranchState().mode === "on") throw new Error("CLM is already on");
 		return this._commitClmEntry({
 			type: "clm_on",
+			modeSource,
 			id: generateId(this.byId),
 			parentId: this.leafId,
 			timestamp: new Date().toISOString(),
@@ -2457,6 +2492,7 @@ export class SessionManager {
 			throw new Error("CLM is not on");
 		return this._commitClmEntry({
 			type: "clm_off_boundary",
+			modeSource: "session-override",
 			id: generateId(this.byId),
 			parentId: this.leafId,
 			timestamp: new Date().toISOString(),
