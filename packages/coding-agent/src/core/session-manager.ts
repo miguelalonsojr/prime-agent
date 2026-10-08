@@ -1826,11 +1826,23 @@ function foldSessionScanLine(acc: SessionScanAccumulator, lineBuffer: Buffer): v
 	// can exhaust the daemon heap.
 	if (line.length > SESSION_LIST_PARSE_MAX_LINE_CHARS) {
 		const header = line.slice(0, SESSION_LIST_HEADER_PREFIX_MAX_CHARS);
-		const entryType = /^\s*\{\s*"type"\s*:\s*"(message|custom_message|custom)"\s*,/.exec(header)?.[1];
+		const entryType = /^\s*\{\s*"type"\s*:\s*"(message|custom_message|custom|clm_off_boundary)"\s*,/.exec(
+			header,
+		)?.[1];
 		const isMessage = entryType === "message";
 		// A skipped first CLM boundary must not fall through to raw-count status currency.
-		if (acc.clm) acc.clm.valid = false;
-		else if (entryType === undefined) acc.clm = { acceptedCount: 0, revisionId: "", contentTipId: "", valid: false };
+		const isWrittenOffBoundary =
+			entryType === "clm_off_boundary" &&
+			/^\{"type":"clm_off_boundary","modeSource":"session-override","id":"[^"]+","parentId":"[^"]+","timestamp":"[^"]+","epochId":"[^"]+","revision":\d+,"snapshot":\{"blocks":\[/.test(
+				header,
+			) &&
+			line.endsWith("}");
+		if (isWrittenOffBoundary && acc.clm) {
+			acc.clm = undefined;
+			acc.agentStatus = undefined;
+		} else if (acc.clm) acc.clm.valid = false;
+		else if (entryType === undefined || entryType === "clm_off_boundary")
+			acc.clm = { acceptedCount: 0, revisionId: "", contentTipId: "", valid: false };
 		if (isMessage) {
 			acc.messageCount++;
 			const summary = extractOversizedMessageSummary(line);
