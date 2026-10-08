@@ -4,6 +4,7 @@ import type { AgentSessionMessageReceipt, AgentSessionMessageSafetyStatus } from
 import type { AuthSourceToken } from "../../core/auth-storage.js";
 import type { AgentAutonomousStatus } from "../../core/autonomous.js";
 import type { BashResult } from "../../core/bash-executor.js";
+import type { ClmStatus } from "../../core/clm/live-context.js";
 import type { CompactionResult } from "../../core/compaction/index.js";
 import type { ContextTreeNode } from "../../core/context-tree.js";
 import type {
@@ -675,6 +676,16 @@ export interface AgentConnectionSessionInputPause {
 	release(): Promise<void>;
 }
 
+export type { ClmStatus } from "../../core/clm/live-context.js";
+
+/** Accepted model history, not the audit or pending working-file bytes. */
+export interface ClmModelSnapshot {
+	epochId: string;
+	revision: number;
+	messages: AgentMessage[];
+	estimatedTokens?: number;
+}
+
 export interface AgentConnection {
 	subscribe(listener: AgentConnectionEventListener): () => void;
 	onBeforeSessionInvalidate(listener: AgentConnectionBeforeSessionInvalidateListener): () => void;
@@ -698,6 +709,10 @@ export interface AgentConnection {
 	getSessionStats(): Promise<SessionStats>;
 	getContextTree(): Promise<ContextTreeNode>;
 	getSessionContext(): Promise<AgentConnectionSessionContext>;
+	getClmStatus(): Promise<ClmStatus>;
+	setClmMode(enabled: boolean): Promise<ClmStatus>;
+	restoreClmRevision(epochId: string, revision: number): Promise<ClmStatus>;
+	getClmModelSnapshot(): Promise<ClmModelSnapshot>;
 	getSessionTree(): Promise<{ tree: AgentConnectionSessionTreeNode[]; leafId: string | null }>;
 	listSavedSessions(
 		scope: AgentConnectionSavedSessionScope,

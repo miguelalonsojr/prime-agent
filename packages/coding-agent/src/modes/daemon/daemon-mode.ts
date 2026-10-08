@@ -126,7 +126,11 @@ import {
 	createAgentConnectionState,
 } from "../agent-connection/snapshot.js";
 import { createAgentConnectionToolDefinition } from "../agent-connection/tool-definition.js";
-import type { AgentConnectionHeartbeat, AgentConnectionRlmChildAgentSnapshot } from "../agent-connection/types.js";
+import type {
+	AgentConnectionHeartbeat,
+	AgentConnectionRlmChildAgentSnapshot,
+	ClmModelSnapshot,
+} from "../agent-connection/types.js";
 import { waitForHeadlessCompletion } from "../headless-completion.js";
 import { initTheme } from "../interactive/theme/theme.js";
 import { attachJsonlLineReader, serializeJsonLine } from "../rpc/jsonl.js";
@@ -4692,7 +4696,7 @@ export class AgentDaemon {
 
 			case "start_side_question": {
 				const state = this.getSessionState(command.activeSessionId);
-				state.runtime.session.assertModelContextAvailable();
+				state.runtime.session.assertClmOperationAllowed("side questions");
 				if (this.sideQuestionRuns.has(command.sideQuestionId)) {
 					throw new Error(`Side question already exists: ${command.sideQuestionId}`);
 				}
@@ -5324,6 +5328,31 @@ export class AgentDaemon {
 				const state = this.getSessionState(command.activeSessionId);
 				const result = await state.runtime.session.setRlmMaxDepth(command.maxDepth, { global: command.global });
 				return success(command.id, "set_rlm_max_depth", result);
+			}
+
+			case "get_clm_status": {
+				const session = this.getSessionState(command.activeSessionId).runtime.session;
+				return success(command.id, command.type, await session.getClmStatus());
+			}
+
+			case "set_clm_mode": {
+				const session = this.getSessionState(command.activeSessionId).runtime.session;
+				return success(command.id, command.type, await session.setClmMode(command.enabled));
+			}
+
+			case "restore_clm_revision": {
+				const session = this.getSessionState(command.activeSessionId).runtime.session;
+				return success(
+					command.id,
+					command.type,
+					await session.restoreClmRevision(command.epochId, command.revision),
+				);
+			}
+
+			case "get_clm_model_snapshot": {
+				const session = this.getSessionState(command.activeSessionId).runtime.session;
+				const snapshot: ClmModelSnapshot = await session.getClmAcceptedView();
+				return success(command.id, command.type, snapshot);
 			}
 
 			case "get_session_context": {

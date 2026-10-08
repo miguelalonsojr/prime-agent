@@ -11,7 +11,11 @@ import { appendRotatingLog, expandTildePath, getClientErrorLogPath, getDaemonLog
 import { ORPHAN_PROCESS_JOURNAL_ENV } from "../core/orphan-process-journal.js";
 import { getProcessStartId, SESSION_LEASE_OWNER_ID_ENV, SESSION_LEASES_ENABLED_ENV } from "../core/session-lease.js";
 import { DaemonClient, type DaemonHello } from "../modes/daemon/daemon-client.js";
-import { DAEMON_PROTOCOL_VERSION, DAEMON_SCHEMA_ID, DAEMON_SCHEMA_REVISION } from "../modes/daemon/daemon-protocol.js";
+import {
+	DAEMON_PROTOCOL_VERSION,
+	DAEMON_SCHEMA_ID,
+	isCompatibleDaemonSchema,
+} from "../modes/daemon/daemon-protocol.js";
 import { getDaemonRuntimeIdentity } from "../modes/daemon/daemon-runtime-identity.js";
 import { isSessionSummaryBusy, type SessionSummary } from "../modes/daemon/daemon-session-list.js";
 import { defaultDaemonSocketPath, normalizeSocketPath } from "../modes/daemon/daemon-socket.js";
@@ -74,10 +78,14 @@ type DaemonVersionProbe =
 	| { status: "unresponsive" };
 
 function isReusableDaemonHello(hello: DaemonHello): boolean {
-	const hasCompatibleSchema =
-		hello.schemaId === DAEMON_SCHEMA_ID ||
-		(typeof hello.schemaRevision === "number" && hello.schemaRevision > DAEMON_SCHEMA_REVISION);
-	return hello.protocol.version === DAEMON_PROTOCOL_VERSION && hasCompatibleSchema && hello.appVersion === VERSION;
+	return (
+		hello.appVersion === VERSION &&
+		isCompatibleDaemonSchema({
+			protocolVersion: hello.protocol.version,
+			schemaRevision: hello.schemaRevision,
+			schemaId: hello.schemaId,
+		})
+	);
 }
 
 /** Connect to a running daemon and check whether it matches this client's protocol and app version. */

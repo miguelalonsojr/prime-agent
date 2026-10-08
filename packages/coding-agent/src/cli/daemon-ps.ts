@@ -10,11 +10,7 @@ import {
 } from "../core/orphan-process-journal.js";
 import { getProcessStartId } from "../core/session-lease.js";
 import { DaemonClient } from "../modes/daemon/daemon-client.js";
-import {
-	DAEMON_PROTOCOL_VERSION,
-	DAEMON_SCHEMA_ID,
-	type DaemonRuntimeIdentity,
-} from "../modes/daemon/daemon-protocol.js";
+import { type DaemonRuntimeIdentity, isCompatibleDaemonSchema } from "../modes/daemon/daemon-protocol.js";
 import { defaultDaemonSocketDir, defaultDaemonSocketPath, normalizeSocketPath } from "../modes/daemon/daemon-socket.js";
 import { createDaemonStateRootMatcher } from "../modes/daemon/daemon-state-root.js";
 import { acquireDaemonShutdownAdmission } from "../modes/daemon/daemon-supervisor-ownership.js";
@@ -259,6 +255,7 @@ function scanSocketDir(): string[] {
 }
 
 interface ProbeResult {
+	schemaRevision?: number;
 	version?: string;
 	protocolVersion?: number;
 	schemaId?: string;
@@ -281,6 +278,7 @@ async function probeDaemon(socketPath: string): Promise<ProbeResult> {
 		let version: string | undefined;
 		let protocolVersion: number | undefined;
 		let schemaId: string | undefined;
+		let schemaRevision: number | undefined;
 		let runtime: DaemonRuntimeIdentity | undefined;
 		let supervisorPid: number | undefined;
 		let supervisorProcessStartId: string | undefined;
@@ -290,6 +288,7 @@ async function probeDaemon(socketPath: string): Promise<ProbeResult> {
 			version = hello.appVersion;
 			protocolVersion = hello.protocol.version;
 			schemaId = hello.schemaId;
+			schemaRevision = hello.schemaRevision;
 			runtime = hello.runtime;
 			supervisorPid = hello.supervisorPid;
 			supervisorProcessStartId = hello.supervisorProcessStartId;
@@ -313,6 +312,7 @@ async function probeDaemon(socketPath: string): Promise<ProbeResult> {
 			version,
 			protocolVersion,
 			schemaId,
+			schemaRevision,
 			runtime,
 			sessionCount,
 			supervisorPid,
@@ -324,12 +324,8 @@ async function probeDaemon(socketPath: string): Promise<ProbeResult> {
 	}
 }
 
-function classifyReachable(probe: ProbeResult): DaemonStatus {
-	if (
-		probe.protocolVersion === DAEMON_PROTOCOL_VERSION &&
-		probe.schemaId === DAEMON_SCHEMA_ID &&
-		probe.version === VERSION
-	) {
+export function classifyReachable(probe: ProbeResult): DaemonStatus {
+	if (probe.version === VERSION && isCompatibleDaemonSchema(probe)) {
 		return "current";
 	}
 	return "stale";

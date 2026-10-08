@@ -70,6 +70,8 @@ import type {
 	AgentConnectionSwitchSessionOptions,
 	AgentConnectionToolDefinition,
 	AgentConnectionUserMessage,
+	ClmModelSnapshot,
+	ClmStatus,
 } from "./types.js";
 
 export interface InProcessHeadlessExtensionOptions {
@@ -187,6 +189,22 @@ export class InProcessAgentConnection implements AgentConnection {
 
 	async getContextTree(): Promise<ContextTreeNode> {
 		return this.session.getContextTree();
+	}
+
+	async getClmStatus(): Promise<ClmStatus> {
+		return this.session.getClmStatus();
+	}
+
+	async setClmMode(enabled: boolean): Promise<ClmStatus> {
+		return this.session.setClmMode(enabled);
+	}
+
+	async restoreClmRevision(epochId: string, revision: number): Promise<ClmStatus> {
+		return this.session.restoreClmRevision(epochId, revision);
+	}
+
+	async getClmModelSnapshot(): Promise<ClmModelSnapshot> {
+		return this.session.getClmAcceptedView();
 	}
 
 	async getSessionContext(): Promise<AgentConnectionSessionContext> {
@@ -397,7 +415,7 @@ export class InProcessAgentConnection implements AgentConnection {
 		question: string,
 		previousTurns?: AgentConnectionSideQuestionTurn[],
 	): Promise<void> {
-		this.session.assertModelContextAvailable();
+		this.session.assertClmOperationAllowed("side questions");
 		if (this.sideQuestionRuns.has(id)) {
 			throw new Error(`Side question already exists: ${id}`);
 		}

@@ -277,13 +277,18 @@ describe("ensureInteractiveDaemonRunning", () => {
 		expect(commands).not.toContain("shutdown");
 	});
 
-	it("reuses a same-app daemon with a newer compatible schema revision", async () => {
+	it.each([
+		["protocol-7-schema-31-edd03ec5165c", 31, false],
+		["protocol-7-schema-31-edd03ec5165c", 31, true],
+		["newer-schema", DAEMON_SCHEMA_REVISION + 1, false],
+	])("reuses schema %s/%s (busy=%s)", async (schemaId, schemaRevision, isSessionActive) => {
 		const commands: string[] = [];
 		const daemon = await startFakeDaemon({
 			protocolVersion: DAEMON_PROTOCOL_VERSION,
 			appVersion: VERSION,
-			schemaId: "newer-schema",
-			schemaRevision: DAEMON_SCHEMA_REVISION + 1,
+			schemaId,
+			schemaRevision,
+			sessions: [{ id: "active-1", isSessionActive }],
 			onCommand: (command) => commands.push(command.type),
 		});
 		cleanups.push(daemon.close);
@@ -293,19 +298,29 @@ describe("ensureInteractiveDaemonRunning", () => {
 	});
 
 	it.each([
-		["same", DAEMON_SCHEMA_REVISION],
-		["older", DAEMON_SCHEMA_REVISION - 1],
-		["missing", null],
-	])("keeps a %s-revision daemon with a different schema ID stale", async (_label, schemaRevision) => {
+		{ schemaId: "different-schema", schemaRevision: DAEMON_SCHEMA_REVISION },
+		{ schemaId: "different-schema", schemaRevision: 31 },
+		{ schemaId: "different-schema", schemaRevision: null },
+		{ appVersion: "other" },
+		{ protocolVersion: 8 },
+		{ schemaRevision: 30 },
+	])("leaves an incompatible busy daemon running: %j", async (mismatch) => {
+		const commands: string[] = [];
 		const daemon = await startFakeDaemon({
-			protocolVersion: DAEMON_PROTOCOL_VERSION,
 			appVersion: VERSION,
-			schemaId: "different-schema",
-			schemaRevision,
+			schemaRevision: 31,
+			schemaId: "protocol-7-schema-31-edd03ec5165c",
+			...mismatch,
+			sessions: [{ id: "active-1", isSessionActive: true }],
+			onCommand: (command) => commands.push(command.type),
 		});
-		cleanups.push(daemon.close);
-
-		await expect(probeDaemonVersion(daemon.socketPath)).resolves.toMatchObject({ status: "stale" });
+		try {
+			await expect(probeDaemonVersion(daemon.socketPath)).resolves.toMatchObject({ status: "stale" });
+			await expect(ensureInteractiveDaemonRunning(daemon.socketPath)).rejects.toThrow("incompatible");
+			expect(commands).not.toContain("shutdown");
+		} finally {
+			await daemon.close();
+		}
 	});
 
 	it("does not replace a stale daemon with busy private client sessions", async () => {

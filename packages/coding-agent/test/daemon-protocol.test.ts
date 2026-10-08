@@ -74,10 +74,10 @@ describe("daemon protocol helpers", () => {
 		else expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).not.toContain(capability);
 	});
 
-	it("publishes the combined schema-31 protocol contract", () => {
+	it("publishes the combined schema-32 protocol contract", () => {
 		expect(DAEMON_PROTOCOL_VERSION).toBe(7);
-		expect(DAEMON_SCHEMA_REVISION).toBe(31);
-		expect(DAEMON_SCHEMA_ID).toBe("protocol-7-schema-31-edd03ec5165c");
+		expect(DAEMON_SCHEMA_REVISION).toBe(32);
+		expect(DAEMON_SCHEMA_ID).toBe("protocol-7-schema-32-1f371df04a5f");
 		expect(DAEMON_DEFAULT_CLIENT_CAPABILITIES).toEqual(["attach_snapshot", "event_sequence"]);
 		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).toEqual(
 			expect.arrayContaining(["abort_and_send_queued", "kernel_cwd_propagation"]),

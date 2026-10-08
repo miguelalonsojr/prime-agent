@@ -99,6 +99,8 @@ import type {
 	AgentConnectionSwitchSessionOptions,
 	AgentConnectionToolDefinition,
 	AgentConnectionUserMessage,
+	ClmModelSnapshot,
+	ClmStatus,
 } from "./types.js";
 import { AgentConnectionPromptAdmissionError } from "./types.js";
 
@@ -898,6 +900,47 @@ export class DaemonAgentConnection implements AgentConnection {
 			type: "get_context_tree",
 			activeSessionId: this.activeSessionId,
 		});
+	}
+
+	async getClmStatus(): Promise<ClmStatus> {
+		this.requireClmCapability();
+		return this.requestData<ClmStatus>({
+			type: "get_clm_status",
+			activeSessionId: this.activeSessionId,
+		});
+	}
+
+	async setClmMode(enabled: boolean): Promise<ClmStatus> {
+		this.requireClmCapability();
+		return this.requestData<ClmStatus>({
+			type: "set_clm_mode",
+			activeSessionId: this.activeSessionId,
+			enabled,
+		});
+	}
+
+	async restoreClmRevision(epochId: string, revision: number): Promise<ClmStatus> {
+		this.requireClmCapability();
+		return this.requestData<ClmStatus>({
+			type: "restore_clm_revision",
+			activeSessionId: this.activeSessionId,
+			epochId,
+			revision,
+		});
+	}
+
+	async getClmModelSnapshot(): Promise<ClmModelSnapshot> {
+		this.requireClmCapability();
+		return this.requestData<ClmModelSnapshot>({
+			type: "get_clm_model_snapshot",
+			activeSessionId: this.activeSessionId,
+		});
+	}
+
+	private requireClmCapability(): void {
+		if (!this.client.supportsServerCapability("clm_context_v1")) {
+			throw new Error("The daemon does not support clm_context_v1; restart the daemon to use CLM commands.");
+		}
 	}
 
 	async getSessionContext(): Promise<AgentConnectionSessionContext> {
@@ -3048,6 +3091,8 @@ function invalidatesCachedSnapshot(commandType: DaemonCommandBody["type"]): bool
 		case "get_queue":
 		case "cron_list":
 		case "heartbeats_list":
+		case "get_clm_status":
+		case "get_clm_model_snapshot":
 		case "get_session_context":
 		case "get_session_tree":
 		case "get_context_tree":

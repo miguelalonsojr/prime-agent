@@ -68,8 +68,23 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 29 adds the capability-gated abort_and_send_queued command.
 // Revision 30 adds structured update_restarting failure info for opens fenced by an update restart.
 // Revision 31 adds capability-gated kernel CWD propagation.
-export const DAEMON_SCHEMA_REVISION = 31;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-31-edd03ec5165c";
+// Revision 32 adds optional accepted CLM context inspection and mode commands.
+export const DAEMON_SCHEMA_REVISION = 32;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-32-1f371df04a5f";
+
+/** Schema reuse is narrower than optional command negotiation. */
+export function isCompatibleDaemonSchema(identity: {
+	protocolVersion?: number;
+	schemaRevision?: number;
+	schemaId?: string;
+}): boolean {
+	if (identity.protocolVersion !== DAEMON_PROTOCOL_VERSION) return false;
+	return (
+		identity.schemaId === DAEMON_SCHEMA_ID ||
+		(typeof identity.schemaRevision === "number" && identity.schemaRevision > DAEMON_SCHEMA_REVISION) ||
+		(identity.schemaRevision === 31 && identity.schemaId === "protocol-7-schema-31-edd03ec5165c")
+	);
+}
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -116,7 +131,8 @@ export type DaemonServerCapability =
 	| "acp_mcp_servers"
 	| "direct_peer_transport"
 	| "abort_and_send_queued"
-	| "kernel_cwd_propagation";
+	| "kernel_cwd_propagation"
+	| "clm_context_v1";
 
 export type DaemonReplayStatus = "complete" | "partial" | "unavailable";
 
@@ -163,6 +179,7 @@ export const DAEMON_DEFAULT_SERVER_CAPABILITIES: readonly DaemonServerCapability
 	"acp_mcp_servers",
 	"abort_and_send_queued",
 	"kernel_cwd_propagation",
+	"clm_context_v1",
 ];
 
 /** Single-use short-lived credential for one direct TUI connection to one worker process incarnation. */
@@ -659,6 +676,10 @@ export type DaemonCommand =
 	| { id?: string; type: "set_rlm_max_depth"; activeSessionId: string; maxDepth: number; global?: boolean }
 	| { id?: string; type: "rename_saved_session"; activeSessionId?: string; sessionPath: string; name: string }
 	| { id?: string; type: "delete_saved_session"; activeSessionId?: string; sessionPath: string }
+	| { id?: string; type: "get_clm_status"; activeSessionId: string }
+	| { id?: string; type: "set_clm_mode"; activeSessionId: string; enabled: boolean }
+	| { id?: string; type: "restore_clm_revision"; activeSessionId: string; epochId: string; revision: number }
+	| { id?: string; type: "get_clm_model_snapshot"; activeSessionId: string }
 	| { id?: string; type: "get_session_context"; activeSessionId: string }
 	| { id?: string; type: "get_session_tree"; activeSessionId: string }
 	| { id?: string; type: "get_user_messages_for_forking"; activeSessionId: string }
@@ -689,6 +710,11 @@ export interface DaemonCommandCompatibility {
 
 const LEGACY_DAEMON_COMMAND = { minProtocol: 7 } as const;
 const CURRENT_DAEMON_COMMAND = { minProtocol: 7 } as const;
+const CLM_CONTEXT_COMMAND = {
+	minProtocol: 7,
+	minSchemaRevision: 32,
+	capability: "clm_context_v1",
+} as const;
 const RLM_MAX_DEPTH_COMMAND = { minProtocol: 7, minSchemaRevision: 11 } as const;
 const SESSION_INPUT_ADMISSION_COMMAND = {
 	minProtocol: 7,
@@ -838,6 +864,10 @@ export const DAEMON_COMMAND_COMPATIBILITY = {
 	set_rlm_max_depth: RLM_MAX_DEPTH_COMMAND,
 	rename_saved_session: LEGACY_DAEMON_COMMAND,
 	delete_saved_session: LEGACY_DAEMON_COMMAND,
+	get_clm_status: CLM_CONTEXT_COMMAND,
+	set_clm_mode: CLM_CONTEXT_COMMAND,
+	restore_clm_revision: CLM_CONTEXT_COMMAND,
+	get_clm_model_snapshot: CLM_CONTEXT_COMMAND,
 	get_session_context: LEGACY_DAEMON_COMMAND,
 	get_session_tree: FLAT_SESSION_TREE_COMMAND,
 	get_user_messages_for_forking: LEGACY_DAEMON_COMMAND,
@@ -976,6 +1006,10 @@ export const DAEMON_COMMAND_PLANE = {
 	set_rlm_max_depth: "session",
 	rename_saved_session: "control",
 	delete_saved_session: "control",
+	get_clm_status: "session",
+	set_clm_mode: "session",
+	restore_clm_revision: "session",
+	get_clm_model_snapshot: "session",
 	get_session_context: "session",
 	get_session_tree: "session",
 	get_user_messages_for_forking: "session",
@@ -1339,6 +1373,8 @@ const READ_ONLY_DAEMON_COMMANDS: ReadonlySet<DaemonCommand["type"]> = new Set([
 	"cron_list",
 	"heartbeats_list",
 	"heartbeat_get",
+	"get_clm_status",
+	"get_clm_model_snapshot",
 	"get_session_context",
 	"get_session_tree",
 	"get_user_messages_for_forking",

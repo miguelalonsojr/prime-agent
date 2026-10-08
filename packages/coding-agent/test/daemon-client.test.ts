@@ -204,16 +204,24 @@ describe("DaemonClient", () => {
 		client.close();
 	});
 
-	it("rejects unsupported optional commands without writing them to an older daemon", async () => {
+	it.each([
+		"heartbeats_list",
+		"get_clm_status",
+		"set_clm_mode",
+		"restore_clm_revision",
+		"get_clm_model_snapshot",
+	] as const)("rejects unsupported optional %s without writing to schema 31", async (type) => {
 		const client = new DaemonClient("/tmp/prime-agent.sock");
 		const connect = client.connect();
 		const socket = netMock.sockets[0]!;
 		socket.emit("connect");
 		await connect;
-		emitHello(socket, 3);
+		emitHello(socket, 7, [], 31);
 
 		expect(client.supportsServerCapability("heartbeat_catalog")).toBe(false);
-		await expect(client.request({ type: "heartbeats_list" })).rejects.toThrow("does not support heartbeat_catalog");
+		await expect(
+			client.request({ type, activeSessionId: "active-1", enabled: true, epochId: "e", revision: 0 }),
+		).rejects.toThrow("does not support");
 		expect(socket.writes).toEqual([]);
 		client.close();
 	});

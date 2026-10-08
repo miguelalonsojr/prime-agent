@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+	classifyReachable,
 	type DaemonInfo,
 	evaluateShutdownQuietPeriod,
 	isWorkerSocketPath,
@@ -8,7 +9,9 @@ import {
 	planShutdownConfirmation,
 	verifyHelloSupervisorPid,
 } from "../src/cli/daemon-ps.js";
+import { VERSION } from "../src/config.js";
 import { getProcessStartId } from "../src/core/session-lease.js";
+import { DAEMON_SCHEMA_ID } from "../src/modes/daemon/daemon-protocol.js";
 
 it("recognizes Windows worker named pipes on every platform", () => {
 	expect(isWorkerSocketPath("\\\\.\\pipe\\prime-agent-worker-98ed5cb228d2-5b1d3aeb91ee")).toBe(true);
@@ -30,6 +33,14 @@ describe("verifyHelloSupervisorPid", () => {
 			expect(verifyHelloSupervisorPid(process.pid, `${processStartId}-stale`)).toBeUndefined();
 		}
 	});
+});
+
+it.each([
+	[31, "protocol-7-schema-31-edd03ec5165c", 7, VERSION, "current"],
+	[32, DAEMON_SCHEMA_ID, 7, VERSION, "current"],
+	[33, "newer", 7, VERSION, "current"],
+] as const)("classifies daemon identity %s/%s/%s/%s", (schemaRevision, schemaId, protocolVersion, version, status) => {
+	expect(classifyReachable({ reachable: true, schemaRevision, schemaId, protocolVersion, version })).toBe(status);
 });
 
 describe("planReap", () => {
