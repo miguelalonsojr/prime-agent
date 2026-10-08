@@ -1829,9 +1829,9 @@ function foldSessionScanLine(acc: SessionScanAccumulator, lineBuffer: Buffer): v
 	// session-list metadata we need, and parsing them during every refresh
 	// can exhaust the daemon heap.
 	if (line.length > SESSION_LIST_PARSE_MAX_LINE_CHARS) {
+		if (acc.clm) acc.clm.valid = false;
 		if (looksLikeMessageEntry(line)) {
 			acc.messageCount++;
-			if (acc.clm) acc.clm.valid = false;
 			const summary = extractOversizedMessageSummary(line);
 			if (typeof summary.timestamp === "number" && (summary.role === "user" || summary.role === "assistant")) {
 				acc.lastActivityTime = Math.max(acc.lastActivityTime ?? 0, summary.timestamp);
@@ -1848,6 +1848,7 @@ function foldSessionScanLine(acc: SessionScanAccumulator, lineBuffer: Buffer): v
 	try {
 		entry = JSON.parse(trimmed) as FileEntry;
 	} catch {
+		if (acc.clm) acc.clm.valid = false;
 		return;
 	}
 

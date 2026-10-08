@@ -5,9 +5,10 @@ import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { fauxAssistantMessage, registerFauxProvider } from "@earendil-works/pi-ai";
 import { describe, expect, test, vi } from "vitest";
 import type { ModelRegistry } from "../src/core/model-registry.js";
-import { type AgentStatus, type ClmUsagePin, SessionManager } from "../src/core/session-manager.js";
+import { type AgentStatus, type ClmUsagePin, readSessionInfo, SessionManager } from "../src/core/session-manager.js";
 import { SettingsManager } from "../src/core/settings-manager.js";
 import type { ActiveSessionState } from "../src/modes/daemon/active-session-state.js";
+import { buildSessionList } from "../src/modes/daemon/daemon-session-list.js";
 import {
 	type AgentStatusResult,
 	buildStatusContext,
@@ -344,6 +345,73 @@ describe("daemon session summarizer", () => {
 			});
 			await (summarizer as unknown as { summarize(state: ActiveSessionState): Promise<void> }).summarize(corrupt);
 			expect(generate).toHaveBeenCalledTimes(3);
+		});
+
+		test("persists an identical CLM verdict after same-count restore and refreshes both lists", async () => {
+			const dir = mkdtempSync(join(tmpdir(), "clm-identical-verdict-"));
+			try {
+				const manager = SessionManager.create(dir, join(dir, "sessions"));
+				const original = {
+					role: "user" as const,
+					content: [{ type: "text" as const, text: "original" }],
+					timestamp: 0,
+				};
+				const restored = { ...original, content: [{ type: "text" as const, text: "restored" }] };
+				const id = manager.appendMessage(original);
+				manager.appendClmOn({ blocks: [{ id, message: original }] }, id);
+				let accepted = original;
+				const state = makeState({
+					messages: [original],
+					isSessionActive: false,
+					clmView: async () => ({ view: { messages: [accepted] }, pin: manager.captureClmUsagePin() }),
+				});
+				Object.assign(state.runtime.session, {
+					state: { streamingMessage: undefined, pendingToolCalls: new Set() },
+					sessionManager: manager,
+					sessionId: manager.getSessionId(),
+					sessionFile: manager.getSessionFile(),
+					isStreaming: false,
+					isCompacting: false,
+					isBashRunning: false,
+					unfinishedActionCount: 0,
+					hasRunningRlmChildren: () => false,
+					getOwnUsageSummary: () => undefined,
+					getSessionActionSnapshot: () => ({ queuedCount: 0, steering: [], followUps: [] }),
+					getRlmChildSnapshots: () => [],
+				});
+				Object.assign(state, {
+					clients: new Set(),
+					runtime: { ...state.runtime, metadata: { kind: "top-level" }, diagnostics: [] },
+				});
+				const generate = vi.fn(async () => ({ summary: "same", taskState: "completed" as const }));
+				const changed = vi.fn();
+				const summarizer = new DaemonSessionSummarizer(() => [state], changed, generate);
+				const run = () =>
+					(summarizer as unknown as { summarize(state: ActiveSessionState): Promise<void> }).summarize(state);
+				await run();
+				manager.flushNow();
+				expect(buildSessionList([state], [(await readSessionInfo(manager.getSessionFile()!))!])[0]?.taskState).toBe(
+					"completed",
+				);
+				manager.appendClmRevision({ blocks: [{ id, message: restored }] }, id, "restore:same-count");
+				accepted = restored;
+				manager.flushNow();
+				const stale = (await readSessionInfo(manager.getSessionFile()!))!;
+				expect(buildSessionList([state], [stale])[0]?.taskState).toBeUndefined();
+				expect(buildSessionList([], [stale])[0]?.taskState).toBeUndefined();
+				await run();
+				manager.flushNow();
+				const fresh = (await readSessionInfo(manager.getSessionFile()!))!;
+				expect(manager.getBranch().filter((entry) => entry.type === "agent_status")).toHaveLength(2);
+				expect(fresh.clmStatusCurrent).toBe(true);
+				expect(buildSessionList([state], [fresh])[0]?.taskState).toBe("completed");
+				expect(buildSessionList([], [fresh])[0]?.taskState).toBe("completed");
+				expect(changed).toHaveBeenCalledTimes(2);
+				await run();
+				expect(generate).toHaveBeenCalledTimes(2);
+			} finally {
+				rmSync(dir, { recursive: true, force: true });
+			}
 		});
 
 		test("keeps a zero-usage status failure unknown beside a pinned nonzero retry", async () => {

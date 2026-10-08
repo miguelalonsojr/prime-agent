@@ -394,7 +394,12 @@ export class DaemonSessionSummarizer {
 				taskState: "error",
 				basedOnMessageCount: messageCount,
 			};
-			this.commitStatus(state, session, status, { isWorking, previous, persist: true });
+			this.commitStatus(state, session, status, {
+				isWorking,
+				previous,
+				persist: true,
+				acceptedIdentity: clmIdentity,
+			});
 			if (clmIdentity) this.settledClmIdentity.set(id, clmIdentity);
 			return;
 		}
@@ -507,7 +512,7 @@ export class DaemonSessionSummarizer {
 				state,
 				session,
 				{ summary: result.summary, taskState, basedOnMessageCount: messageCount },
-				{ isWorking, previous, persist: generated !== undefined },
+				{ isWorking, previous, persist: generated !== undefined, acceptedIdentity: clmIdentity },
 			);
 			if (clmIdentity) this.settledClmIdentity.set(id, clmIdentity);
 		} finally {
@@ -559,21 +564,36 @@ export class DaemonSessionSummarizer {
 		state: ActiveSessionState,
 		session: ActiveSessionState["runtime"]["session"],
 		status: AgentStatus,
-		{ isWorking, previous, persist }: { isWorking: boolean; previous: AgentStatus | undefined; persist: boolean },
+		{
+			isWorking,
+			previous,
+			persist,
+			acceptedIdentity,
+		}: { isWorking: boolean; previous: AgentStatus | undefined; persist: boolean; acceptedIdentity?: string },
 	): void {
+		const branch = acceptedIdentity ? session.sessionManager.getBranch?.() : undefined;
+		let needsCurrentClmStatus = false;
+		if (!isWorking && branch) {
+			for (const entry of branch) {
+				if (entry.type === "clm_on" || entry.type === "clm_revision") needsCurrentClmStatus = true;
+				else if (entry.type === "agent_status") needsCurrentClmStatus = false;
+			}
+		}
 		// An idle settle refreshes the verdict's currency, which gates the published
 		// taskState: it must publish even when the verdict text is unchanged.
 		const changed =
 			previous?.summary !== status.summary ||
 			previous?.taskState !== status.taskState ||
-			(!isWorking && previous?.basedOnMessageCount !== status.basedOnMessageCount);
+			(!isWorking && previous?.basedOnMessageCount !== status.basedOnMessageCount) ||
+			needsCurrentClmStatus;
 		state.summaryState = status;
 		if (!isWorking && persist) {
 			const persisted = session.sessionManager.getLatestAgentStatus();
 			if (
 				persisted?.summary !== status.summary ||
 				persisted.taskState !== status.taskState ||
-				persisted.basedOnMessageCount !== status.basedOnMessageCount
+				persisted.basedOnMessageCount !== status.basedOnMessageCount ||
+				needsCurrentClmStatus
 			) {
 				try {
 					session.sessionManager.appendAgentStatus(status);

@@ -133,6 +133,40 @@ describe("buildSessionList", () => {
 		}
 	});
 
+	it.each(["accepted revision", "unknown entry"] as const)(
+		"hides an old inactive verdict after an oversized %s",
+		async (kind) => {
+			const dir = mkdtempSync(join(tmpdir(), "clm-list-oversized-"));
+			try {
+				const manager = SessionManager.create(dir, join(dir, "sessions"));
+				const accepted = { role: "user" as const, content: "kept", timestamp: 1 };
+				const id = manager.appendMessage(accepted);
+				manager.appendClmOn({ blocks: [{ id, message: accepted }] }, id);
+				manager.appendAgentStatus({ summary: "old", taskState: "completed", basedOnMessageCount: 1 });
+				manager.flushNow();
+				const path = manager.getSessionFile()!;
+				expect(buildSessionList([], [(await readSessionInfo(path))!])[0]?.taskState).toBe("completed");
+				if (kind === "accepted revision") {
+					manager.appendClmRevision(
+						{ blocks: [{ id, message: { ...accepted, content: "x".repeat(1_100_000) } }] },
+						id,
+						"restore:oversized",
+					);
+				} else {
+					manager.appendCustomMessageEntry("opaque", "x".repeat(1_100_000), false);
+				}
+				manager.flushNow();
+				const saved = (await readSessionInfo(path))!;
+				expect(saved.messageCount).toBe(1);
+				expect(saved.clmStatusCurrent).toBe(false);
+				expect(buildSessionList([], [saved])[0]?.taskState).toBeUndefined();
+				expect((await readSessionInfo(path))?.clmStatusCurrent).toBe(false);
+			} finally {
+				rmSync(dir, { recursive: true, force: true });
+			}
+		},
+	);
+
 	it("degrades a corrupt CLM status projection without failing the roster", () => {
 		const state = makeState({
 			activeSessionId: "corrupt",
