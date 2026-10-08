@@ -248,6 +248,7 @@ export class DaemonSessionSummarizer {
 	// Sessions requested while one was running; get one more pass on completion.
 	private readonly rerunRequested = new Set<string>();
 	private readonly waitingForSlot = new Map<string, ActiveSessionState>();
+	private readonly settledClmIdentity = new Map<string, string>();
 	// Failed idle generations per session, keyed to the settled content they saw.
 	private readonly failedIdleGenerations = new Map<
 		string,
@@ -290,6 +291,7 @@ export class DaemonSessionSummarizer {
 		this.rerunRequested.clear();
 		this.waitingForSlot.clear();
 		this.failedIdleGenerations.clear();
+		this.settledClmIdentity.clear();
 	}
 
 	/** Drop any pending work for a session that is closing. */
@@ -303,6 +305,7 @@ export class DaemonSessionSummarizer {
 		this.rerunRequested.delete(activeSessionId);
 		this.waitingForSlot.delete(activeSessionId);
 		this.failedIdleGenerations.delete(activeSessionId);
+		this.settledClmIdentity.delete(activeSessionId);
 	}
 
 	/** Seed in-memory status from the persisted entry when a session is added. */
@@ -355,13 +358,16 @@ export class DaemonSessionSummarizer {
 			return;
 		}
 		const messageCount = messages.length;
+		const clmIdentity = usagePin?.mode === "on" ? this.acceptedStatusKey(usagePin) : undefined;
 		const isWorking = session.isSessionActive;
 		const previous = state.summaryState;
 		// Idle sessions with a current verdict need no refresh — except a
 		// transcript whose terminal turn errored (owesErrorVerdict below) —
 		// while working sessions always refresh so the recap keeps up with the
 		// in-progress turn.
-		const contentUnchanged = previous?.basedOnMessageCount === messageCount;
+		const contentUnchanged =
+			previous?.basedOnMessageCount === messageCount &&
+			(clmIdentity === undefined || this.settledClmIdentity.get(id) === clmIdentity);
 		const owesIdleVerdict = !isWorking && previous?.taskState === undefined;
 		// A blank recap means the model call hasn't succeeded yet (e.g. the
 		// needs_input fallback fired on a transient failure); keep retrying until a
@@ -389,6 +395,7 @@ export class DaemonSessionSummarizer {
 				basedOnMessageCount: messageCount,
 			};
 			this.commitStatus(state, session, status, { isWorking, previous, persist: true });
+			if (clmIdentity) this.settledClmIdentity.set(id, clmIdentity);
 			return;
 		}
 		// The leaf entry id is the branch-tip identity (appends, edits, and branch
@@ -452,14 +459,23 @@ export class DaemonSessionSummarizer {
 			}
 			// Discard if the session closed, was swapped, or moved to a new turn
 			// during the async call — never write a verdict for stale state.
+			let contextCurrent = session.messages.length === messageCount;
+			if (clmIdentity) {
+				try {
+					const current = await session.getClmAcceptedViewWithUsagePin();
+					contextCurrent =
+						current.view.messages.length === messageCount && this.acceptedStatusKey(current.pin) === clmIdentity;
+				} catch {
+					return;
+				}
+			}
 			if (
 				controller.signal.aborted ||
 				state.runtime.session !== session ||
 				session.isSessionActive !== isWorking ||
-				session.messages.length !== messageCount
-			) {
+				!contextCurrent
+			)
 				return;
-			}
 			// A working refresh carries no verdict; keep the prior one at the same
 			// message count so a still-valid needs_input isn't dropped.
 			const taskState =
@@ -472,6 +488,7 @@ export class DaemonSessionSummarizer {
 				{ summary: result.summary, taskState, basedOnMessageCount: messageCount },
 				{ isWorking, previous, persist: generated !== undefined },
 			);
+			if (clmIdentity) this.settledClmIdentity.set(id, clmIdentity);
 		} finally {
 			this.inFlight.delete(id);
 			this.admitNextWaitingSession();
@@ -480,6 +497,10 @@ export class DaemonSessionSummarizer {
 				this.notifyActivity(state);
 			}
 		}
+	}
+
+	private acceptedStatusKey(pin: ClmUsagePin): string {
+		return `${pin.epochId ?? ""}:${pin.revision ?? ""}:${pin.entryId ?? ""}`;
 	}
 
 	/**

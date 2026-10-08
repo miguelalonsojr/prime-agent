@@ -1,8 +1,11 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { fauxAssistantMessage, registerFauxProvider } from "@earendil-works/pi-ai";
 import { describe, expect, test, vi } from "vitest";
 import type { ModelRegistry } from "../src/core/model-registry.js";
-import type { AgentStatus } from "../src/core/session-manager.js";
+import { type AgentStatus, type ClmUsagePin, SessionManager } from "../src/core/session-manager.js";
 import { SettingsManager } from "../src/core/settings-manager.js";
 import type { ActiveSessionState } from "../src/modes/daemon/active-session-state.js";
 import {
@@ -13,6 +16,7 @@ import {
 	generateAgentStatus,
 	parseAgentStatusResponse,
 } from "../src/modes/daemon/daemon-session-summarizer.js";
+import { createDeferred } from "./suite/scheduling.js";
 
 function userMessage(text: string, timestamp = 0): AgentMessage {
 	return { role: "user", content: [{ type: "text", text }], timestamp } as unknown as AgentMessage;
@@ -212,8 +216,9 @@ describe("daemon session summarizer", () => {
 			summaryState?: AgentStatus;
 			persistedStatus?: AgentStatus;
 			appendAgentStatus?: (status: AgentStatus) => void;
+			recordClmUsage?: SessionManager["recordClmUsage"];
 			getLeafId?: () => string | null;
-			clmView?: () => Promise<{ view: { messages: AgentMessage[] }; pin: { mode: "on"; branchId: string | null } }>;
+			clmView?: () => Promise<{ view: { messages: AgentMessage[] }; pin: ClmUsagePin }>;
 		}): ActiveSessionState {
 			return {
 				activeSessionId: options.activeSessionId ?? "active-1",
@@ -228,6 +233,7 @@ describe("daemon session summarizer", () => {
 						state: { streamingMessage: undefined },
 						sessionManager: {
 							appendAgentStatus: options.appendAgentStatus ?? (() => {}),
+							recordClmUsage: options.recordClmUsage ?? (() => {}),
 							getLatestAgentStatus: () => options.persistedStatus,
 							getLeafId: options.getLeafId ?? (() => null),
 							getClmBranchState: () => ({ mode: options.clmView ? "on" : "off" }),
@@ -263,17 +269,72 @@ describe("daemon session summarizer", () => {
 		});
 
 		test("uses the accepted CLM view and rejects an unavailable view before generation", async () => {
-			const audit = [userMessage("removed secret")];
-			const accepted = [userMessage("kept task")];
-			const generate = vi.fn(async () => ({ summary: "Working", taskState: "needs_input" as const }));
+			const audit = [userMessage("removed secret"), assistantMessage("old reply")];
+			let accepted = [userMessage("kept task")];
+			let revision = 0;
+			const persisted = vi.fn();
+			let generated = 0;
+			const generate = vi.fn(async () => ({ summary: `Working ${++generated}`, taskState: "needs_input" as const }));
 			const state = makeState({
 				messages: audit,
 				isSessionActive: false,
-				clmView: async () => ({ view: { messages: accepted }, pin: { mode: "on", branchId: "entry" } }),
+				clmView: async () => ({
+					view: { messages: accepted },
+					pin: { mode: "on", branchId: "entry", epochId: "epoch", revision, entryId: `revision-${revision}` },
+				}),
+				appendAgentStatus: persisted,
 			});
 			const summarizer = new DaemonSessionSummarizer(() => [state], undefined, generate);
 			await (summarizer as unknown as { summarize(state: ActiveSessionState): Promise<void> }).summarize(state);
 			expect(generate).toHaveBeenCalledWith(expect.objectContaining({ messages: accepted }));
+			expect(state.summaryState).toMatchObject({ summary: "Working 1", basedOnMessageCount: 1 });
+			expect(persisted).toHaveBeenCalledOnce();
+			const priorStatus = state.summaryState;
+			accepted = [userMessage("restored task")];
+			revision = 1;
+			await (summarizer as unknown as { summarize(state: ActiveSessionState): Promise<void> }).summarize(state);
+			expect(generate).toHaveBeenCalledTimes(2);
+			expect(persisted).toHaveBeenCalledTimes(2);
+			const dir = mkdtempSync(join(tmpdir(), "clm-reopened-status-"));
+			try {
+				const manager = SessionManager.create(dir, join(dir, "sessions"));
+				const original = {
+					role: "user" as const,
+					content: [{ type: "text" as const, text: "kept task" }],
+					timestamp: 0,
+				};
+				const id = manager.appendMessage(original);
+				manager.appendClmOn({ blocks: [{ id, message: original }] }, id);
+				manager.appendAgentStatus(priorStatus!);
+				manager.appendClmRevision(
+					{
+						blocks: [
+							{ id, message: { ...original, content: [{ type: "text" as const, text: "restored task" }] } },
+						],
+					},
+					id,
+					"restore:test",
+				);
+				manager.flushNow();
+				const opened = SessionManager.open(manager.getSessionFile()!);
+				const reopened = makeState({
+					messages: audit,
+					isSessionActive: false,
+					summaryState: opened.getLatestAgentStatus(),
+					persistedStatus: opened.getLatestAgentStatus(),
+					clmView: async () => ({ view: { messages: accepted }, pin: opened.captureClmUsagePin() }),
+					appendAgentStatus: opened.appendAgentStatus.bind(opened),
+				});
+				const reopenedSummarizer = new DaemonSessionSummarizer(() => [reopened], undefined, generate);
+				await (reopenedSummarizer as unknown as { summarize(state: ActiveSessionState): Promise<void> }).summarize(
+					reopened,
+				);
+				expect(reopened.summaryState?.summary).toBe("Working 3");
+				opened.flushNow();
+				expect(SessionManager.open(manager.getSessionFile()!).getLatestAgentStatus()?.summary).toBe("Working 3");
+			} finally {
+				rmSync(dir, { recursive: true, force: true });
+			}
 			const corrupt = makeState({
 				messages: audit,
 				isSessionActive: false,
@@ -282,7 +343,76 @@ describe("daemon session summarizer", () => {
 				},
 			});
 			await (summarizer as unknown as { summarize(state: ActiveSessionState): Promise<void> }).summarize(corrupt);
-			expect(generate).toHaveBeenCalledTimes(1);
+			expect(generate).toHaveBeenCalledTimes(3);
+		});
+
+		test("keeps a zero-usage status failure unknown beside a pinned nonzero retry", async () => {
+			const dir = mkdtempSync(join(tmpdir(), "clm-status-receipt-"));
+			try {
+				const manager = SessionManager.create(dir, join(dir, "sessions"));
+				const accepted = {
+					role: "user" as const,
+					content: [{ type: "text" as const, text: "task" }],
+					timestamp: 0,
+				};
+				const id = manager.appendMessage(accepted);
+				manager.appendClmOn({ blocks: [{ id, message: accepted }] }, id);
+				const pin = manager.captureClmUsagePin();
+				const state = makeState({
+					messages: [accepted],
+					isSessionActive: false,
+					clmView: async () => ({ view: { messages: [accepted] }, pin }),
+					recordClmUsage: manager.recordClmUsage.bind(manager),
+				});
+				const generate = async (params: GenerateAgentStatusParams) => {
+					const zero = fauxAssistantMessage("failure", { stopReason: "error" });
+					params.onObservedResponse?.(zero);
+					params.onObservedResponse?.({ ...zero, usage: { ...zero.usage, input: 4, totalTokens: 4 } });
+					return { summary: "observed", taskState: "needs_input" as const };
+				};
+				const summarizer = new DaemonSessionSummarizer(() => [state], undefined, generate);
+				await (summarizer as unknown as { summarize(state: ActiveSessionState): Promise<void> }).summarize(state);
+				const receipts = manager
+					.getBranch()
+					.filter((entry) => entry.type === "custom" && entry.customType.startsWith("clm_usage_"));
+				expect(receipts.map((entry) => (entry.type === "custom" ? entry.customType : ""))).toEqual([
+					"clm_usage_unknown_v1",
+					"clm_usage_v1",
+				]);
+				expect(receipts[1]).toMatchObject({
+					data: { pin: { entryId: pin.entryId, revision: pin.revision }, usage: { input: 4 } },
+				});
+				expect(manager.getClmMeasuredUsage()).toBeUndefined();
+			} finally {
+				rmSync(dir, { recursive: true, force: true });
+			}
+		});
+
+		test("discards a status result when the accepted revision changes during generation", async () => {
+			const [started, release] = [createDeferred(), createDeferred()];
+			let revision = 0;
+			const state = makeState({
+				messages: [userMessage("audit")],
+				isSessionActive: false,
+				clmView: async () => ({
+					view: { messages: [userMessage("accepted")] },
+					pin: { mode: "on", branchId: "entry", epochId: "epoch", revision, entryId: `rev-${revision}` },
+				}),
+			});
+			const generate = vi.fn(async () => {
+				started.resolve();
+				await release.promise;
+				return { summary: "stale", taskState: "completed" as const };
+			});
+			const summarizer = new DaemonSessionSummarizer(() => [state], undefined, generate);
+			const pending = (summarizer as unknown as { summarize(state: ActiveSessionState): Promise<void> }).summarize(
+				state,
+			);
+			await started.promise;
+			revision = 1;
+			release.resolve();
+			await pending;
+			expect(state.summaryState).toBeUndefined();
 		});
 
 		function failingIdleSetup(

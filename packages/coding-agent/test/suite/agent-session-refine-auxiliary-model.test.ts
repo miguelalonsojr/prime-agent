@@ -19,6 +19,8 @@ vi.mock("@earendil-works/pi-ai", async (importOriginal) => {
 	};
 });
 
+import { SessionManager } from "../../src/core/session-manager.js";
+import { emptyUsage } from "../../src/core/usage.js";
 import { createHarness, type Harness } from "./harness.js";
 
 function assistantText(text: string): AssistantMessage {
@@ -198,6 +200,38 @@ describe("AgentSession refinement auxiliary model", () => {
 			}
 		},
 	);
+
+	it("marks zero-usage refinement errors unknown while retaining a measured retry", async () => {
+		const h = await createHarness({
+			persistSession: true,
+			settings: { retry: { enabled: true, maxRetries: 1, baseDelayMs: 0 } },
+		});
+		harnesses.push(h);
+		const watermark = h.sessionManager.appendMessage(userMsg("task"));
+		h.sessionManager.appendClmOn({ blocks: [{ id: watermark, message: userMsg("task") }] }, watermark);
+		const first = { ...assistantText("failure"), stopReason: "error" as const, usage: emptyUsage() };
+		const second = emptyProposalResponse();
+		second.usage.cacheRead = 13;
+		completeSimpleMock.mockResolvedValueOnce(first).mockResolvedValueOnce(second);
+		await h.session.refine();
+		const receipts = h.sessionManager
+			.getBranch()
+			.filter((entry) => entry.type === "custom" && entry.customType.startsWith("clm_usage_"));
+		expect(receipts.map((entry) => (entry.type === "custom" ? entry.customType : ""))).toEqual([
+			"clm_usage_unknown_v1",
+			"clm_usage_v1",
+		]);
+		expect(receipts[1]).toMatchObject({ data: { pin: { revision: 0 }, usage: { cacheRead: 13 } } });
+		expect((await h.session.getClmStatus()).measuredUsage).toBeUndefined();
+		expect(JSON.stringify(h.sessionManager.buildSessionContext().messages)).not.toContain("clm_usage_unknown_v1");
+		h.sessionManager.flushNow();
+		const reopened = SessionManager.open(h.session.sessionFile!);
+		expect(reopened.getClmMeasuredUsage()).toBeUndefined();
+		reopened.branch(receipts[0].id);
+		expect(reopened.getClmMeasuredUsage()).toBeUndefined();
+		reopened.branch(receipts[1].id);
+		expect(reopened.getClmMeasuredUsage()).toBeUndefined();
+	});
 
 	it("keeps the original accepted revision on a refinement retry after a new revision appears", async () => {
 		const h = await createHarness({

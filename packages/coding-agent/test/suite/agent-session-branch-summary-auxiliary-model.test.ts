@@ -46,7 +46,10 @@ describe("AgentSession branch summary auxiliary model", () => {
 		],
 	];
 	it.each(cases)("%s", async (_label, options, expectedModel) => {
-		completeSimpleMock.mockReset().mockResolvedValue(fauxAssistantMessage("Test summary"));
+		const observed = fauxAssistantMessage("Test summary");
+		observed.usage.input = 3;
+		observed.usage.totalTokens = 3;
+		completeSimpleMock.mockReset().mockResolvedValue(observed);
 		const warnSpy = vi.spyOn(console, "warn");
 		warnSpy.mockReset().mockImplementation(() => {});
 		const harness = await createHarness({

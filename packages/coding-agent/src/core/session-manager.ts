@@ -167,7 +167,7 @@ function isObservedClmUsage(value: unknown): value is Usage {
 	const usage = value as Partial<Usage>;
 	const cost = usage.cost;
 	if (!cost || typeof cost !== "object") return false;
-	return [
+	const values = [
 		usage.input,
 		usage.output,
 		usage.cacheRead,
@@ -178,7 +178,11 @@ function isObservedClmUsage(value: unknown): value is Usage {
 		cost.cacheRead,
 		cost.cacheWrite,
 		cost.total,
-	].every((number) => typeof number === "number" && Number.isFinite(number) && number >= 0);
+	];
+	return (
+		values.every((number) => typeof number === "number" && Number.isFinite(number) && number >= 0) &&
+		values.some((number) => typeof number === "number" && number > 0)
+	);
 }
 
 export interface ClmBranchState {
@@ -2399,6 +2403,14 @@ export class SessionManager {
 	}
 
 	recordClmUsage(pin: ClmUsagePin, usage: Usage, messageEntryId?: string): void {
+		if (!isObservedClmUsage(usage)) {
+			this.appendCustomEntry("clm_usage_unknown_v1", {
+				version: 1,
+				pin,
+				...(messageEntryId ? { messageEntryId } : {}),
+			});
+			return;
+		}
 		const receipt: ClmUsageReceipt = {
 			version: 1,
 			pin,

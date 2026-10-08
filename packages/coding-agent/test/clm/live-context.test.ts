@@ -79,7 +79,22 @@ describe("CLM live context", () => {
 		const f = await fixture();
 		const pin = f.manager.captureClmUsagePin();
 		expect(f.manager.getClmMeasuredUsage()).toBeUndefined();
+		f.manager.recordClmUsage(pin, emptyUsage());
+		expect(
+			f.manager.getBranch().filter((entry) => entry.type === "custom" && entry.customType === "clm_usage_v1"),
+		).toEqual([]);
+		expect(
+			f.manager
+				.getBranch()
+				.filter((entry) => entry.type === "custom" && entry.customType === "clm_usage_unknown_v1"),
+		).toHaveLength(1);
+		expect(f.manager.getClmMeasuredUsage()).toBeUndefined();
+		f.manager.flushNow();
+		expect(SessionManager.open(f.manager.getSessionFile()!).getClmMeasuredUsage()).toBeUndefined();
 		f.manager.appendCustomEntry("clm_usage_v2", { version: 2, pin, usage: emptyUsage() });
+		expect(f.manager.getClmMeasuredUsage()).toBeUndefined();
+		f.manager.branch(pin.branchId!);
+		f.manager.appendCustomEntry("clm_usage_v1", { version: 1, pin, usage: emptyUsage() });
 		expect(f.manager.getClmMeasuredUsage()).toBeUndefined();
 		f.manager.branch(pin.branchId!);
 		f.manager.recordClmUsage(pin, { ...emptyUsage(), cost: { ...emptyUsage().cost, input: Number.NaN } });

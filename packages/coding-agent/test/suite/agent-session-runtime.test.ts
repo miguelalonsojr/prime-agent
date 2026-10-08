@@ -295,6 +295,47 @@ describe("AgentSessionRuntime characterization", () => {
 		await expect(session.restoreClmRevision(on.epochId!, 0)).rejects.toThrow(/CLM/);
 	});
 
+	it("keeps an early zero-usage provider failure unknown instead of a measured receipt", async () => {
+		const { runtime, faux } = await createRuntimeForTest(() => {});
+		const session = runtime.session;
+		await session.setClmMode(true);
+		faux.setResponses([
+			() => {
+				throw new Error("early provider failure");
+			},
+		]);
+		await session.prompt("failed request");
+		const receipts = session.sessionManager
+			.getBranch()
+			.filter((entry) => entry.type === "custom" && entry.customType.startsWith("clm_usage_"));
+		expect(receipts.filter((entry) => entry.type === "custom" && entry.customType === "clm_usage_v1")).toEqual([]);
+		expect(receipts.some((entry) => entry.type === "custom" && entry.customType === "clm_usage_unknown_v1")).toBe(
+			true,
+		);
+		expect((await session.getClmStatus()).measuredUsage).toBeUndefined();
+	});
+
+	it("persists observed nonzero usage from an errored provider attempt", async () => {
+		const { runtime, faux } = await createRuntimeForTest(() => {});
+		const session = runtime.session;
+		await session.setClmMode(true);
+		session.settingsManager.applyOverrides({ retry: { enabled: false } });
+		faux.setResponses([fauxAssistantMessage("partial answer", { stopReason: "error" })]);
+		await session.prompt("request that fails after output");
+		const receipts = session.sessionManager
+			.getBranch()
+			.filter((entry) => entry.type === "custom" && entry.customType.startsWith("clm_usage_"));
+		expect(receipts).toHaveLength(1);
+		expect(receipts[0]).toMatchObject({
+			customType: "clm_usage_v1",
+			data: { pin: { revision: 0 }, usage: { input: expect.any(Number) } },
+		});
+		if (receipts[0]?.type !== "custom") throw new Error("missing observed error receipt");
+		expect((receipts[0].data as { usage: { input: number } }).usage.input).toBeGreaterThan(0);
+		// Error recovery selects a new accepted revision, so the old pinned receipt is not its subtotal.
+		expect((await session.getClmStatus()).measuredUsage).toBeUndefined();
+	});
+
 	it("attributes provider usage to the selected CLM revision after restore and reopen", async () => {
 		const { runtime, faux } = await createRuntimeForTest(() => {});
 		const session = runtime.session;
