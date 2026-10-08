@@ -2322,10 +2322,13 @@ describe("CLM action identity", () => {
 				expect(nextProviderCall).toHaveBeenCalledTimes(1);
 				harness.setResponses([fauxAssistantMessage(refinePlanJson("after writer repair"))]);
 				expect((await harness.session.refine()).summary).toBe("after writer repair");
+				const beforeDrift = readFileSync(manager.getSessionFile()!, "utf8");
 				await writeFile(path, "unowned drift");
+				await expect(harness.session.restoreClmRevision(epoch, 0)).rejects.toThrow(/drift/);
 				await expect(harness.session.projectClmContext([])).rejects.toThrow(/drift/);
 				await expect(harness.session.restoreClmRevision(epoch, 0)).rejects.toThrow(/drift/);
 				expect(readFileSync(path, "utf8")).toBe("unowned drift");
+				expect(readFileSync(manager.getSessionFile()!, "utf8")).toBe(beforeDrift);
 			} else {
 				await expect(harness.session.restoreClmRevision(epoch, 0)).rejects.toThrow(/writer/);
 				expect(manager.getClmBranchState().revision).toBe(1);

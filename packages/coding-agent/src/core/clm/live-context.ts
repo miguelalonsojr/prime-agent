@@ -301,6 +301,7 @@ export class LiveContextController {
 				);
 			if (!target || (target.type !== "clm_on" && target.type !== "clm_revision"))
 				throw new Error("CLM restore target is not an ancestor on the selected branch");
+			const leafId = this.sessionManager.getLeafId();
 			const { pending } = this.acceptedContext();
 			if (pending.length) throw new Error("CLM cannot restore with an unfinished tool group");
 			const { watermark } = this.sessionManager.captureClmContext();
@@ -309,7 +310,9 @@ export class LiveContextController {
 			LiveContextController.checkDocumentSize(rendered);
 			parseContextDocument(rendered, target.snapshot);
 			if (this.cancelled) await this.repairCancelledMirror();
+			else await this.checkDrift();
 			this.assertIdle();
+			if (this.sessionManager.getLeafId() !== leafId) throw new Error("CLM session changed before restore");
 			const id = this.sessionManager.appendClmRevision(target.snapshot, watermark, `restore:${epochId}:${revision}`);
 			await this.publishAcceptedRevision(id, new Set(target.snapshot.blocks.map((block) => block.id)));
 		});
