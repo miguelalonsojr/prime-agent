@@ -1,4 +1,4 @@
-import { writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
@@ -98,7 +98,7 @@ it("keeps audit attachment available when CLM snapshot fails", async () => {
 		expect(on).toMatchObject({ mode: "on", modeSource: "session-override", revision: 0 });
 		expect((await local.setClmMode(false)).mode).toBe("off");
 		await connection.setClmMode(true);
-		const first = await connection.getClmModelSnapshot();
+		const [first, publishedMirror] = await Promise.all([connection.getClmModelSnapshot(), readFileSync(on.path)]);
 		writeFileSync(on.path, "pending unaccepted edit");
 		for (const adapter of [local, connection]) expect(await adapter.getClmModelSnapshot()).toEqual(first);
 		await expect(local.startSideQuestion("local", "question")).rejects.toThrow("CLM");
@@ -110,10 +110,10 @@ it("keeps audit attachment available when CLM snapshot fails", async () => {
 				question: "question",
 			}),
 		).resolves.toMatchObject({ success: false, error: expect.stringContaining("CLM") });
+		writeFileSync(on.path, publishedMirror);
 		expect((await connection.restoreClmRevision(first.epochId, 0)).revision).toBe(1);
-		expect(await connection.getClmStatus()).toMatchObject({ revision: 1 });
+		expect([(await connection.getClmStatus()).revision, (await local.getClmStatus()).revision]).toEqual([1, 1]);
 		expect(await connection.getClmModelSnapshot()).toEqual({ ...first, revision: 1 });
-		expect(await local.getClmStatus()).toMatchObject({ revision: 1 });
 		expect((await local.restoreClmRevision(first.epochId, 0)).revision).toBe(2);
 		const revisions = harness.sessionManager.getEntries().filter((entry) => entry.type === "clm_revision");
 		revisions.at(-1)!.checksum = "corrupt";
