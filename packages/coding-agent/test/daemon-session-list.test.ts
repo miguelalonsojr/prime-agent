@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { copyFileSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
@@ -166,6 +166,66 @@ describe("buildSessionList", () => {
 			}
 		},
 	);
+
+	it("hides stale status when the initial CLM boundary and its revision are oversized", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "clm-list-initial-oversized-"));
+		try {
+			const manager = SessionManager.create(dir, join(dir, "sessions"));
+			const first = { role: "user" as const, content: "a".repeat(1_100_000), timestamp: 1 };
+			const id = manager.appendMessage(first);
+			manager.appendClmOn({ blocks: [{ id, message: first }] }, id);
+			manager.appendAgentStatus({ summary: "old", taskState: "completed", basedOnMessageCount: 1 });
+			manager.flushNow();
+			const path = manager.getSessionFile()!;
+			await readSessionInfo(path); // Prime the incremental scan before the revision is appended.
+			manager.appendClmRevision(
+				{ blocks: [{ id, message: { ...first, content: "b".repeat(1_100_000) } }] },
+				id,
+				"restore:oversized-initial",
+			);
+			manager.flushNow();
+			const coldPath = join(dir, "cold.jsonl");
+			copyFileSync(path, coldPath);
+			for (const scanPath of [path, coldPath]) {
+				const saved = (await readSessionInfo(scanPath))!;
+				expect(saved.messageCount).toBe(1);
+				expect(saved.clmStatusCurrent).toBe(false);
+				expect(buildSessionList([], [saved])[0]?.taskState).toBeUndefined();
+			}
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it.each(["normal", "CLM-off"] as const)("keeps %s status current beside an oversized tool result", async (mode) => {
+		const dir = mkdtempSync(join(tmpdir(), "clm-list-large-tool-"));
+		try {
+			const manager = SessionManager.create(dir, join(dir, "sessions"));
+			const user = { role: "user" as const, content: "task", timestamp: 1 };
+			const id = manager.appendMessage(user);
+			if (mode === "CLM-off") {
+				const snapshot = { blocks: [{ id, message: user }] };
+				manager.appendClmOn(snapshot, id);
+				manager.appendClmOffBoundary(snapshot, id);
+			}
+			manager.appendMessage({
+				role: "toolResult",
+				toolCallId: "call-1",
+				toolName: "faux",
+				content: [{ type: "text", text: "x".repeat(1_100_000) }],
+				isError: false,
+				timestamp: 2,
+			});
+			manager.appendAgentStatus({ summary: "current", taskState: "completed", basedOnMessageCount: 2 });
+			manager.flushNow();
+			const saved = (await readSessionInfo(manager.getSessionFile()!))!;
+			expect(saved.messageCount).toBe(2);
+			expect(saved.clmStatusCurrent).toBeUndefined();
+			expect(buildSessionList([], [saved])[0]?.taskState).toBe("completed");
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
 
 	it("degrades a corrupt CLM status projection without failing the roster", () => {
 		const state = makeState({

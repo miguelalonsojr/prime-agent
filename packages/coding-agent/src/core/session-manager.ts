@@ -1497,10 +1497,6 @@ function appendCappedSearchText(current: string, text: string): string {
 	return current + next.slice(0, SESSION_LIST_SEARCH_TEXT_MAX_CHARS - current.length);
 }
 
-function looksLikeMessageEntry(line: string): boolean {
-	return line.includes('"type":"message"') || line.includes('"type": "message"');
-}
-
 function extractJsonStringPropertyPrefix(
 	text: string,
 	propertyName: string,
@@ -1829,8 +1825,12 @@ function foldSessionScanLine(acc: SessionScanAccumulator, lineBuffer: Buffer): v
 	// session-list metadata we need, and parsing them during every refresh
 	// can exhaust the daemon heap.
 	if (line.length > SESSION_LIST_PARSE_MAX_LINE_CHARS) {
+		const header = line.slice(0, SESSION_LIST_HEADER_PREFIX_MAX_CHARS);
+		const isMessage = extractJsonStringPropertyPrefix(header, "type", 32) === "message";
+		// A skipped first CLM boundary must not fall through to raw-count status currency.
 		if (acc.clm) acc.clm.valid = false;
-		if (looksLikeMessageEntry(line)) {
+		else if (!isMessage) acc.clm = { acceptedCount: 0, revisionId: "", contentTipId: "", valid: false };
+		if (isMessage) {
 			acc.messageCount++;
 			const summary = extractOversizedMessageSummary(line);
 			if (typeof summary.timestamp === "number" && (summary.role === "user" || summary.role === "assistant")) {
