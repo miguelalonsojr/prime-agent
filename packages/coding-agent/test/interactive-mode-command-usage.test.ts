@@ -1,4 +1,6 @@
 import { beforeAll, describe, expect, it, vi } from "vitest";
+import type { ClmStatus } from "../src/core/clm/live-context.js";
+import { emptyUsage } from "../src/core/usage.js";
 import { InteractiveMode } from "../src/modes/interactive/interactive-mode.js";
 import { initTheme } from "../src/modes/interactive/theme/theme.js";
 
@@ -98,5 +100,125 @@ describe("InteractiveMode no-argument command usage errors", () => {
 		await context.defaultEditor.onSubmit?.("/speed banana");
 		expect(context.showError).toHaveBeenCalledWith("Usage: /speed [on|off]");
 		expect((context.agentConnection as { prompt: ReturnType<typeof vi.fn> }).prompt).not.toHaveBeenCalled();
+	});
+});
+describe("CLM interactive commands", () => {
+	beforeAll(() => initTheme("dark"));
+	function setup(overrides: Partial<ClmStatus> = {}) {
+		const context = makeSubmitContext();
+		Object.setPrototypeOf(context, InteractiveMode.prototype);
+		const calls: string[] = [];
+		const status: ClmStatus = {
+			mode: "on",
+			configuredDefault: false,
+			modeSource: "session-override",
+			path: "/tmp/clm/context.txt",
+			epochId: "epoch",
+			revision: 2,
+			recentRevisions: [],
+			...overrides,
+		};
+		const usage = emptyUsage();
+		usage.input = 7;
+		usage.cost.total = 0.25;
+		const tree = {
+			id: "root",
+			label: "agent",
+			status: "active" as const,
+			ownUsage: usage,
+			totalUsage: usage,
+			children: [],
+		};
+		const connection = {
+			prompt: vi.fn(),
+			startSideQuestion: vi.fn(),
+			getClmStatus: vi.fn(async () => status),
+			setClmMode: vi.fn(async () => status),
+			restoreClmRevision: vi.fn(async () => status),
+			getMessages: vi.fn(async () => [{ role: "user", content: "deleted audit and pending bytes" }]),
+			getClmModelSnapshot: vi.fn(async () => ({
+				epochId: "epoch",
+				revision: 2,
+				messages: [{ role: "user", content: "accepted text" }],
+			})),
+			getContextTree: vi.fn(async () => tree),
+		};
+		Object.assign(context, {
+			showWarning: vi.fn(),
+			sideQuestionContainer: { clear: vi.fn() },
+			uiServices: { settingsManager: {} },
+			agentConnection: connection,
+			ui: { terminal: { columns: 120 }, requestRender: vi.fn() },
+			chatContainer: {
+				addChild: (component: { render?: (width: number) => string[] }) => {
+					if (component.render) calls.push(component.render(120).join("\n"));
+				},
+			},
+		});
+		prototype.setupEditorSubmitHandler.call(context);
+		return { context, connection, calls, status, submit: (text: string) => context.defaultEditor.onSubmit!(text) };
+	}
+	it("shows accepted revision only and never reads pending file bytes", async () => {
+		const { submit, calls } = setup();
+		await submit("/clm view");
+		expect(calls.join("\n")).toContain("epoch:2");
+		expect(calls.join("\n")).toContain("user: accepted text");
+		expect(calls.join("\n")).not.toContain("deleted audit and pending bytes");
+	});
+	it("validates restore before connection and keeps malformed commands out of chat", async () => {
+		const { submit, connection, context } = setup();
+		await submit("/clm restore bad");
+		expect(context.showError).toHaveBeenCalledWith(expect.stringContaining("Usage: /clm"));
+		expect(connection.restoreClmRevision).not.toHaveBeenCalled();
+		await submit("/clm restore epoch:2");
+		expect(connection.restoreClmRevision).toHaveBeenCalledWith("epoch", 2);
+		expect(connection.prompt).not.toHaveBeenCalled();
+	});
+	it("keeps old-daemon errors local and the audit report usable", async () => {
+		const { submit, connection, calls, context } = setup();
+		connection.getClmStatus.mockRejectedValueOnce(new Error("CLM unsupported by old daemon"));
+		await submit("/clm status");
+		expect(context.showError).toHaveBeenCalledWith(expect.stringContaining("unsupported"));
+		expect(connection.prompt).not.toHaveBeenCalled();
+		connection.getClmStatus.mockRejectedValueOnce(new Error("old daemon"));
+		await submit("/context");
+		expect(calls.join("\n")).toContain("$0.25");
+	});
+	it("labels estimates separately from observed usage and unknown legacy attribution", async () => {
+		const { submit, connection, calls, status } = setup({
+			estimatedOccupancy: { estimatedInputTokens: 310, outputReserveTokens: 90, maxInputTokens: 410 },
+			measuredUsage: { input: 16, output: 3, cacheRead: 2, cacheWrite: 1, cost: 0.04 },
+		});
+		await submit("/context");
+		expect(calls.join("\n")).toMatch(/Estimated occupancy: 310 tokens/);
+		expect(calls.join("\n")).toContain("Estimated input budget: 410 tokens");
+		expect(calls.join("\n")).toContain("Estimated output reserve: 90 tokens");
+		expect(calls.join("\n")).toMatch(/Observed billed usage.*16 input.*\$0.04/);
+		connection.getClmStatus.mockResolvedValueOnce({ ...status, measuredUsage: undefined, modeSource: "unknown" });
+		await submit("/context");
+		expect(calls.at(-1)).toContain("Observed billed usage (current revision): unknown");
+	});
+	it("does not present invalid receipts as billed usage", async () => {
+		const { submit, calls } = setup({
+			measuredUsage: { input: -1, output: 0, cacheRead: 0, cacheWrite: 0, cost: NaN },
+		});
+		await submit("/context");
+		expect(calls.at(-1)).toContain("Observed billed usage (current revision): unknown");
+	});
+	it("rejects a CLM-on side question before provider work", async () => {
+		const { context, connection } = setup();
+		await (
+			InteractiveMode.prototype as unknown as {
+				handleSideQuestion(this: SubmitContext, question: string): Promise<void>;
+			}
+		).handleSideQuestion.call(context, "why?");
+		expect(context.showWarning).toHaveBeenCalledWith(expect.stringContaining("CLM is on"));
+		expect(connection.startSideQuestion).not.toHaveBeenCalled();
+	});
+	it("warns about older binaries when enabling CLM", async () => {
+		const { submit, connection, context } = setup();
+		await submit("/clm on");
+		expect(connection.setClmMode).toHaveBeenCalledWith(true);
+		expect(context.showWarning).toHaveBeenCalledWith(expect.stringContaining("Older Prime Agent binaries"));
 	});
 });

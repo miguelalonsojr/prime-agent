@@ -173,3 +173,10 @@ describe("ENG-6014 literal prompt arguments", () => {
 		expect(expandPromptTemplate(`/explain ${input}`, [explainTemplate])).toBe(expected);
 	});
 });
+test("registers /clm with argument completion and keeps it local", () => {
+	const command = BUILTIN_SLASH_COMMANDS.find((entry) => entry.name === "clm");
+	expect(command?.argumentHint).toContain("restore");
+	expect(builtinSlashCommandTakesArgument("clm")).toBe(true);
+	expect(parseSlashCommand("/clm restore epoch:2")).toEqual({ name: "clm", args: "restore epoch:2" });
+	expect(parseSessionSlashCommand("/clm on")).toBeUndefined();
+});

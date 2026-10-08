@@ -129,6 +129,12 @@ const CANONICAL_BUILTIN_SLASH_COMMANDS: ReadonlyArray<BuiltinSlashCommand> = [
 		description: "Preview, upload, or configure Prime Agent traces",
 		argumentHint: "[status|on|off|preview|upload|upload-current|upload-all|login]",
 	},
+	{
+		name: "clm",
+		description: "Manage accepted model context",
+		argumentHint: "[on|off|status|view|restore <epoch:revision>]",
+		takesArgument: true,
+	},
 	{ name: "context", description: "Show token, cost, and context usage for agent and sub-agents" },
 	{ name: "changelog", description: "Show changelog entries" },
 	{

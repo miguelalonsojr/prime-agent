@@ -86,6 +86,7 @@ import {
 } from "../../core/agent-traces.js";
 import { isNoModelsAvailableMessage } from "../../core/auth-guidance.js";
 import type { AuthCredential } from "../../core/auth-storage.js";
+import type { ClmStatus } from "../../core/clm/live-context.js";
 import {
 	type AgentCronJob,
 	type AgentHeartbeatManagementAction,
@@ -5018,6 +5019,10 @@ export class InteractiveMode {
 			this.showWarning("Usage: /btw <question>");
 			return;
 		}
+		if ((await this.agentConnection.getClmStatus().catch(() => undefined))?.mode === "on") {
+			this.showWarning("Side questions are unavailable while CLM is on. Use /clm off first.");
+			return;
+		}
 		if (this.activeSideQuestionId) {
 			this.showWarning("Wait for the current side question to finish or cancel it first.");
 			return;
@@ -5347,6 +5352,12 @@ export class InteractiveMode {
 				if (commandName === "traces") {
 					await this.handleTracesCommand(canonicalCommandText);
 					this.editor.setText("");
+					return;
+				}
+				if (commandName === "clm") {
+					this.editor.setText("");
+					this.echoLocalCommand(text);
+					await this.handleClmCommand(commandArgs);
 					return;
 				}
 				if (commandName === "context") {
@@ -11512,12 +11523,23 @@ export class InteractiveMode {
 			if (outputPath?.endsWith(".jsonl")) {
 				const filePath = await this.agentConnection.exportToJsonl(outputPath);
 				this.showStatus(`Session exported to: ${filePath}`);
+				await this.showClmExportWarning();
 			} else {
 				const filePath = await this.agentConnection.exportToHtml(outputPath);
 				this.showStatus(`Session exported to: ${filePath}`);
+				await this.showClmExportWarning();
 			}
 		} catch (error: unknown) {
 			this.showError(`Failed to export session: ${error instanceof Error ? error.message : "Unknown error"}`);
+		}
+	}
+
+	private async showClmExportWarning(): Promise<void> {
+		const status = await this.agentConnection.getClmStatus().catch(() => undefined);
+		if (status?.mode === "on" || status?.epochId) {
+			this.showWarning(
+				"Older Prime Agent binaries can ignore CLM edits and replay the audit when opening this export.",
+			);
 		}
 	}
 
@@ -12091,12 +12113,113 @@ export class InteractiveMode {
 		this.showWarning("Usage: /traces [status|on|off|preview|upload|upload-current|upload-all|login]");
 	}
 
+	private async handleClmCommand(args: string): Promise<void> {
+		const restore = /^restore\s+([^\s:]+):([0-9]+)$/.exec(args);
+		if (!["on", "off", "status", "view"].includes(args) && !restore) {
+			this.showError("Usage: /clm on|off|status|view|restore <epoch:revision>");
+			return;
+		}
+		try {
+			if (args === "view") {
+				const snapshot = await this.agentConnection.getClmModelSnapshot();
+				const messages = snapshot.messages.map((message) => this.formatClmMessage(message)).join("\n\n");
+				this.showClmText(
+					`Accepted model context ${snapshot.epochId}:${snapshot.revision} (read-only)\n${messages}`,
+				);
+				return;
+			}
+			let status: ClmStatus;
+			if (restore) {
+				const revision = Number(restore[2]);
+				if (!Number.isSafeInteger(revision) || revision < 1) {
+					this.showError("Usage: /clm restore <epoch:revision>");
+					return;
+				}
+				status = await this.agentConnection.restoreClmRevision(restore[1], revision);
+			} else if (args === "on" || args === "off") {
+				status = await this.agentConnection.setClmMode(args === "on");
+			} else {
+				status = await this.agentConnection.getClmStatus();
+			}
+			this.showClmText(this.formatClmStatus(status));
+			if (args === "on")
+				this.showWarning(
+					"Older Prime Agent binaries can ignore CLM edits and replay the audit. Do not downgrade this session.",
+				);
+		} catch (error) {
+			this.showError(`CLM unavailable: ${error instanceof Error ? error.message : String(error)}`);
+		}
+	}
+
+	private formatClmMessage(message: AgentMessage): string {
+		if (!("content" in message)) return `${message.role}: ${JSON.stringify(message)}`;
+		const content = message.content;
+		if (typeof content === "string") return `${message.role}: ${content}`;
+		if (!Array.isArray(content)) return `${message.role}: ${JSON.stringify(content)}`;
+		const parts = content.map((part) => {
+			if (part.type === "text") return part.text;
+			if (part.type === "image") return `[image: ${part.mimeType}]`;
+			return JSON.stringify(part);
+		});
+		return `${message.role}: ${parts.join("\n")}`;
+	}
+
+	private showClmText(text: string): void {
+		this.chatContainer.addChild(new Spacer(1));
+		this.chatContainer.addChild(new Text(text, 1, 0));
+		this.ui.requestRender();
+	}
+
+	private formatClmStatus(status: ClmStatus): string {
+		const revision =
+			status.epochId !== undefined && status.revision !== undefined
+				? `${status.epochId}:${status.revision}`
+				: "unknown";
+		const usage = status.measuredUsage;
+		const hasMeasuredUsage =
+			usage !== undefined &&
+			[usage.input, usage.output, usage.cacheRead, usage.cacheWrite].every(
+				(value) => Number.isSafeInteger(value) && value >= 0,
+			) &&
+			Number.isFinite(usage.cost) &&
+			usage.cost >= 0;
+		const estimate = status.estimatedOccupancy?.estimatedInputTokens;
+		const estimatedTokens =
+			estimate !== undefined && Number.isSafeInteger(estimate) && estimate >= 0 ? estimate : "unknown";
+		const maxInput = status.estimatedOccupancy?.maxInputTokens;
+		const estimatedBudget =
+			maxInput !== null && maxInput !== undefined && Number.isSafeInteger(maxInput) && maxInput >= 0
+				? maxInput
+				: "unknown";
+		const reserve = status.estimatedOccupancy?.outputReserveTokens;
+		const estimatedReserve =
+			reserve !== null && reserve !== undefined && Number.isSafeInteger(reserve) && reserve >= 0
+				? reserve
+				: "unknown";
+		return [
+			`CLM: ${status.mode} (configured default: ${status.configuredDefault ? "on" : "off"}; source: ${status.modeSource ?? "unknown"})`,
+			`Accepted revision: ${revision}`,
+			`Context file: ${status.path}`,
+			`Recent accepted revisions: ${status.recentRevisions?.map((item) => `${item.epochId}:${item.revision}`).join(", ") || "none"}`,
+			`Estimated occupancy: ${estimatedTokens} tokens`,
+			`Estimated input budget: ${estimatedBudget} tokens`,
+			`Estimated output reserve: ${estimatedReserve} tokens`,
+			`Observed billed usage (current revision): ${hasMeasuredUsage ? `${usage.input} input, ${usage.output} output, ${usage.cacheRead} cache read, ${usage.cacheWrite} cache write, $${usage.cost}` : "unknown"}`,
+			status.warning ? `Warning: ${status.warning}` : undefined,
+			status.error ? `Recovery error: ${status.error}` : undefined,
+		]
+			.filter((line) => line !== undefined)
+			.join("\n");
+	}
+
 	private async handleContextCommand(): Promise<void> {
 		let info: string;
 		try {
 			const tree = await this.agentConnection.getContextTree();
 			const width = Math.max(60, Math.min(this.ui.terminal.columns - 2, 120));
 			info = formatContextTree(tree, width);
+			const status = await this.agentConnection.getClmStatus().catch(() => undefined);
+			if (status) info += `\n\n${this.formatClmStatus(status)}`;
 		} catch (error) {
 			this.showError(error instanceof Error ? error.message : String(error));
 			return;
