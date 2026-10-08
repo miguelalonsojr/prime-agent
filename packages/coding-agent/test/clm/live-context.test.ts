@@ -51,6 +51,23 @@ async function fixture(messages: AuditMessage[] = [user("obsolete"), user("curre
 }
 
 describe("CLM live context", () => {
+	it("inspects oversized durable context without relaxing provider or mirror limits", async () => {
+		const accepted = user("a".repeat(20 * 1024 * 1024));
+		const later = user("b".repeat(14 * 1024 * 1024));
+		const f = await fixture([accepted]);
+		f.manager.appendMessage(later);
+		f.manager.flushNow();
+		await expect(f.project()).rejects.toThrow(/32 MiB/);
+		await expect(f.prepare()).rejects.toThrow(/32 MiB/);
+		await writeFile(f.path, "pending bytes");
+		await expect(LiveContextController.readAcceptedView(f.manager)).resolves.toEqual({
+			epochId: f.manager.getClmBranchState().epochId,
+			revision: 0,
+			messages: [accepted, later],
+		});
+		expect(await readFile(f.path, "utf8")).toBe("pending bytes");
+	});
+
 	it("pins a read behind restore without importing pending mirror bytes", async () => {
 		const f = await fixture();
 		await f.prepare();

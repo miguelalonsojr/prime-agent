@@ -246,7 +246,7 @@ export class LiveContextController {
 		let messages: AgentMessage[];
 		if (state.mode === "on") {
 			this.assertIdle();
-			const { snapshot, pending } = this.acceptedContext();
+			const { snapshot, pending } = this.acceptedContext(undefined, false);
 			messages = [...snapshot.blocks, ...pending].map((block) => block.message);
 		} else {
 			parseContextDocument(renderContextDocument(state.snapshot, new Set()), state.snapshot);
@@ -482,7 +482,10 @@ export class LiveContextController {
 		LiveContextController.assertWriterSettled(this.sessionManager);
 	}
 
-	private acceptedContext(failedEntry?: ClmBlock): {
+	private acceptedContext(
+		failedEntry?: ClmBlock,
+		enforceDocumentLimit = true,
+	): {
 		snapshot: ClmSnapshot;
 		pending: ClmBlock[];
 		watermark: string | null;
@@ -524,7 +527,7 @@ export class LiveContextController {
 		const snapshot = { blocks: [...state.snapshot.blocks, ...suffix] };
 		const { editable, pending } = this.splitPendingToolGroup(snapshot, state.snapshot.blocks.length);
 		const rendered = renderContextDocument(editable, new Set());
-		LiveContextController.checkDocumentSize(rendered);
+		if (enforceDocumentLimit) LiveContextController.checkDocumentSize(rendered);
 		parseContextDocument(rendered, editable);
 		// A failed-provider cleanup still covers its removed raw audit tail in the watermark.
 		const completeCount = uncovered.length - pending.length;
