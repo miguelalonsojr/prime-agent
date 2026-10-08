@@ -65,12 +65,11 @@ describe("AgentSession branch summary auxiliary model", () => {
 		for (const _ of [1, 2, 3]) await harness.session.prompt(turnText);
 		const [rootNode] = harness.sessionManager.getTree();
 		const previousLeaf = harness.sessionManager.getLeafId();
-		const result = await harness.session.navigateTree(rootNode.entry.id, { summarize: true });
-		const calls = completeSimpleMock.mock.calls.filter(
-			(call) => (call[1] as { systemPrompt?: string }).systemPrompt === SUMMARIZATION_SYSTEM_PROMPT,
-		);
-		expect(calls.length).toBe(options.stub ? 0 : 1);
-		expect(
+		let receiptPersisted!: () => void;
+		const receiptCompletion = new Promise<void>((resolve) => {
+			receiptPersisted = resolve;
+		});
+		const matchingReceipts = () =>
 			harness.sessionManager
 				.getEntries()
 				.filter(
@@ -78,17 +77,32 @@ describe("AgentSession branch summary auxiliary model", () => {
 						entry.type === "custom" &&
 						entry.customType === "clm_usage_v1" &&
 						(entry.data as { pin?: { branchId?: string | null } })?.pin?.branchId === previousLeaf,
-				),
-		).toHaveLength(calls.length);
-		expect(result.summaryEntry?.summary).toContain(options.stub ? "No content to summarize" : "Test summary");
-		for (const call of calls) {
-			expect(call[0]).toMatchObject({ provider: "faux", id: expectedModel });
+				);
+		const stopListening = harness.sessionManager.onPersist(() => {
+			if (matchingReceipts().length > 0) receiptPersisted();
+		});
+		try {
+			const result = await harness.session.navigateTree(rootNode.entry.id, { summarize: true });
+			const calls = completeSimpleMock.mock.calls.filter(
+				(call) => (call[1] as { systemPrompt?: string }).systemPrompt === SUMMARIZATION_SYSTEM_PROMPT,
+			);
+			expect(calls.length).toBe(options.stub ? 0 : 1);
+			if (calls.length > 0) await receiptCompletion;
+			expect(matchingReceipts()).toHaveLength(calls.length);
+			expect(result.summaryEntry?.summary).toContain(options.stub ? "No content to summarize" : "Test summary");
+			for (const call of calls) {
+				expect(call[0]).toMatchObject({ provider: "faux", id: expectedModel });
+			}
+			const fallbackWarn = expectedModel === "session-model" ? options.auxiliaryModel : undefined;
+			const expectedWarnings = fallbackWarn
+				? [`Warning: auxiliaryModel "${fallbackWarn}" unusable for branch summary; using the session model.`]
+				: [];
+			expect(warnSpy.mock.calls.map(([message]) => String(message))).toStrictEqual(expectedWarnings);
+		} finally {
+			stopListening();
+			warnSpy.mockRestore();
+			await harness.session.disposeAsync();
+			harness.cleanup();
 		}
-		const fallbackWarn = expectedModel === "session-model" ? options.auxiliaryModel : undefined;
-		const expectedWarnings = fallbackWarn
-			? [`Warning: auxiliaryModel "${fallbackWarn}" unusable for branch summary; using the session model.`]
-			: [];
-		expect(warnSpy.mock.calls.map(([message]) => String(message))).toStrictEqual(expectedWarnings);
-		harness.cleanup();
 	});
 });
