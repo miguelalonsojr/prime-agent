@@ -1,4 +1,4 @@
-import { writeFileSync } from "node:fs";
+import { existsSync, writeFileSync } from "node:fs";
 import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { describe, expect, it, vi } from "vitest";
@@ -179,57 +179,74 @@ describe("subagent default model setting", () => {
 		}
 	});
 
-	it("does not reassign an authenticated request to a later ipython writer", async () => {
-		const h = await createHarness({ persistSession: true });
-		const started = createDeferred();
-		const release = createDeferred();
-		const auth = h.session.modelRegistry.getApiKeyAndHeaders.bind(h.session.modelRegistry);
-		const held = vi.spyOn(h.session.modelRegistry, "getApiKeyAndHeaders").mockImplementationOnce(async (model) => {
-			started.resolve();
-			await release.promise;
-			return auth(model);
-		});
-		const unsubscribe = h.session.subscribe((event) => {
-			if (event.type === "tool_execution_update" && JSON.stringify(event.partialResult).includes("origin-switched"))
+	it.each(["reused-tool-call", "second-tool-call"])(
+		"does not reassign an authenticated request to later writer %s",
+		async (secondToolId) => {
+			const h = await createHarness({ persistSession: true });
+			const started = createDeferred();
+			const release = createDeferred();
+			let writerMarkerPresent = false;
+			const auth = h.session.modelRegistry.getApiKeyAndHeaders.bind(h.session.modelRegistry);
+			const held = vi.spyOn(h.session.modelRegistry, "getApiKeyAndHeaders").mockImplementationOnce(async (model) => {
+				started.resolve();
+				await release.promise;
+				return auth(model);
+			});
+			const unsubscribe = h.session.subscribe((event) => {
+				if (
+					event.type === "tool_execution_update" &&
+					JSON.stringify(event.partialResult).includes("origin-switched")
+				) {
+					writerMarkerPresent = existsSync(`${h.session.sessionFile}.clm-writer`);
+					release.resolve();
+				}
+			});
+			try {
+				await h.session.setClmMode(true);
+				h.session.setActiveToolsByName(["ipython"]);
+				const selector = `${h.getModel().provider}/${h.getModel().id}`;
+				const code = [
+					"import asyncio",
+					"started = asyncio.Event()",
+					"async def delayed():",
+					"    started.set()",
+					`    return await rlm.spawn('delayed task', name='delayed', model=${JSON.stringify(selector)})`,
+					"pending = asyncio.create_task(delayed())",
+					"await started.wait()",
+				].join("\n");
+				h.setResponses([
+					fauxAssistantMessage(fauxToolCall("ipython", { code }, { id: "reused-tool-call" }), {
+						stopReason: "toolUse",
+					}),
+					async () => {
+						await started.promise;
+						return fauxAssistantMessage(
+							fauxToolCall(
+								"ipython",
+								{
+									code: "print('origin-switched', flush=True)\ntry:\n    await pending\nexcept RuntimeError as error:\n    print('delayed-rejected=' + str(error))\nchild = await rlm.spawn('current task', name='current')",
+								},
+								{ id: secondToolId },
+							),
+							{ stopReason: "toolUse" },
+						);
+					},
+					...Array.from({ length: 4 }, () => fauxAssistantMessage("done")),
+				]);
+				await h.session.prompt("switch writers during auth");
+				const children = await h.session.collectRlmChildren([], 10_000);
+				expect(children.results.map((child) => child.session_name)).toEqual(["current"]);
+				expect(children.results[0].status).toBe("done");
+				expect(writerMarkerPresent).toBe(true);
+			} finally {
 				release.resolve();
-		});
-		try {
-			await h.session.setClmMode(true);
-			h.session.setActiveToolsByName(["ipython"]);
-			const selector = `${h.getModel().provider}/${h.getModel().id}`;
-			const code = [
-				"import asyncio",
-				"started = asyncio.Event()",
-				"async def delayed():",
-				"    started.set()",
-				`    return await rlm.spawn('delayed task', name='delayed', model=${JSON.stringify(selector)})`,
-				"pending = asyncio.create_task(delayed())",
-				"await started.wait()",
-			].join("\n");
-			h.setResponses([
-				fauxAssistantMessage(fauxToolCall("ipython", { code }), { stopReason: "toolUse" }),
-				async () => {
-					await started.promise;
-					return fauxAssistantMessage(
-						fauxToolCall("ipython", {
-							code: "print('origin-switched', flush=True)\ntry:\n    await pending\nexcept RuntimeError as error:\n    print('delayed-rejected=' + str(error))",
-						}),
-						{ stopReason: "toolUse" },
-					);
-				},
-				...Array.from({ length: 3 }, () => fauxAssistantMessage("done")),
-			]);
-			await h.session.prompt("switch writers during auth");
-			expect((await h.session.listRlmSubagents()).subagents).toEqual([]);
-			expect(JSON.stringify(h.sessionManager.getEntries())).toContain("delayed-rejected=CLM");
-		} finally {
-			release.resolve();
-			held.mockRestore();
-			unsubscribe();
-			await h.session.disposeAsync();
-			h.cleanup();
-		}
-	});
+				held.mockRestore();
+				unsubscribe();
+				await h.session.disposeAsync();
+				h.cleanup();
+			}
+		},
+	);
 
 	it("admits rlm.spawn from its owned live ipython writer", async () => {
 		const h = await createHarness({ persistSession: true });

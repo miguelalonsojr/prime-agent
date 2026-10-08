@@ -11775,9 +11775,11 @@ export class AgentSession {
 			.find((entry): entry is SessionMessageEntry => entry.type === "message" && entry.message === message);
 	}
 
-	private _assertRlmChildAdmissionAvailable(verifiedToolCallId?: string): void {
+	private _assertRlmChildAdmissionAvailable(originFence?: { readonly id: string }): void {
 		this.assertModelContextAvailable();
-		if (this._clmController) this._clmController.assertChildAdmissionAvailable(verifiedToolCallId);
+		// Provider tool IDs can repeat; ownership belongs to one captured fence instance.
+		const actionId = originFence === this._clmToolFence ? originFence?.id : undefined;
+		if (this._clmController) this._clmController.assertChildAdmissionAvailable(actionId);
 		else LiveContextController.assertWriterSettled(this.sessionManager);
 	}
 
@@ -13170,10 +13172,11 @@ export class AgentSession {
 		spawnCode?: string,
 		verifiedToolCallId?: string,
 	): Promise<RlmSpawnHandle> {
+		const originFence = this._clmToolFence?.id === verifiedToolCallId ? this._clmToolFence : undefined;
 		// Snapshot before any await: the spawning request is the turn whose tool call is
 		// executing now. A spawn arriving outside an active run (a detached kernel task
 		// firing while the parent is idle) has no such turn; an absent edge beats a wrong one.
-		this._assertRlmChildAdmissionAvailable(verifiedToolCallId);
+		this._assertRlmChildAdmissionAvailable(originFence);
 		const inheritedClmMode = this.sessionManager.getClmBranchState().mode === "on";
 		const spawnedByRequestId = this.isStreaming ? this._semanticEdges.lastTurnRequestId : undefined;
 		const { name: rawName, model: rawModel, thinking: rawThinking, ...unsupported } = kwargs;
@@ -13223,7 +13226,7 @@ export class AgentSession {
 			if (this._disposed || this._disposing) {
 				throw new Error("Cannot spawn a subagent after its parent was disposed");
 			}
-			this._assertRlmChildAdmissionAvailable(verifiedToolCallId);
+			this._assertRlmChildAdmissionAvailable(originFence);
 			childSessionDir = this._createChildRlmSessionDir();
 		} catch (error) {
 			releaseReservedSessionName();
@@ -13233,7 +13236,7 @@ export class AgentSession {
 		const sessionName = requestedSessionName ?? createDefaultRlmSubagentSessionName(prompt, childNodeId);
 		try {
 			if (!requestedSessionName) await this._assertRlmSubagentSessionNameAvailable(sessionName);
-			this._assertRlmChildAdmissionAvailable(verifiedToolCallId);
+			this._assertRlmChildAdmissionAvailable(originFence);
 		} catch (error) {
 			releaseReservedSessionName();
 			throw error;
