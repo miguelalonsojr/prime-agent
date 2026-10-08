@@ -42,8 +42,10 @@ import { attachJsonlLineReader, serializeJsonLine } from "../src/modes/rpc/jsonl
 import { getCodingAgentFixtureModel } from "./fixture-models.js";
 import { createHarness } from "./suite/harness.js";
 
-it("serves accepted CLM views on demand and rejects legacy side questions before dispatch", async () => {
+it("keeps audit attachment available when CLM snapshot fails", async () => {
 	const harness = await createHarness({ persistSession: true });
+	const originalAuditMessage: AgentMessage = { role: "user", content: "durable audit before CLM", timestamp: 1 };
+	harness.sessionManager.appendMessage(originalAuditMessage);
 	const runtime = { session: harness.session, setRebindSession: () => {} } as unknown as AgentSessionRuntime;
 	const local = new InProcessAgentConnection(runtime);
 	const daemon = Object.assign(Object.create(AgentDaemon.prototype), {
@@ -52,7 +54,14 @@ it("serves accepted CLM views on demand and rejects legacy side questions before
 	}) as { handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<DaemonResponse> };
 	const socketPath = join(harness.tempDir, "clm.sock");
 	const commands: string[] = [];
+	const metadata = new Map<string, unknown>([
+		["attach", createAttachResult("active-1", "old-client", [], 1).snapshot.summary],
+		["get_connection_state", createConnectionState("active-1", harness.session.sessionId)],
+		["detach", undefined],
+	]);
+	let disconnect = () => {};
 	const server = createServer((socket) => {
+		disconnect = () => socket.destroy();
 		socket.on("error", () => {});
 		socket.write(
 			serializeJsonLine({
@@ -69,19 +78,16 @@ it("serves accepted CLM views on demand and rejects legacy side questions before
 			const command = { ...wire.command, id: wire.id };
 			commands.push(command.type);
 			if (command.type === "ack_result") return;
-			const response =
-				command.type === "attach"
-					? Promise.resolve(success(command.id, command.type, createAttachResult("active-1", "old-client", [], 1)))
-					: command.type === "detach"
-						? Promise.resolve(success(command.id, command.type))
-						: daemon.handleCommand({ socket, capabilities: new Set() } as DaemonSocketClient, command);
+			const response = metadata.has(command.type)
+				? Promise.resolve(success(command.id, command.type, metadata.get(command.type)))
+				: daemon.handleCommand({ socket, capabilities: new Set() } as DaemonSocketClient, command);
 			void response
 				.catch((error) => failure(command.id, command.type, error))
 				.then((result) => socket.write(serializeJsonLine(result)));
 		});
 	});
 	const client = new DaemonClient(socketPath);
-	const connection = new DaemonAgentConnection(client, "active-1");
+	const connection = new DaemonAgentConnection(client, "active-1", { recoverDaemon: async () => {} });
 	try {
 		await new Promise<void>((resolve) => server.listen(socketPath, resolve));
 		await client.connect();
@@ -90,6 +96,8 @@ it("serves accepted CLM views on demand and rejects legacy side questions before
 		expect(commands).toEqual(["attach"]);
 		const on = await connection.setClmMode(true);
 		expect(on).toMatchObject({ mode: "on", modeSource: "session-override", revision: 0 });
+		expect((await local.setClmMode(false)).mode).toBe("off");
+		await connection.setClmMode(true);
 		const first = await connection.getClmModelSnapshot();
 		writeFileSync(on.path, "pending unaccepted edit");
 		for (const adapter of [local, connection]) expect(await adapter.getClmModelSnapshot()).toEqual(first);
@@ -102,13 +110,26 @@ it("serves accepted CLM views on demand and rejects legacy side questions before
 				question: "question",
 			}),
 		).resolves.toMatchObject({ success: false, error: expect.stringContaining("CLM") });
-		expect(harness.faux.state.callCount).toBe(0);
 		expect((await connection.restoreClmRevision(first.epochId, 0)).revision).toBe(1);
 		expect(await connection.getClmStatus()).toMatchObject({ revision: 1 });
 		expect(await connection.getClmModelSnapshot()).toEqual({ ...first, revision: 1 });
 		expect(await local.getClmStatus()).toMatchObject({ revision: 1 });
 		expect((await local.restoreClmRevision(first.epochId, 0)).revision).toBe(2);
-		expect((await local.setClmMode(false)).mode).toBe("off");
+		const revisions = harness.sessionManager.getEntries().filter((entry) => entry.type === "clm_revision");
+		revisions.at(-1)!.checksum = "corrupt";
+		const reconnected = new Promise<void>((resolve) =>
+			connection.subscribe((event) => {
+				if (event.type === "session_resynced") resolve();
+			}),
+		);
+		disconnect();
+		await reconnected;
+		expect(commands).toContain("get_session_context");
+		expect((await connection.getInitialSnapshot()).sessionContext).toBeUndefined();
+		await expect(connection.getSessionContext()).rejects.toThrow("CLM");
+		await expect(connection.getClmModelSnapshot()).rejects.toThrow("CLM");
+		expect(await connection.getMessages()).toContainEqual(originalAuditMessage);
+		expect(harness.faux.state.callCount).toBe(0);
 	} finally {
 		await connection.dispose();
 		client.close();
@@ -2803,36 +2824,11 @@ describe("DaemonAgentConnection", () => {
 		await connection.dispose();
 	});
 
-	it("keeps audit attachment available when CLM snapshot fails", async () => {
+	it("rejects unsupported CLM commands without sending", async () => {
 		const fakeClient = new FakeDaemonClient();
-		const originalAuditMessage: AgentMessage = { role: "user", content: "current prompt", timestamp: 4 };
-		const request = fakeClient.request.bind(fakeClient);
-		const summary = createAttachResult("active-1", undefined, [], 12).snapshot.summary;
-		vi.spyOn(fakeClient, "request").mockImplementation((command, timeout, options) =>
-			command.type === "get_session_context" || command.type === "get_clm_model_snapshot"
-				? Promise.resolve(failure(command.id, command.type, "CLM recovery requires repair"))
-				: command.type === "attach" && fakeClient.reconnectCount > 0
-					? Promise.resolve(success(command.id, command.type, summary))
-					: request(command, timeout, options),
-		);
-		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1", {
-			recoverDaemon: async () => {},
-		});
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
 		try {
 			await connection.attach();
-			const reconnected = new Promise<void>((resolve) =>
-				connection.subscribe((event) => {
-					if (event.type === "session_resynced") resolve();
-				}),
-			);
-			fakeClient.connected = false;
-			fakeClient.emitClose(new Error("transport lost"));
-			await reconnected;
-			await expect(connection.getInitialSnapshot()).resolves.toMatchObject({
-				messages: [originalAuditMessage],
-			});
-			expect((await connection.getInitialSnapshot()).sessionContext).toBeUndefined();
-			await expect(connection.getSessionContext()).rejects.toThrow("CLM recovery requires repair");
 			fakeClient.requests.length = 0;
 			for (const request of [
 				() => connection.getClmStatus(),
@@ -2842,9 +2838,6 @@ describe("DaemonAgentConnection", () => {
 			])
 				await expect(request()).rejects.toThrow("clm_context_v1");
 			expect(fakeClient.requests).toEqual([]);
-			fakeClient.serverCapabilities.add("clm_context_v1");
-			await expect(connection.getClmModelSnapshot()).rejects.toThrow("CLM recovery requires repair");
-			expect(await connection.getMessages()).toContainEqual(originalAuditMessage);
 		} finally {
 			await connection.dispose();
 		}
