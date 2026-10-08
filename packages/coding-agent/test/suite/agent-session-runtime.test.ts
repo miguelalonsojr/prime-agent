@@ -26,7 +26,7 @@ import {
 	SEMANTIC_EDGES_LEDGER_FILENAME,
 } from "../../src/core/semantic-edges.js";
 import { SESSION_LEASE_OWNER_ID_ENV, SESSION_LEASES_ENABLED_ENV } from "../../src/core/session-lease.js";
-import { SessionManager } from "../../src/core/session-manager.js";
+import { type ClmUsagePin, SessionManager } from "../../src/core/session-manager.js";
 import { SettingsManager } from "../../src/core/settings-manager.js";
 import type {
 	ExtensionAPI,
@@ -653,6 +653,97 @@ describe("AgentSessionRuntime characterization", () => {
 			}
 		},
 	);
+
+	it("settles a CLM tool before retaining overlapping refinement receipts", async () => {
+		const [helperStarted, toolStarted, observed, retry] = [
+			createDeferred(),
+			createDeferred(),
+			createDeferred(),
+			createDeferred(),
+		];
+		let path = "";
+		let unchanged = false;
+		const h = await createHarness({
+			persistSession: true,
+			serializedRefine: true,
+			settings: { retry: { enabled: true, maxRetries: 1, baseDelayMs: 100 } },
+			tools: [
+				{
+					name: "inspect",
+					label: "inspect",
+					description: "inspect",
+					parameters: Type.Object({}),
+					execute: async () => {
+						const leaf = h.sessionManager.getLeafId();
+						writeFileSync(path, readFileSync(path, "utf8").replace("obsolete", "compressed"));
+						toolStarted.resolve();
+						await observed.promise;
+						unchanged = h.sessionManager.getLeafId() === leaf;
+						return { content: [{ type: "text", text: "ok" }], details: {} };
+					},
+				},
+			],
+		});
+		let refinement: Promise<unknown> | undefined;
+		let prompt: Promise<unknown> | undefined;
+		let sleep: ReturnType<typeof vi.spyOn> | undefined;
+		try {
+			h.setResponses([fauxAssistantMessage("obsolete")]);
+			await h.session.prompt("seed");
+			path = (await h.session.setClmMode(true)).path;
+			const pin = h.sessionManager.captureClmUsagePin();
+			sleep = vi.spyOn(sleepUtils, "sleep").mockImplementation(async () => {
+				observed.resolve();
+				await retry.promise;
+			});
+			h.setResponses([
+				async () => {
+					helperStarted.resolve();
+					await toolStarted.promise;
+					return fauxAssistantMessage("transient", { stopReason: "error" });
+				},
+				fauxAssistantMessage(fauxToolCall("inspect", {}), { stopReason: "toolUse" }),
+				fauxAssistantMessage("finished"),
+				fauxAssistantMessage(
+					JSON.stringify({ summary: "no-op", rationale: "none", expectedOutcome: "none", edits: [] }),
+				),
+			]);
+			refinement = h.session.refine().catch((error: unknown) => error);
+			await helperStarted.promise;
+			prompt = h.session.prompt("inspect context");
+			await prompt;
+			expect(unchanged).toBe(true);
+			expect(h.eventsOfType("tool_execution_end").at(-1)?.isError).toBe(false);
+			expect(existsSync(`${h.session.sessionFile}.clm-writer`)).toBe(false);
+			expect((await h.session.getClmStatus()).revision).toBe(1);
+			retry.resolve();
+			await refinement;
+			await h.session.getClmAcceptedView();
+			const reopened = SessionManager.open(h.session.sessionFile!);
+			const receipts = reopened
+				.getBranch()
+				.filter(
+					(entry) =>
+						entry.type === "custom" &&
+						entry.customType.startsWith("clm_usage_") &&
+						(entry.data as { pin: ClmUsagePin }).pin.branchId === pin.branchId,
+				);
+			expect(receipts).toHaveLength(2);
+			for (const receipt of receipts) expect(receipt).toMatchObject({ data: { pin } });
+			expect(JSON.stringify(reopened.buildSessionContext().messages)).toContain("compressed");
+			h.setResponses([fauxAssistantMessage("next request works")]);
+			await h.session.prompt("continue");
+			expect(h.getPendingResponseCount()).toBe(0);
+		} finally {
+			toolStarted.resolve();
+			observed.resolve();
+			retry.resolve();
+			await Promise.allSettled([prompt, refinement]);
+			sleep?.mockRestore();
+			await h.session.disposeAsync();
+			h.cleanup();
+		}
+	});
 
 	it("flushes a helper receipt queued synchronously by a persistence observer", async () => {
 		const h = await createHarness({ persistSession: true, tools: [] });

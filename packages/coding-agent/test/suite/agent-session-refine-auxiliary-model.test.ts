@@ -203,7 +203,8 @@ describe("AgentSession refinement auxiliary model", () => {
 		},
 	);
 
-	it.each(["plan", "review"])("blocks %s retries after a concurrent receipt repair failure", async (kind) => {
+	const retryCases = ["plan", "review"].flatMap((kind) => [false, true].map((ownReceipt) => ({ kind, ownReceipt })));
+	it.each(retryCases)("blocks $kind retries on unrepaired receipts ($ownReceipt)", async ({ kind, ownReceipt }) => {
 		const retry = { enabled: true, maxRetries: 1, baseDelayMs: 100, maxRetryDelayMs: 0 };
 		const h = await createHarness({
 			persistSession: true,
@@ -222,11 +223,33 @@ describe("AgentSession refinement auxiliary model", () => {
 			h.setResponses([assistantText("seed")]);
 			await h.session.prompt("task");
 			await h.session.setClmMode(true);
+			const injectFailure = () => {
+				const file = h.session.sessionFile!;
+				const append = fs.appendFileSync,
+					rename = fs.renameSync;
+				faults.push(
+					vi.spyOn(fs, "appendFileSync").mockImplementation((path, data, options) => {
+						if (path === file && String(data).includes("clm_usage_")) {
+							append(path, '{"type":"custom"', options);
+							throw new Error("partial receipt EIO");
+						}
+						return append(path, data, options);
+					}),
+				);
+				faults.push(
+					vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+						if (to === file) throw new Error("rollback EIO");
+						return rename(from, to);
+					}),
+				);
+				syncBuiltinESMExports();
+			};
 			completeSimpleMock.mockImplementation(original.completeSimple);
 			h.setResponses([
 				...(kind === "review" ? [assistantText("turn")] : []),
 				() => {
 					calls++;
+					if (ownReceipt) injectFailure();
 					return { ...assistantText("transient"), stopReason: "error" };
 				},
 				() => {
@@ -247,26 +270,10 @@ describe("AgentSession refinement auxiliary model", () => {
 				await vi.advanceTimersByTimeAsync(0);
 			}
 			await backoff.promise;
-			const file = h.session.sessionFile!;
-			const append = fs.appendFileSync,
-				rename = fs.renameSync;
-			faults.push(
-				vi.spyOn(fs, "appendFileSync").mockImplementation((path, data, options) => {
-					if (path === file && String(data).includes("clm_usage_")) {
-						append(path, '{"type":"custom"', options);
-						throw new Error("partial receipt EIO");
-					}
-					return append(path, data, options);
-				}),
-			);
-			faults.push(
-				vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
-					if (to === file) throw new Error("rollback EIO");
-					return rename(from, to);
-				}),
-			);
-			syncBuiltinESMExports();
-			h.session.recordClmUsage(h.sessionManager.captureClmUsagePin(), assistantText("receipt").usage);
+			if (!ownReceipt) {
+				injectFailure();
+				h.session.recordClmUsage(h.sessionManager.captureClmUsagePin(), assistantText("receipt").usage);
+			}
 			await expect(h.session.getClmAcceptedView()).rejects.toThrow(/repair/);
 			for (const fault of faults) fault.mockRestore();
 			syncBuiltinESMExports();
@@ -319,7 +326,7 @@ describe("AgentSession refinement auxiliary model", () => {
 		expect(reopened.getClmMeasuredUsage()).toBeUndefined();
 	});
 
-	it("keeps the original accepted revision on a refinement retry after a new revision appears", async () => {
+	it("keeps queued refinement receipts blocked after an out-of-band revision invalidates the controller", async () => {
 		const h = await createHarness({
 			persistSession: true,
 			settings: { retry: { enabled: true, maxRetries: 1, baseDelayMs: 0 } },
@@ -327,7 +334,6 @@ describe("AgentSession refinement auxiliary model", () => {
 		harnesses.push(h);
 		const watermark = h.sessionManager.appendMessage(userMsg("task"));
 		h.sessionManager.appendClmOn({ blocks: [{ id: watermark, message: userMsg("task") }] }, watermark);
-		const epochId = h.sessionManager.getClmBranchState().epochId;
 		const first = { ...assistantText("transient"), stopReason: "error" as const };
 		first.usage.cacheRead = 9;
 		const second = emptyProposalResponse();
@@ -343,14 +349,15 @@ describe("AgentSession refinement auxiliary model", () => {
 			})
 			.mockResolvedValueOnce(second);
 		await expect(h.session.refine()).rejects.toThrow(/CLM accepted state changed/);
+		await expect(h.session.getClmAcceptedView()).rejects.toThrow(/CLM accepted state changed/);
 		const receipts = h.sessionManager
 			.getBranch()
 			.filter((entry) => entry.type === "custom" && entry.customType === "clm_usage_v1");
-		expect(receipts.map((entry) => (entry.type === "custom" ? entry.data : null))).toMatchObject([
-			{ pin: { epochId, revision: 0 }, usage: { cacheRead: 9 } },
-			{ pin: { epochId, revision: 0 }, usage: { cacheRead: 20 } },
-		]);
+		expect(receipts).toHaveLength(0);
 		expect(h.sessionManager.getClmMeasuredUsage()).toBeUndefined();
+		h.setResponses([emptyProposalResponse()]);
+		await expect(h.session.prompt("blocked")).rejects.toThrow(/CLM accepted state changed/);
+		expect(h.getPendingResponseCount()).toBe(1);
 	});
 
 	it("routes refinement planning to the configured auxiliary model", async () => {

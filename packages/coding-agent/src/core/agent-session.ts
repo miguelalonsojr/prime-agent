@@ -2179,7 +2179,9 @@ export class AgentSession {
 			isFauxProviderQueueExhausted(response)
 		)
 			return;
-		if (response.usage) this.sessionManager.recordClmUsage(pin, response.usage, messageEntryId);
+		if (!response.usage) return;
+		if (messageEntryId !== undefined) this.sessionManager.recordClmUsage(pin, response.usage, messageEntryId);
+		else this.recordClmUsage(pin, response.usage);
 	}
 
 	private _clmRequestInputs(): ClmRequestInputs {
