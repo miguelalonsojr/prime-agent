@@ -221,7 +221,7 @@ describe("daemon session summarizer", () => {
 			getLeafId?: () => string | null;
 			clmView?: () => Promise<{ view: { messages: AgentMessage[] }; pin: ClmUsagePin }>;
 		}): ActiveSessionState {
-			return {
+			const state = {
 				activeSessionId: options.activeSessionId ?? "active-1",
 				summaryState: options.summaryState,
 				runtime: {
@@ -229,6 +229,8 @@ describe("daemon session summarizer", () => {
 						isSessionActive: options.isSessionActive,
 						messages: options.messages,
 						getClmAcceptedViewWithUsagePin: options.clmView,
+						recordClmUsage: (pin: ClmUsagePin, usage: Parameters<SessionManager["recordClmUsage"]>[1]) =>
+							state.runtime.session.sessionManager.recordClmUsage(pin, usage),
 						modelRegistry: {},
 						settingsManager: SettingsManager.inMemory(),
 						state: { streamingMessage: undefined },
@@ -242,6 +244,7 @@ describe("daemon session summarizer", () => {
 					},
 				},
 			} as unknown as ActiveSessionState;
+			return state;
 		}
 
 		async function settle(state: ActiveSessionState, generated: { summary: string; taskState?: "needs_input" }) {

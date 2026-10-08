@@ -458,7 +458,7 @@ export class DaemonSessionSummarizer {
 					? {
 							onObservedResponse: (response: AssistantMessage) => {
 								if (response.stopReason !== "aborted" && response.usage)
-									session.sessionManager.recordClmUsage(usagePin, response.usage);
+									session.recordClmUsage(usagePin, response.usage);
 							},
 						}
 					: {}),

@@ -1583,6 +1583,8 @@ export class AgentSession {
 	private readonly _unguardedStreamFn: Agent["streamFn"];
 	private _clmProjectedUsagePin?: ClmUsagePin;
 	private readonly _clmDispatchedUsagePins: ClmUsagePin[] = [];
+	private readonly _pendingClmUsageReceipts: Array<{ pin: ClmUsagePin; usage: Usage }> = [];
+	private _clmUsageFlushPending = false;
 
 	private _scopedModels: Array<{
 		model: Model<any>;
@@ -2061,6 +2063,7 @@ export class AgentSession {
 		} finally {
 			this._clmTransition = false;
 			fence?.release();
+			this._scheduleClmUsageFlush();
 			pause.release();
 		}
 	}
@@ -2122,6 +2125,47 @@ export class AgentSession {
 			if (this.sessionManager.getClmBranchState().mode !== "on") throw new Error("CLM restore requires CLM on");
 			await (await this._getClmController()).restoreRevision(epochId, revision);
 		}, "restore");
+	}
+
+	/** Retain observed helper attempts independently of their eventual status verdict. */
+	recordClmUsage(pin: ClmUsagePin, usage: Usage): void {
+		if (this._disposed || this._disposing) return;
+		this._pendingClmUsageReceipts.push(structuredClone({ pin, usage }));
+		this._scheduleClmUsageFlush();
+	}
+
+	private _scheduleClmUsageFlush(): void {
+		if (this._clmUsageFlushPending || this._pendingClmUsageReceipts.length === 0 || this._disposed || this._disposing)
+			return;
+		this._clmUsageFlushPending = true;
+		// A helper can inherit an action's async context, but must not borrow its fence.
+		this._sessionActionCommitContext.exit(() => {
+			void this._flushClmUsageReceipts();
+		});
+	}
+
+	private async _flushClmUsageReceipts(): Promise<void> {
+		let fence: { owner: symbol; release(): void } | undefined;
+		try {
+			fence = await this._acquireSessionActionCommitFence();
+			await this._agentEventQueue;
+			if (this._disposed || this._disposing || this._clmToolFence) return;
+			// beforeToolCall releases the action fence while the physical writer runs.
+			// Never wait for that writer here: afterToolCall needs this same fence.
+			LiveContextController.assertWriterSettled(this.sessionManager);
+			this.assertModelContextAvailable();
+			this._clmController?.assertModelRequestAvailable();
+			for (const receipt of [...this._pendingClmUsageReceipts]) {
+				this.sessionManager.recordClmUsage(receipt.pin, receipt.usage);
+				this._pendingClmUsageReceipts.shift();
+			}
+		} catch {
+			// Keep receipts through a writer conflict; explicit repair wakes this queue.
+			// A crash before the ordinary session append leaves attribution unknown.
+		} finally {
+			fence?.release();
+			this._clmUsageFlushPending = false;
+		}
 	}
 
 	private _recordObservedProviderUsage(pin: ClmUsagePin, response: AssistantMessage, messageEntryId?: string): void {
@@ -2522,6 +2566,7 @@ export class AgentSession {
 					this._clmToolFence?.dispose();
 					this._clmToolFence = undefined;
 					fence.release();
+					this._scheduleClmUsageFlush();
 				}
 			}
 			const runner = this._extensionRunner;
@@ -5647,6 +5692,7 @@ export class AgentSession {
 			return;
 		}
 		this._disposed = true;
+		this._pendingClmUsageReceipts.length = 0;
 		for (const run of this._unsettledRlmChildRuns) run.suppressTerminalNotice = true;
 		for (const controller of this._rlmQuiescenceWaitAborts) controller.abort();
 		this._sessionActionCommitDisposeAbortController.abort();

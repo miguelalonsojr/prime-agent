@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { fauxAssistantMessage, fauxToolCall, registerFauxProvider } from "@earendil-works/pi-ai";
+import { fauxAssistantMessage, fauxToolCall, registerFauxProvider, type Usage } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AgentSession } from "../../src/core/agent-session.js";
@@ -40,6 +40,7 @@ import { InProcessAgentConnection } from "../../src/modes/agent-connection/in-pr
 import type { ActiveSessionState } from "../../src/modes/daemon/active-session-state.js";
 import { AgentDaemon } from "../../src/modes/daemon/daemon-mode.js";
 import type { DaemonCommand } from "../../src/modes/daemon/daemon-protocol.js";
+import { DaemonSessionSummarizer, generateAgentStatus } from "../../src/modes/daemon/daemon-session-summarizer.js";
 import { assistantMsg, createTestResourceLoader, userMsg } from "../utilities.js";
 import { conversationMessages, createHarness, getMessageText, type Harness } from "./harness.js";
 
@@ -293,6 +294,139 @@ describe("AgentSessionRuntime characterization", () => {
 		await session.restoreClmRevision(reopened.epochId!, 0);
 		expect((await session.getClmStatus()).revision).toBe(1);
 		await expect(session.restoreClmRevision(on.epochId!, 0)).rejects.toThrow(/CLM/);
+	});
+
+	it.each(["noop", "edit", "rejected", "forget", "stop"] as const)(
+		"settles a CLM tool before retaining overlapping recap receipts (%s)",
+		async (action) => {
+			const [started, toolStarted, observed] = [createDeferred(), createDeferred(), createDeferred()];
+			let path = "";
+			let unchanged = false;
+			const usages: Usage[] = [];
+			const h = await createHarness({
+				persistSession: true,
+				provider: "prime-inference",
+				models: [{ id: "qwen/qwen3-30b-a3b-instruct-2507" }],
+				tools: [
+					{
+						name: "inspect",
+						label: "inspect",
+						description: "inspect",
+						parameters: Type.Object({}),
+						execute: async () => {
+							const leaf = h.sessionManager.getLeafId();
+							if (action === "edit")
+								writeFileSync(path, readFileSync(path, "utf8").replace("obsolete", "compressed"));
+							if (action === "rejected") writeFileSync(path, "invalid context");
+							toolStarted.resolve();
+							await observed.promise;
+							await h.session.getClmAcceptedView().catch(() => undefined);
+							unchanged = h.sessionManager.getLeafId() === leaf;
+							return { content: [{ type: "text", text: "ok" }], details: {} };
+						},
+					},
+				],
+			});
+			const state = { activeSessionId: "receipt-race", runtime: { session: h.session } } as ActiveSessionState;
+			const summarizer = new DaemonSessionSummarizer(
+				() => [state],
+				undefined,
+				async (params) => {
+					try {
+						return await generateAgentStatus({
+							...params,
+							retryPolicy: { enabled: true, maxRetries: 1, baseDelayMs: 0, maxRetryDelayMs: 0 },
+							onObservedResponse: (response) => {
+								usages.push(structuredClone(response.usage));
+								params.onObservedResponse?.(response);
+								response.usage.input = 999;
+								if (action === "forget") summarizer.forget(state.activeSessionId);
+								if (action === "stop") summarizer.stop();
+							},
+						});
+					} finally {
+						observed.resolve();
+					}
+				},
+			);
+			try {
+				h.setResponses([fauxAssistantMessage("obsolete")]);
+				await h.session.prompt("seed");
+				path = (await h.session.setClmMode(true)).path;
+				const pin = h.sessionManager.captureClmUsagePin();
+				const response = fauxAssistantMessage("<recap>Working</recap><status>COMPLETED</status>");
+				h.setResponses([
+					async () => {
+						started.resolve();
+						await toolStarted.promise;
+						return { ...response, stopReason: "error" };
+					},
+					fauxAssistantMessage(fauxToolCall("inspect", {}), { stopReason: "toolUse" }),
+					...(action === "forget" || action === "stop" ? [] : [response]),
+					fauxAssistantMessage("finished"),
+				]);
+				vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+				summarizer.start();
+				vi.advanceTimersByTime(25_000);
+				await started.promise;
+				await h.session.prompt("inspect context");
+				expect(unchanged).toBe(true);
+				expect(existsSync(`${h.session.sessionFile}.clm-writer`)).toBe(false);
+				expect(h.eventsOfType("tool_execution_end").at(-1)?.isError).toBe(action === "rejected");
+				const reopened = SessionManager.open(h.session.sessionFile!);
+				const receipts = reopened
+					.getBranch()
+					.filter(
+						(entry) =>
+							entry.type === "custom" &&
+							entry.customType === "clm_usage_v1" &&
+							(entry.data as { pin: { branchId: string } }).pin.branchId === pin.branchId,
+					);
+				expect(receipts).toHaveLength(action === "forget" || action === "stop" ? 1 : 2);
+				expect(receipts.map((entry) => (entry.type === "custom" ? entry.data : undefined))).toEqual(
+					usages.map((usage) => ({ version: 1, pin, usage })),
+				);
+				expect(h.getPendingResponseCount()).toBe(0);
+				expect(reopened.getClmBranchState().revision).toBe(action === "edit" ? 1 : 0);
+				if (action === "edit") {
+					const final = reopened
+						.getBranch()
+						.filter((entry) => entry.type === "message")
+						.at(-1);
+					if (final?.type !== "message" || final.message.role !== "assistant") throw new Error("missing final");
+					expect(reopened.getClmMeasuredUsage()?.input).toBe(final.message.usage.input);
+				}
+				expect(JSON.stringify(reopened.buildSessionContext().messages)).toContain(
+					action === "edit" ? "compressed" : "obsolete",
+				);
+				expect(state.summaryState).toBeUndefined();
+			} finally {
+				toolStarted.resolve();
+				observed.resolve();
+				summarizer.stop();
+				vi.useRealTimers();
+				await h.session.disposeAsync();
+				h.cleanup();
+			}
+		},
+	);
+
+	it("does not append queued or late helper receipts after disposal", async () => {
+		const h = await createHarness({ persistSession: true });
+		try {
+			await h.session.setClmMode(true);
+			const pin = h.sessionManager.captureClmUsagePin();
+			const usage = { ...fauxAssistantMessage("observed").usage, input: 17 };
+			const before = readFileSync(h.session.sessionFile!, "utf8");
+			h.session.recordClmUsage(pin, usage);
+			h.session.dispose();
+			await h.session.disposeAsync();
+			h.session.recordClmUsage(pin, usage);
+			await expect(h.session.getClmAcceptedView()).rejects.toThrow(/disposed/);
+			expect(readFileSync(h.session.sessionFile!, "utf8")).toBe(before);
+		} finally {
+			h.cleanup();
+		}
 	});
 
 	it("keeps an early zero-usage provider failure unknown instead of a measured receipt", async () => {

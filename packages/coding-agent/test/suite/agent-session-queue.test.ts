@@ -24,6 +24,7 @@ import {
 } from "../../src/core/messages.js";
 import { getLocalHarnessStateDir, loadHarnessState, type RefinementResult } from "../../src/core/refinement/index.js";
 import type { ActionStore, SessionAction } from "../../src/core/session-action-store.js";
+import { SessionManager } from "../../src/core/session-manager.js";
 import { parseSessionSlashCommand } from "../../src/core/slash-commands.js";
 import type { BashOperations } from "../../src/core/tools/bash.js";
 import { createEditToolDefinition } from "../../src/core/tools/edit.js";
@@ -2265,6 +2266,9 @@ describe("CLM action identity", () => {
 		manager.appendClmOn({ blocks: [{ id, message }] }, id);
 		manager.appendClmRevision({ blocks: [{ id, message: { ...message, content: "accepted" } }] }, id, "seed");
 		const epoch = manager.getClmBranchState().epochId!;
+		const originalPin = manager.captureClmUsagePin();
+		const pin = structuredClone(originalPin);
+		const usage = { ...fauxAssistantMessage("observed").usage, input: 12345 };
 		harness.session.syncClmMode();
 		path = join(manager.getSessionArtifactDir()!, "clm", "context.txt");
 		const originalWrite = fileSystem.writeFile;
@@ -2290,6 +2294,10 @@ describe("CLM action identity", () => {
 		try {
 			reached = await Promise.race([started.promise.then(() => true), run.then(() => false)]);
 			expect(reached, JSON.stringify(harness.eventsOfType("tool_execution_end"))).toBe(true);
+			harness.session.recordClmUsage(pin, usage);
+			pin.revision = 99;
+			usage.input = 99;
+			await expect(harness.session.getClmAcceptedView()).rejects.toThrow(/writer/);
 			await harness.session.abort();
 			await run;
 			await expect(harness.session.restoreClmRevision(epoch, 0)).rejects.toThrow(/idle|writer/);
@@ -2303,6 +2311,16 @@ describe("CLM action identity", () => {
 			expect(nextProviderCall).not.toHaveBeenCalled();
 			await drainFileMutationQueue(path);
 			await expect(harness.session.setClmMode(false)).rejects.toThrow(/writer/);
+			expect(
+				manager
+					.getEntries()
+					.filter(
+						(entry) =>
+							entry.type === "custom" &&
+							entry.customType === "clm_usage_v1" &&
+							(entry.data as { usage: { input: number } }).usage.input === 12345,
+					),
+			).toEqual([]);
 			if (kind === "builtin") {
 				await harness.session.restoreFollowUpMessage("queued");
 				await expect(harness.session.restoreClmRevision(epoch, 0)).rejects.toThrow(/idle/);
@@ -2318,6 +2336,16 @@ describe("CLM action identity", () => {
 				expect(manager.getEntry(id)).toMatchObject({ message });
 				expect(readFileSync(path, "utf8")).not.toContain("late bytes");
 				expect(JSON.stringify(await harness.session.getClmAcceptedView())).toContain("obsolete");
+				expect(SessionManager.open(manager.getSessionFile()!).getBranch()).toContainEqual(
+					expect.objectContaining({
+						customType: "clm_usage_v1",
+						data: expect.objectContaining({
+							pin: originalPin,
+							usage: expect.objectContaining({ input: 12345 }),
+						}),
+					}),
+				);
+				expect((await harness.session.getClmStatus()).measuredUsage).toBeUndefined();
 				await harness.session.prompt("after repair");
 				expect(nextProviderCall).toHaveBeenCalledTimes(1);
 				harness.setResponses([fauxAssistantMessage(refinePlanJson("after writer repair"))]);
