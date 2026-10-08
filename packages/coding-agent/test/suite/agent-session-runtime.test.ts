@@ -42,6 +42,7 @@ import type { ActiveSessionState } from "../../src/modes/daemon/active-session-s
 import { AgentDaemon } from "../../src/modes/daemon/daemon-mode.js";
 import type { DaemonCommand } from "../../src/modes/daemon/daemon-protocol.js";
 import { DaemonSessionSummarizer, generateAgentStatus } from "../../src/modes/daemon/daemon-session-summarizer.js";
+import * as sleepUtils from "../../src/utils/sleep.js";
 import { assistantMsg, createTestResourceLoader, userMsg } from "../utilities.js";
 import { conversationMessages, createHarness, getMessageText, type Harness } from "./harness.js";
 
@@ -535,6 +536,123 @@ describe("AgentSessionRuntime characterization", () => {
 			h.cleanup();
 		}
 	});
+
+	it.each([
+		{ clm: true, repairFails: true, input: 17 },
+		{ clm: true, repairFails: true, input: 0 },
+		{ clm: true, repairFails: false, input: 17 },
+		{ clm: true, repairFails: false, input: 0 },
+		{ clm: false, repairFails: true, input: 17 },
+		{ clm: false, repairFails: true, input: 0 },
+	])(
+		"rechecks recap retry admission after receipt recovery (clm=$clm, repairFails=$repairFails, input=$input)",
+		async ({ clm, repairFails, input }) => {
+			const h = await createHarness({
+				persistSession: true,
+				tools: [],
+				provider: "prime-inference",
+				models: [{ id: "qwen/qwen3-30b-a3b-instruct-2507" }],
+				settings: { retry: { enabled: true, maxRetries: 1, baseDelayMs: 100 } },
+			});
+			const [backoff, release, done] = [createDeferred(), createDeferred(), createDeferred()];
+			const state = { activeSessionId: "retry-receipt", runtime: { session: h.session } } as ActiveSessionState;
+			const summarizer = new DaemonSessionSummarizer(
+				() => [state],
+				undefined,
+				async (params) => {
+					try {
+						return await generateAgentStatus(params);
+					} finally {
+						done.resolve();
+					}
+				},
+			);
+			const faults: Array<ReturnType<typeof vi.spyOn>> = [];
+			let sleep: ReturnType<typeof vi.spyOn> | undefined;
+			let injected = false;
+			const requests: string[] = [];
+			try {
+				h.setResponses([fauxAssistantMessage("seed")]);
+				await h.session.prompt("seed");
+				if (clm) await h.session.setClmMode(true);
+				const pin = h.sessionManager.captureClmUsagePin();
+				const receiptStart = h.sessionManager
+					.getBranch()
+					.filter((entry) => entry.type === "custom" && entry.customType.startsWith("clm_usage_")).length;
+				const file = h.session.sessionFile!;
+				const append = fs.appendFileSync,
+					rename = fs.renameSync;
+				faults.push(
+					vi.spyOn(fs, "appendFileSync").mockImplementation((path, data, options) => {
+						if (!injected && path === file && String(data).includes("clm_usage_")) {
+							injected = true;
+							append(path, '{"type":"custom"', options);
+							throw Object.assign(new Error("partial receipt append"), { code: "EIO" });
+						}
+						return append(path, data, options);
+					}),
+				);
+				faults.push(
+					vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+						if (repairFails && to === file)
+							throw Object.assign(new Error("rollback rewrite failed"), { code: "EIO" });
+						return rename(from, to);
+					}),
+				);
+				syncBuiltinESMExports();
+				sleep = vi.spyOn(sleepUtils, "sleep").mockImplementation(async () => {
+					backoff.resolve();
+					await release.promise;
+				});
+				h.setResponses([
+					(context) => {
+						requests.push(JSON.stringify(context.messages));
+						return {
+							...fauxAssistantMessage("temporary", { stopReason: "error" }),
+							usage: { ...fauxAssistantMessage("usage").usage, input },
+						};
+					},
+					(context) => {
+						requests.push(JSON.stringify(context.messages));
+						return fauxAssistantMessage("<recap>Recovered</recap><status>COMPLETED</status>");
+					},
+				]);
+				vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+				summarizer.start();
+				await vi.advanceTimersByTimeAsync(25_000);
+				await backoff.promise;
+				await h.session.getClmAcceptedView().catch(() => undefined);
+				expect(injected).toBe(true);
+				expect(requests).toHaveLength(1);
+				if (clm && repairFails) expect(() => h.session.assertModelContextAvailable()).toThrow(/repair/);
+				for (const fault of faults) fault.mockRestore();
+				syncBuiltinESMExports();
+				release.resolve();
+				await done.promise;
+				expect(requests).toHaveLength(clm && repairFails ? 1 : 2);
+				expect(h.getPendingResponseCount()).toBe(clm && repairFails ? 1 : 0);
+				if (!clm || !repairFails) {
+					expect(requests[1]).toBe(requests[0]);
+					await h.session.getClmAcceptedView().catch(() => undefined);
+					const receipts = h.sessionManager
+						.getBranch()
+						.filter((entry) => entry.type === "custom" && entry.customType.startsWith("clm_usage_"))
+						.slice(receiptStart);
+					expect(receipts).toHaveLength(2);
+					for (const receipt of receipts) expect(receipt).toMatchObject({ data: { pin } });
+				}
+			} finally {
+				for (const fault of faults) fault.mockRestore();
+				syncBuiltinESMExports();
+				summarizer.stop();
+				release.resolve();
+				sleep?.mockRestore();
+				vi.useRealTimers();
+				await h.session.disposeAsync();
+				h.cleanup();
+			}
+		},
+	);
 
 	it("flushes a helper receipt queued synchronously by a persistence observer", async () => {
 		const h = await createHarness({ persistSession: true, tools: [] });

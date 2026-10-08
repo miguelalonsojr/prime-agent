@@ -112,6 +112,7 @@ export interface RefineOptions {
 	global?: boolean;
 	retry?: ProviderRetryPolicy;
 	onObservedResponse?: (message: AssistantMessage) => void;
+	beforeAttempt?: () => void;
 }
 
 export type AutoRefineReason = "turn_interval" | "compact";
@@ -1299,7 +1300,12 @@ export async function planRefinement(
 					sessionId,
 				},
 			),
-		{ policy: options.retry, signal, onObservedResponse: options.onObservedResponse },
+		{
+			policy: options.retry,
+			signal,
+			onObservedResponse: options.onObservedResponse,
+			beforeAttempt: options.beforeAttempt,
+		},
 	);
 
 	if (response.stopReason === "error") {
@@ -1342,6 +1348,7 @@ export async function reviewAutoRefine(
 	retry?: ProviderRetryPolicy,
 	sessionId?: string,
 	onObservedResponse?: (message: AssistantMessage) => void,
+	beforeAttempt?: () => void,
 ): Promise<AutoRefineReview> {
 	const conversationText = serializeConversation(convertToLlm(messages)).slice(-40_000);
 	const buildPrompt = (conversation: string): string =>
@@ -1389,7 +1396,7 @@ ${conversation}
 					sessionId,
 				},
 			),
-		{ policy: retry, signal, onObservedResponse },
+		{ policy: retry, signal, onObservedResponse, beforeAttempt },
 	);
 	if (response.stopReason === "error") {
 		throw new Error(`Auto-refine review failed: ${response.errorMessage || "Unknown error"}`);

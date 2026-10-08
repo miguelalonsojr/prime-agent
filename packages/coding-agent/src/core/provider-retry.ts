@@ -115,12 +115,14 @@ export async function completeWithProviderRetry(
 		policy?: ProviderRetryPolicy;
 		signal?: AbortSignal;
 		onObservedResponse?: (message: AssistantMessage) => void;
+		beforeAttempt?: () => void;
 	},
 ): Promise<AssistantMessage> {
 	const policy = options?.policy ?? DEFAULT_PROVIDER_RETRY_POLICY;
 	const maxRetries = policy.enabled ? policy.maxRetries : 0;
 	let retriesPerformed = 0;
 	for (;;) {
+		options?.beforeAttempt?.();
 		const message = await attemptCompletion();
 		options?.onObservedResponse?.(message);
 		if (message.stopReason !== "error") {

@@ -553,6 +553,7 @@ export async function generateSummary(
 	sessionId?: string,
 	recentStateAnchor?: string,
 	onObservedResponse?: (message: AssistantMessage) => void,
+	beforeAttempt?: () => void,
 ): Promise<SummarySlice> {
 	const maxTokens = historySummaryCompletionBudget(reserveTokens);
 
@@ -585,7 +586,7 @@ export async function generateSummary(
 				{ systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, messages: summarizationMessages },
 				completionOptions,
 			),
-		{ policy: retry, signal, onObservedResponse },
+		{ policy: retry, signal, onObservedResponse, beforeAttempt },
 	);
 
 	if (response.stopReason === "error") {
@@ -831,6 +832,7 @@ export async function compact(
 	retry?: ProviderRetryPolicy,
 	sessionId?: string,
 	onObservedResponse?: (message: AssistantMessage) => void,
+	beforeAttempt?: () => void,
 ): Promise<CompactionResult> {
 	const {
 		firstKeptEntryId,
@@ -865,6 +867,7 @@ export async function compact(
 							sessionId,
 							recentStateAnchor,
 							onObservedResponse,
+							beforeAttempt,
 						),
 					)
 				: Promise.resolve<SummarySlice>({ summary: "No prior history." }),
@@ -880,6 +883,7 @@ export async function compact(
 					retry,
 					sessionId,
 					onObservedResponse,
+					beforeAttempt,
 				),
 			),
 		]);
@@ -901,6 +905,7 @@ export async function compact(
 				sessionId,
 				recentStateAnchor,
 				onObservedResponse,
+				beforeAttempt,
 			),
 		);
 		slices.push(result);
@@ -942,6 +947,7 @@ async function generateTurnPrefixSummary(
 	retry?: ProviderRetryPolicy,
 	sessionId?: string,
 	onObservedResponse?: (message: AssistantMessage) => void,
+	beforeAttempt?: () => void,
 ): Promise<SummarySlice> {
 	const maxTokens = turnPrefixSummaryCompletionBudget(reserveTokens);
 	const llmMessages = convertToLlm(messages);
@@ -964,7 +970,7 @@ async function generateTurnPrefixSummary(
 					? { maxTokens, signal, apiKey, headers, sessionId, reasoning: thinkingLevel }
 					: { maxTokens, signal, apiKey, headers, sessionId },
 			),
-		{ policy: retry, signal, onObservedResponse },
+		{ policy: retry, signal, onObservedResponse, beforeAttempt },
 	);
 
 	if (response.stopReason === "error") {

@@ -155,6 +155,7 @@ export interface GenerateAgentStatusParams {
 	retryPolicy?: ProviderRetryPolicy;
 	signal?: AbortSignal;
 	onObservedResponse?: (message: AssistantMessage) => void;
+	beforeAttempt?: () => void;
 }
 
 /** One cheap model call for a fresh status, or undefined if unavailable/empty/failed. */
@@ -190,7 +191,7 @@ export async function generateAgentStatus(params: GenerateAgentStatusParams): Pr
 					},
 					{ maxTokens: SUMMARY_MAX_TOKENS, apiKey: auth.apiKey, headers: auth.headers, signal },
 				),
-			{ policy: retryPolicy, signal, onObservedResponse },
+			{ policy: retryPolicy, signal, onObservedResponse, beforeAttempt: params.beforeAttempt },
 		);
 		if (response.stopReason === "error") {
 			return undefined;
@@ -454,6 +455,7 @@ export class DaemonSessionSummarizer {
 				isWorking,
 				retryPolicy: providerRetryPolicy(session.settingsManager),
 				signal: controller.signal,
+				beforeAttempt: () => session.assertModelContextAvailable(),
 				...(usagePin
 					? {
 							onObservedResponse: (response: AssistantMessage) => {

@@ -1,7 +1,9 @@
-import { writeFileSync } from "node:fs";
+import fs, { writeFileSync } from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import type * as PiAi from "@earendil-works/pi-ai";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import * as sleepUtils from "../../src/utils/sleep.js";
 import { userMsg } from "../utilities.js";
 import { createDeferred } from "./scheduling.js";
 
@@ -200,6 +202,90 @@ describe("AgentSession refinement auxiliary model", () => {
 			}
 		},
 	);
+
+	it.each(["plan", "review"])("blocks %s retries after a concurrent receipt repair failure", async (kind) => {
+		const retry = { enabled: true, maxRetries: 1, baseDelayMs: 100, maxRetryDelayMs: 0 };
+		const h = await createHarness({
+			persistSession: true,
+			settings: {
+				retry,
+				autoRefine: { enabled: kind === "review", turnInterval: 2, cooldownMs: 0 },
+				compaction: { enabled: false },
+			},
+		});
+		const [backoff, release] = [createDeferred(), createDeferred()];
+		const faults: Array<ReturnType<typeof vi.spyOn>> = [];
+		let sleep: ReturnType<typeof vi.spyOn> | undefined;
+		let run: Promise<unknown> | undefined;
+		let calls = 0;
+		try {
+			h.setResponses([assistantText("seed")]);
+			await h.session.prompt("task");
+			await h.session.setClmMode(true);
+			completeSimpleMock.mockImplementation(original.completeSimple);
+			h.setResponses([
+				...(kind === "review" ? [assistantText("turn")] : []),
+				() => {
+					calls++;
+					return { ...assistantText("transient"), stopReason: "error" };
+				},
+				() => {
+					calls++;
+					return kind === "plan"
+						? emptyProposalResponse()
+						: assistantText(JSON.stringify({ shouldRefine: false, rationale: "none" }));
+				},
+			]);
+			sleep = vi.spyOn(sleepUtils, "sleep").mockImplementation(async () => {
+				backoff.resolve();
+				await release.promise;
+			});
+			vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+			run = (kind === "plan" ? h.session.refine() : h.session.prompt("next")).catch(() => undefined);
+			if (kind === "review") {
+				await run;
+				await vi.advanceTimersByTimeAsync(0);
+			}
+			await backoff.promise;
+			const file = h.session.sessionFile!;
+			const append = fs.appendFileSync,
+				rename = fs.renameSync;
+			faults.push(
+				vi.spyOn(fs, "appendFileSync").mockImplementation((path, data, options) => {
+					if (path === file && String(data).includes("clm_usage_")) {
+						append(path, '{"type":"custom"', options);
+						throw new Error("partial receipt EIO");
+					}
+					return append(path, data, options);
+				}),
+			);
+			faults.push(
+				vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+					if (to === file) throw new Error("rollback EIO");
+					return rename(from, to);
+				}),
+			);
+			syncBuiltinESMExports();
+			h.session.recordClmUsage(h.sessionManager.captureClmUsagePin(), assistantText("receipt").usage);
+			await expect(h.session.getClmAcceptedView()).rejects.toThrow(/repair/);
+			for (const fault of faults) fault.mockRestore();
+			syncBuiltinESMExports();
+			release.resolve();
+			await run;
+			await vi.advanceTimersByTimeAsync(0);
+			expect(calls).toBe(1);
+			expect(h.getPendingResponseCount()).toBe(1);
+		} finally {
+			for (const fault of faults) fault.mockRestore();
+			syncBuiltinESMExports();
+			release.resolve();
+			await run;
+			sleep?.mockRestore();
+			vi.useRealTimers();
+			await h.session.disposeAsync();
+			h.cleanup();
+		}
+	});
 
 	it("marks zero-usage refinement errors unknown while retaining a measured retry", async () => {
 		const h = await createHarness({

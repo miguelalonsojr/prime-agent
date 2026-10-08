@@ -77,6 +77,7 @@ export interface GenerateBranchSummaryOptions {
 	replaceInstructions?: boolean;
 	retry?: ProviderRetryPolicy;
 	onObservedResponse?: (message: AssistantMessage) => void;
+	beforeAttempt?: () => void;
 	/** Tokens reserved for prompt + LLM response (default 16384) */
 	reserveTokens?: number;
 }
@@ -302,6 +303,7 @@ export async function generateBranchSummary(
 		replaceInstructions,
 		retry,
 		onObservedResponse,
+		beforeAttempt,
 		reserveTokens = 16384,
 	} = options;
 	const tokenBudget = branchSummaryTokenBudget(model.contextWindow, reserveTokens);
@@ -330,7 +332,7 @@ export async function generateBranchSummary(
 				{ systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, messages: summarizationMessages },
 				{ apiKey, headers, sessionId, signal, maxTokens: BRANCH_SUMMARY_MAX_TOKENS },
 			),
-		{ policy: retry, signal, onObservedResponse },
+		{ policy: retry, signal, onObservedResponse, beforeAttempt },
 	);
 	if (response.stopReason === "aborted") {
 		return { aborted: true };

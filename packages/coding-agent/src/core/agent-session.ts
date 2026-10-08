@@ -9567,6 +9567,7 @@ export class AgentSession {
 					providerRetryPolicy(this.settingsManager),
 					this.sessionId,
 					(response) => this._recordObservedProviderUsage(usagePin, response),
+					() => this.assertModelContextAvailable(),
 				));
 			}
 
@@ -10170,6 +10171,7 @@ export class AgentSession {
 			providerRetryPolicy(this.settingsManager),
 			this.sessionId,
 			(response) => this._recordObservedProviderUsage(usagePin, response),
+			() => this.assertModelContextAvailable(),
 		);
 	}
 
@@ -10592,6 +10594,7 @@ export class AgentSession {
 				...options,
 				retry: providerRetryPolicy(this.settingsManager),
 				onObservedResponse: (response) => this._recordObservedProviderUsage(usagePin, response),
+				beforeAttempt: () => this.assertModelContextAvailable(),
 			},
 			refinementModel.headers,
 			signal,
@@ -15406,6 +15409,7 @@ export class AgentSession {
 					reserveTokens: branchSummarySettings.reserveTokens,
 					retry: providerRetryPolicy(this.settingsManager),
 					onObservedResponse: (response) => this._recordObservedProviderUsage(usagePin, response),
+					beforeAttempt: () => this.assertModelContextAvailable(),
 				});
 				if (result.aborted) {
 					return { cancelled: true, aborted: true };
