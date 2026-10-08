@@ -254,6 +254,8 @@ interface SummaryComposeFingerprint {
 	attachedClients: number;
 	directAttachedClients: number;
 	messageCount: number;
+	leafId: string | null | undefined;
+	statusCurrent: boolean;
 	// References: memoized upstream (usage), replaced on change (model,
 	// summaryState, streamingMessage), or structural (sessionActions,
 	// diagnostics: post-construction changes replace the array or append).
@@ -326,6 +328,15 @@ export function summaryForActiveSession(
 		(metadata.prompt ? compactRlmText(metadata.prompt, 120) : undefined) ??
 		firstUserMessageText(session);
 
+	const memo = summaryComposeMemos.get(activeSession);
+	const leafId = session.sessionManager.getLeafId?.();
+	const statusCurrent =
+		memo &&
+		memo.fingerprint.leafId === leafId &&
+		memo.fingerprint.summaryState === activeSession.summaryState &&
+		memo.fingerprint.messageCount === session.messages.length
+			? memo.fingerprint.statusCurrent
+			: isSummaryCurrent(activeSession);
 	const fingerprint: SummaryComposeFingerprint = {
 		hasActiveHeartbeat,
 		hasRegisteredHeartbeat,
@@ -341,6 +352,8 @@ export function summaryForActiveSession(
 		attachedClients: activeSession.clients.size,
 		directAttachedClients,
 		messageCount: session.messages.length,
+		leafId,
+		statusCurrent,
 		usage: session.getOwnUsageSummary?.(),
 		model: session.model as Model<Api> | undefined,
 		thinkingLevel: session.thinkingLevel,
@@ -368,7 +381,6 @@ export function summaryForActiveSession(
 		firstMessage,
 	};
 
-	const memo = summaryComposeMemos.get(activeSession);
 	if (memo && summaryComposeFingerprintsEqual(memo.fingerprint, fingerprint)) {
 		return memo.summary;
 	}
@@ -423,7 +435,7 @@ export function summaryForActiveSession(
 		// gate the verdict on currency: a stale "completed" must not show on a turn
 		// that is active again.
 		summary: activeSession.summaryState?.summary,
-		...(isSummaryCurrent(activeSession) ? { taskState: activeSession.summaryState?.taskState } : {}),
+		...(statusCurrent ? { taskState: activeSession.summaryState?.taskState } : {}),
 	};
 	summaryComposeMemos.set(activeSession, { fingerprint, summary });
 	return Object.freeze(summary);
@@ -566,7 +578,36 @@ export function latestMessageActivityAt(
 
 export function isSummaryCurrent(activeSession: ActiveSessionState): boolean {
 	const status = activeSession.summaryState;
-	return status !== undefined && status.basedOnMessageCount === activeSession.runtime.session.messages.length;
+	if (!status) return false;
+	const manager = activeSession.runtime.session.sessionManager;
+	let clm: ReturnType<typeof manager.getClmBranchState>;
+	let branch: ReturnType<typeof manager.getBranch> | undefined;
+	try {
+		clm = manager.getClmBranchState?.();
+		if (clm?.mode === "on") branch = manager.getBranch?.();
+	} catch {
+		return false;
+	}
+	if (clm?.mode !== "on") return status.basedOnMessageCount === activeSession.runtime.session.messages.length;
+	if (!branch || !clm.snapshot) return false;
+	let acceptedIndex = -1;
+	let statusIndex = -1;
+	for (let index = 0; index < branch.length; index++) {
+		if (branch[index]?.type === "clm_on" || branch[index]?.type === "clm_revision") acceptedIndex = index;
+		if (branch[index]?.type === "agent_status") statusIndex = index;
+	}
+	const boundary =
+		clm.auditWatermark === null ? acceptedIndex : branch.findIndex((entry) => entry.id === clm.auditWatermark);
+	if (acceptedIndex < 0 || statusIndex <= acceptedIndex || boundary < 0) return false;
+	const uncovered = branch
+		.slice(boundary + 1)
+		.filter(
+			(entry) =>
+				entry.type === "message" ||
+				entry.type === "custom_message" ||
+				(entry.type === "branch_summary" && entry.summary),
+		);
+	return status.basedOnMessageCount === clm.snapshot.blocks.length + uncovered.length;
 }
 
 export function summaryForInactiveSession(
@@ -602,8 +643,8 @@ export function summaryForInactiveSession(
 		// agents-view bucket (e.g. Completed) instead of defaulting to Needs Input.
 		// Gate on message-count currency like isSummaryCurrent does for resident
 		// sessions, so a verdict from before later messages isn't shown stale.
-		...(session.agentStatus?.basedOnMessageCount === session.messageCount
-			? { summary: session.agentStatus.summary, taskState: session.agentStatus.taskState }
+		...((session.clmStatusCurrent ?? session.agentStatus?.basedOnMessageCount === session.messageCount)
+			? { summary: session.agentStatus?.summary, taskState: session.agentStatus?.taskState }
 			: {}),
 	};
 }

@@ -1,11 +1,13 @@
-import { resolve } from "node:path";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { RlmChildAgentSnapshot } from "../src/core/agent-session.js";
 import type { AgentSessionRuntimeDiagnostic } from "../src/core/agent-session-services.js";
 import type { AgentCronJob } from "../src/core/cron-jobs.js";
 import type { SessionActionSnapshot } from "../src/core/session-action-store.js";
-import type { AgentStatus, SessionInfo } from "../src/core/session-manager.js";
+import { type AgentStatus, readSessionInfo, type SessionInfo, SessionManager } from "../src/core/session-manager.js";
 import type { SessionUsageSummary } from "../src/core/usage.js";
 import type { ActiveSessionState, DaemonSocketClient } from "../src/modes/daemon/active-session-state.js";
 import { passivatedWorkerRosterEntry, workerRosterEntryFromSummary } from "../src/modes/daemon/agent-roster.js";
@@ -83,6 +85,66 @@ describe("buildSessionList", () => {
 		const summary = summaryForActiveSession(makeState({ activeSessionId: "active-1", ...options }));
 
 		expect(summary).toMatchObject(expected);
+	});
+
+	it("shows accepted-shortened CLM status for active and inactive rows, then hides a same-count restored verdict", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "clm-list-status-"));
+		try {
+			const manager = SessionManager.create(dir, join(dir, "sessions"));
+			const kept = { role: "user" as const, content: "kept", timestamp: 1 };
+			const removed = { role: "user" as const, content: "removed", timestamp: 2 };
+			const firstId = manager.appendMessage(kept);
+			const watermark = manager.appendMessage(removed);
+			manager.appendClmOn({ blocks: [{ id: firstId, message: kept }] }, watermark);
+			const prior: AgentStatus = { summary: "accepted", taskState: "completed", basedOnMessageCount: 1 };
+			manager.appendAgentStatus(prior);
+			manager.flushNow();
+			const state = makeState({
+				activeSessionId: "clm-live",
+				sessionFile: manager.getSessionFile(),
+				messages: [kept, removed] as AgentMessage[],
+				summaryState: prior,
+			});
+			(state.runtime.session as unknown as { sessionManager: SessionManager }).sessionManager = manager;
+			const saved = (await readSessionInfo(manager.getSessionFile()!))!;
+			expect(buildSessionList([state], [saved])[0]).toMatchObject({ summary: "accepted", taskState: "completed" });
+			expect(buildSessionList([], [saved])[0]).toMatchObject({ summary: "accepted", taskState: "completed" });
+			manager.appendClmRevision(
+				{ blocks: [{ id: firstId, message: { ...kept, content: "replacement" } }] },
+				watermark,
+				"restore:test",
+			);
+			manager.flushNow();
+			const restored = (await readSessionInfo(manager.getSessionFile()!))!;
+			expect(buildSessionList([state], [restored])[0]?.taskState).toBeUndefined();
+			expect(buildSessionList([], [restored])[0]?.taskState).toBeUndefined();
+			const fresh: AgentStatus = { summary: "restored", taskState: "needs_input", basedOnMessageCount: 1 };
+			manager.appendAgentStatus(fresh);
+			manager.flushNow();
+			state.summaryState = fresh;
+			const settled = (await readSessionInfo(manager.getSessionFile()!))!;
+			expect(buildSessionList([state], [settled])[0]).toMatchObject({
+				summary: "restored",
+				taskState: "needs_input",
+			});
+			expect(buildSessionList([], [settled])[0]).toMatchObject({ summary: "restored", taskState: "needs_input" });
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("degrades a corrupt CLM status projection without failing the roster", () => {
+		const state = makeState({
+			activeSessionId: "corrupt",
+			messages: [{ role: "user", content: "task" } as AgentMessage],
+			summaryState: { summary: "old", taskState: "completed", basedOnMessageCount: 1 },
+		});
+		(state.runtime.session.sessionManager as unknown as { getClmBranchState(): never }).getClmBranchState = () => {
+			throw new Error("corrupt CLM branch");
+		};
+		const row = buildSessionList([state], [])[0];
+		expect(row?.summary).toBe("old");
+		expect(row?.taskState).toBeUndefined();
 	});
 
 	it("counts direct peers separately so the supervisor can add them to its own attachment count", () => {
@@ -578,6 +640,24 @@ describe("summary compose memoization", () => {
 			expect(next).toMatchObject(expected);
 			previous = next;
 		}
+	});
+
+	it("does not revalidate unchanged off-mode status on each roster compose", () => {
+		const state = makeState({
+			activeSessionId: "off-fast",
+			messages: [messageAt("2026-05-01T00:00:00.000Z")],
+			summaryState: { summary: "idle", taskState: "needs_input", basedOnMessageCount: 1 },
+		});
+		const manager = state.runtime.session.sessionManager as unknown as {
+			getClmBranchState(): { mode: "off" };
+			getLeafId(): string;
+		};
+		const getClmBranchState = vi.fn(() => ({ mode: "off" as const }));
+		manager.getClmBranchState = getClmBranchState;
+		manager.getLeafId = () => "stable-leaf";
+		summaryForActiveSession(state);
+		summaryForActiveSession(state, undefined, true);
+		expect(getClmBranchState).toHaveBeenCalledOnce();
 	});
 
 	it("recomposes when heartbeat registration flags differ per call site", () => {

@@ -386,6 +386,8 @@ export interface SessionInfo {
 	firstMessage: string;
 	allMessagesText: string;
 	agentStatus?: AgentStatus;
+	/** Internal catalog projection; never serialized into a daemon summary. */
+	clmStatusCurrent?: boolean;
 	usage?: SessionUsageSummary;
 }
 
@@ -1578,6 +1580,15 @@ interface SessionScanAccumulator {
 	name?: string;
 	state?: SessionState;
 	agentStatus?: AgentStatus;
+	lastEntryId?: string;
+	clm?: {
+		acceptedCount: number;
+		revisionId: string;
+		contentTipId: string;
+		statusRevisionId?: string;
+		statusContentTipId?: string;
+		valid: boolean;
+	};
 	lastActivityTime?: number;
 	// Fold attribution aggregates like the loader: either disk representation cancels to the same own spend.
 	assistantUsageById: Map<string, Usage>;
@@ -1809,7 +1820,7 @@ function foldSessionScanLine(acc: SessionScanAccumulator, lineBuffer: Buffer): v
 	if (!line.trim()) return;
 
 	// Guarded on the header so damaged-file detection still sees the first entry parsed.
-	if (acc.header !== undefined && isCountOnlyMessageLine(line)) {
+	if (acc.header !== undefined && !acc.clm && isCountOnlyMessageLine(line)) {
 		acc.messageCount++;
 		return;
 	}
@@ -1820,6 +1831,7 @@ function foldSessionScanLine(acc: SessionScanAccumulator, lineBuffer: Buffer): v
 	if (line.length > SESSION_LIST_PARSE_MAX_LINE_CHARS) {
 		if (looksLikeMessageEntry(line)) {
 			acc.messageCount++;
+			if (acc.clm) acc.clm.valid = false;
 			const summary = extractOversizedMessageSummary(line);
 			if (typeof summary.timestamp === "number" && (summary.role === "user" || summary.role === "assistant")) {
 				acc.lastActivityTime = Math.max(acc.lastActivityTime ?? 0, summary.timestamp);
@@ -1839,6 +1851,23 @@ function foldSessionScanLine(acc: SessionScanAccumulator, lineBuffer: Buffer): v
 		return;
 	}
 
+	// A fork can leave the last scanned CLM revision outside the selected branch; hide its verdict.
+	if (entry.type !== "session" && acc.clm && acc.lastEntryId !== undefined && entry.parentId !== acc.lastEntryId)
+		acc.clm.valid = false;
+	if (entry.type === "clm_on" || entry.type === "clm_revision") {
+		acc.clm = {
+			acceptedCount: entry.snapshot.blocks.length,
+			revisionId: entry.id,
+			contentTipId: entry.id,
+			valid: true,
+		};
+	} else if (entry.type === "clm_off_boundary") {
+		acc.clm = undefined;
+	} else if (acc.clm && (entry.type === "custom_message" || (entry.type === "branch_summary" && entry.summary))) {
+		acc.clm.acceptedCount++;
+		acc.clm.contentTipId = entry.id;
+	}
+	acc.lastEntryId = entry.id;
 	if (entry.type === "session_info") {
 		const infoEntry = entry as SessionInfoEntry;
 		acc.name = infoEntry.name?.trim() || undefined;
@@ -1854,6 +1883,10 @@ function foldSessionScanLine(acc: SessionScanAccumulator, lineBuffer: Buffer): v
 	// unjudged in the agents view. Append-only, so last seen wins.
 	if (entry.type === "agent_status") {
 		acc.agentStatus = (entry as AgentStatusEntry).status;
+		if (acc.clm) {
+			acc.clm.statusRevisionId = acc.clm.revisionId;
+			acc.clm.statusContentTipId = acc.clm.contentTipId;
+		}
 	}
 	if (entry.type === "model_change") {
 		const modelEntry = entry as ModelChangeEntry;
@@ -1882,6 +1915,10 @@ function foldSessionScanLine(acc: SessionScanAccumulator, lineBuffer: Buffer): v
 
 	if (entry.type !== "message") return;
 	acc.messageCount++;
+	if (acc.clm) {
+		acc.clm.acceptedCount++;
+		acc.clm.contentTipId = entry.id;
+	}
 
 	const message = (entry as SessionMessageEntry).message;
 	if (message.role === "assistant" && (message as { usage?: Usage }).usage) {
@@ -1918,6 +1955,7 @@ function snapshotSessionInfo(
 			assistantUsageById: new Map(persistent.assistantUsageById),
 			attributedChildUsage: cloneUsage(persistent.attributedChildUsage),
 			summarizationUsage: cloneUsage(persistent.summarizationUsage),
+			clm: persistent.clm ? { ...persistent.clm } : undefined,
 		};
 		foldSessionScanLine(acc, tornTail);
 	}
@@ -1949,6 +1987,15 @@ function snapshotSessionInfo(
 		firstMessage: acc.firstMessage || "(no messages)",
 		allMessagesText: acc.allMessagesText,
 		agentStatus: acc.agentStatus,
+		...(acc.clm
+			? {
+					clmStatusCurrent:
+						acc.clm.valid &&
+						acc.clm.statusRevisionId === acc.clm.revisionId &&
+						acc.clm.statusContentTipId === acc.clm.contentTipId &&
+						acc.agentStatus?.basedOnMessageCount === acc.clm.acceptedCount,
+				}
+			: {}),
 		usage: sessionUsageSummaryFrom(usageTotal),
 	};
 }

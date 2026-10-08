@@ -398,9 +398,30 @@ export class DaemonSessionSummarizer {
 			if (clmIdentity) this.settledClmIdentity.set(id, clmIdentity);
 			return;
 		}
-		// The leaf entry id is the branch-tip identity (appends, edits, and branch
-		// navigation all move it; counts and timestamps collide across siblings).
-		const contentKey = `${session.sessionManager.getLeafId() ?? "root"}:${messageCount}`;
+		// Usage and status entries move the leaf without changing the model-visible content.
+		const branch = session.sessionManager.getBranch?.();
+		let contentTip: string | undefined;
+		if (branch) {
+			for (let index = branch.length - 1; index >= 0; index--) {
+				const entry = branch[index]!;
+				if (
+					[
+						"message",
+						"custom_message",
+						"branch_summary",
+						"compaction",
+						"clm_on",
+						"clm_revision",
+						"clm_off_boundary",
+					].includes(entry.type)
+				) {
+					contentTip = entry.id;
+					break;
+				}
+			}
+		}
+		contentTip ??= session.sessionManager.getLeafId() ?? "root";
+		const contentKey = `${clmIdentity ?? ""}:${contentTip}:${messageCount}`;
 		const failed = this.failedIdleGenerations.get(id);
 		if (
 			!isWorking &&

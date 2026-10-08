@@ -470,6 +470,61 @@ describe("daemon session summarizer", () => {
 			}
 		});
 
+		test.each(["on", "off"] as const)(
+			"caps unchanged %s-mode failed summaries despite usage-marker leaf churn",
+			async (mode) => {
+				const dir = mkdtempSync(join(tmpdir(), "clm-status-cap-"));
+				try {
+					const manager = SessionManager.create(dir, join(dir, "sessions"));
+					const first = {
+						role: "user" as const,
+						content: [{ type: "text" as const, text: "task" }],
+						timestamp: 0,
+					};
+					const id = manager.appendMessage(first);
+					const pivot = mode === "on" ? manager.appendClmOn({ blocks: [{ id, message: first }] }, id) : id;
+					const second = { ...first, content: [{ type: "text" as const, text: "second" }] };
+					manager.appendMessage(second);
+					const messages: AgentMessage[] = [first, second];
+					const state = makeState({
+						messages,
+						isSessionActive: false,
+						...(mode === "on"
+							? {
+									clmView: async () => ({
+										view: { messages: [...messages] },
+										pin: manager.captureClmUsagePin(),
+									}),
+								}
+							: {}),
+					});
+					(state.runtime.session as unknown as { sessionManager: SessionManager }).sessionManager = manager;
+					const generate = vi.fn(async (params: GenerateAgentStatusParams) => {
+						params.onObservedResponse?.(fauxAssistantMessage("failed", { stopReason: "error" }));
+						return undefined;
+					});
+					const summarizer = new DaemonSessionSummarizer(() => [state], undefined, generate);
+					const run = () =>
+						(summarizer as unknown as { summarize(state: ActiveSessionState): Promise<void> }).summarize(state);
+					for (let attempt = 0; attempt < 5; attempt++) await run();
+					expect(generate).toHaveBeenCalledTimes(3);
+					expect(
+						manager
+							.getBranch()
+							.filter((entry) => entry.type === "custom" && entry.customType === "clm_usage_unknown_v1"),
+					).toHaveLength(3);
+					const next = { ...first, content: [{ type: "text" as const, text: "sibling task" }] };
+					manager.branch(pivot);
+					manager.appendMessage(next);
+					messages[1] = next;
+					await run();
+					expect(generate).toHaveBeenCalledTimes(4);
+				} finally {
+					rmSync(dir, { recursive: true, force: true });
+				}
+			},
+		);
+
 		test("a forget() during an in-flight idle generation leaves no failure record behind", async () => {
 			let release!: () => void;
 			const gate = new Promise<void>((resolveGate) => {
