@@ -227,6 +227,30 @@ describe("buildSessionList", () => {
 		}
 	});
 
+	it.each(["normal", "CLM-off"] as const)("shows fresh %s status after an oversized custom message", async (mode) => {
+		const dir = mkdtempSync(join(tmpdir(), "clm-list-large-custom-"));
+		try {
+			const manager = SessionManager.create(dir, join(dir, "sessions"));
+			const user = { role: "user" as const, content: "task", timestamp: 1 };
+			const id = manager.appendMessage(user);
+			if (mode === "CLM-off") {
+				const snapshot = { blocks: [{ id, message: user }] };
+				manager.appendClmOn(snapshot, id);
+				manager.appendClmOffBoundary(snapshot, id);
+			}
+			manager.appendCustomMessageEntry("large-note", "x".repeat(1_100_000), true);
+			manager.appendAgentStatus({ summary: "new", taskState: "completed", basedOnMessageCount: 1 });
+			manager.flushNow();
+			const saved = (await readSessionInfo(manager.getSessionFile()!))!;
+			expect(saved.messageCount).toBe(1);
+			expect(saved.agentStatus?.summary).toBe("new");
+			expect(saved.clmStatusCurrent).toBeUndefined();
+			expect(buildSessionList([], [saved])[0]?.taskState).toBe("completed");
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
 	it("degrades a corrupt CLM status projection without failing the roster", () => {
 		const state = makeState({
 			activeSessionId: "corrupt",
