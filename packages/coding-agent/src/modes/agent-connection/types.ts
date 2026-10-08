@@ -28,7 +28,6 @@ import type {
 	SessionActionSnapshot,
 } from "../../core/session-action-store.js";
 import type { DeleteSessionFileResult } from "../../core/session-file-actions.js";
-import type { ClmOffBoundaryEntry, ClmOnEntry, ClmRevisionEntry } from "../../core/session-manager.js";
 import type { SessionStats } from "../../core/session-stats.js";
 import type { SessionUsageSummary } from "../../core/usage.js";
 import type { SessionSummary } from "../daemon/daemon-session-list.js";
@@ -247,10 +246,36 @@ export interface AgentConnectionGitStateEntry extends AgentConnectionSessionEntr
 	};
 }
 
+export type AgentConnectionClmModeSource = "configured-default" | "inherited-child" | "session-override";
+
+interface AgentConnectionClmEntryBase extends AgentConnectionSessionEntryBase {
+	epochId: string;
+	revision: number;
+	snapshot: { blocks: { id: string; message: AgentMessage }[] };
+	auditWatermark: string | null;
+}
+
+export interface AgentConnectionClmOnEntry extends AgentConnectionClmEntryBase {
+	type: "clm_on";
+	modeSource?: AgentConnectionClmModeSource;
+}
+
+export interface AgentConnectionClmRevisionEntry extends AgentConnectionClmEntryBase {
+	type: "clm_revision";
+	baseRevision: number;
+	checksum: string;
+	observedActionId: string;
+}
+
+export interface AgentConnectionClmOffBoundaryEntry extends AgentConnectionClmEntryBase {
+	type: "clm_off_boundary";
+	modeSource?: AgentConnectionClmModeSource;
+}
+
 export type AgentConnectionSessionEntry =
-	| ClmOnEntry
-	| ClmRevisionEntry
-	| ClmOffBoundaryEntry
+	| AgentConnectionClmOnEntry
+	| AgentConnectionClmRevisionEntry
+	| AgentConnectionClmOffBoundaryEntry
 	| AgentConnectionSessionMessageEntry
 	| AgentConnectionThinkingLevelChangeEntry
 	| AgentConnectionServiceTierChangeEntry
