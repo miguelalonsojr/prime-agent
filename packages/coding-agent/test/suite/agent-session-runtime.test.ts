@@ -1,4 +1,5 @@
-import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import fs, { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fauxAssistantMessage, fauxToolCall, registerFauxProvider, type Usage } from "@earendil-works/pi-ai";
@@ -410,6 +411,90 @@ describe("AgentSessionRuntime characterization", () => {
 			}
 		},
 	);
+
+	it.each([
+		{ input: 11, partial: false },
+		{ input: 0, partial: false },
+		{ input: 11, partial: true },
+		{ input: 0, partial: true },
+	])(
+		"rolls back failed helper receipt appends before retry ($input, partial=$partial)",
+		async ({ input, partial }) => {
+			const h = await createHarness({ persistSession: true, tools: [] });
+			let fault: ReturnType<typeof vi.spyOn> | undefined;
+			try {
+				h.setResponses([fauxAssistantMessage("seed")]);
+				await h.session.prompt("seed");
+				await h.session.setClmMode(true);
+				const manager = h.sessionManager;
+				const pin = manager.captureClmUsagePin();
+				const before = readFileSync(h.session.sessionFile!, "utf8");
+				const entries = [...manager.getEntries()];
+				const append = fs.appendFileSync;
+				let injected = false;
+				fault = vi.spyOn(fs, "appendFileSync").mockImplementation((file, data, options) => {
+					if (!injected && file === h.session.sessionFile && String(data).includes("clm_usage_")) {
+						injected = true;
+						if (partial) append(file, String(data).slice(0, 20), options);
+						throw Object.assign(new Error("injected receipt append failure"), { code: "ENOSPC" });
+					}
+					return append(file, data, options);
+				});
+				syncBuiltinESMExports();
+				h.session.recordClmUsage(pin, { ...fauxAssistantMessage("observed").usage, input });
+				await h.session.getClmAcceptedView();
+				await h.session.getClmAcceptedView();
+				expect(injected).toBe(true);
+				expect(manager.getLeafId()).toBe(pin.branchId);
+				expect(manager.getEntries()).toEqual(entries);
+				expect(readFileSync(h.session.sessionFile!, "utf8")).toBe(before);
+				expect(manager.getClmMeasuredUsage()).toBeUndefined();
+				h.session.recordClmUsage(pin, { ...fauxAssistantMessage("next").usage, input: 22 });
+				await h.session.getClmAcceptedView();
+				const reopened = SessionManager.open(h.session.sessionFile!);
+				expect(reopened.getClmBranchState()).toEqual(manager.getClmBranchState());
+				expect(reopened.getClmBranchState()).toMatchObject({ mode: "on", epochId: pin.epochId, revision: 0 });
+				expect(reopened.getEntries()).toEqual(manager.getEntries());
+				const receipts = reopened.getBranch().slice(entries.length);
+				expect(receipts.map((entry) => (entry.type === "custom" ? entry.data : undefined))).toEqual([
+					{ version: 1, pin, ...(input ? { usage: { ...fauxAssistantMessage("observed").usage, input } } : {}) },
+					{ version: 1, pin, usage: { ...fauxAssistantMessage("next").usage, input: 22 } },
+				]);
+				expect(reopened.getClmMeasuredUsage()?.input).toBe(input ? 33 : undefined);
+			} finally {
+				fault?.mockRestore();
+				syncBuiltinESMExports();
+				await h.session.disposeAsync();
+				h.cleanup();
+			}
+		},
+	);
+
+	it("flushes a helper receipt queued synchronously by a persistence observer", async () => {
+		const h = await createHarness({ persistSession: true, tools: [] });
+		let unsubscribe = () => {};
+		try {
+			h.setResponses([fauxAssistantMessage("seed")]);
+			await h.session.prompt("seed");
+			await h.session.setClmMode(true);
+			const pin = h.sessionManager.captureClmUsagePin();
+			let persisted = 0;
+			unsubscribe = h.sessionManager.onPersist(() => {
+				if (++persisted === 1) h.session.recordClmUsage(pin, { ...fauxAssistantMessage("next").usage, input: 22 });
+			});
+			h.session.recordClmUsage(pin, { ...fauxAssistantMessage("first").usage, input: 11 });
+			await h.session.getClmAcceptedView();
+			await h.session.getClmAcceptedView();
+			expect(persisted).toBe(2);
+			const reopened = SessionManager.open(h.session.sessionFile!);
+			expect(reopened.getClmBranchState()).toMatchObject({ mode: "on", epochId: pin.epochId, revision: 0 });
+			expect(reopened.getClmMeasuredUsage()?.input).toBe(33);
+		} finally {
+			unsubscribe();
+			await h.session.disposeAsync();
+			h.cleanup();
+		}
+	});
 
 	it("does not append queued or late helper receipts after disposal", async () => {
 		const h = await createHarness({ persistSession: true });

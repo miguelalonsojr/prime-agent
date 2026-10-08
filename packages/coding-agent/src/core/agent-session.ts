@@ -2146,6 +2146,7 @@ export class AgentSession {
 
 	private async _flushClmUsageReceipts(): Promise<void> {
 		let fence: { owner: symbol; release(): void } | undefined;
+		let drained = false;
 		try {
 			fence = await this._acquireSessionActionCommitFence();
 			await this._agentEventQueue;
@@ -2159,12 +2160,15 @@ export class AgentSession {
 				this.sessionManager.recordClmUsage(receipt.pin, receipt.usage);
 				this._pendingClmUsageReceipts.shift();
 			}
+			drained = true;
 		} catch {
 			// Keep receipts through a writer conflict; explicit repair wakes this queue.
 			// A crash before the ordinary session append leaves attribution unknown.
 		} finally {
 			fence?.release();
 			this._clmUsageFlushPending = false;
+			// Persistence observers can enqueue receipts while the snapshot is being written.
+			if (drained) this._scheduleClmUsageFlush();
 		}
 	}
 

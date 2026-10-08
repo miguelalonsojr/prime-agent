@@ -2453,7 +2453,7 @@ export class SessionManager {
 
 	recordClmUsage(pin: ClmUsagePin, usage: Usage, messageEntryId?: string): void {
 		if (!isObservedClmUsage(usage)) {
-			this.appendCustomEntry("clm_usage_unknown_v1", {
+			this.appendCustomEntryWithRollback("clm_usage_unknown_v1", {
 				version: 1,
 				pin,
 				...(messageEntryId ? { messageEntryId } : {}),
@@ -2466,7 +2466,7 @@ export class SessionManager {
 			usage: cloneUsage(usage),
 			...(messageEntryId ? { messageEntryId } : {}),
 		};
-		this.appendCustomEntry(CLM_USAGE_RECEIPT, receipt);
+		this.appendCustomEntryWithRollback(CLM_USAGE_RECEIPT, receipt);
 	}
 
 	getClmMeasuredUsage():
