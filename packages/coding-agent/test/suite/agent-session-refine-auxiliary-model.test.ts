@@ -1,13 +1,17 @@
+import { writeFileSync } from "node:fs";
 import type * as PiAi from "@earendil-works/pi-ai";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { userMsg } from "../utilities.js";
 
-const { completeSimpleMock } = vi.hoisted(() => ({
+const { completeSimpleMock, original } = vi.hoisted(() => ({
 	completeSimpleMock: vi.fn(),
+	original: {} as { completeSimple: typeof PiAi.completeSimple },
 }));
 
 vi.mock("@earendil-works/pi-ai", async (importOriginal) => {
 	const actual = await importOriginal<typeof PiAi>();
+	original.completeSimple = actual.completeSimple;
 	return {
 		...actual,
 		completeSimple: completeSimpleMock,
@@ -66,6 +70,76 @@ describe("AgentSession refinement auxiliary model", () => {
 		harnesses.push(harness);
 		return harness;
 	}
+
+	it.each(["manual", "automatic", "off", "marker", "apply-marker"])(
+		"pins accepted-only context for %s refinement",
+		async (mode) => {
+			const preparations: string[] = [];
+			const h = await createHarness({
+				persistSession: true,
+				serializedRefine: mode === "automatic",
+				settings: { autoRefine: { enabled: mode === "automatic", turnInterval: 1, cooldownMs: 0 } },
+				extensionFactories: [
+					(pi) => {
+						pi.on("session_before_refine", (event) => {
+							preparations.push(event.preparation.conversationText);
+						});
+					},
+				],
+			});
+			harnesses.push(h);
+			const watermark = h.sessionManager.appendMessage(userMsg("obsolete audit"));
+			h.session.agent.state.messages = h.sessionManager.buildSessionContext().messages;
+			h.sessionManager.appendClmOn({ blocks: [{ id: watermark, message: userMsg("obsolete audit") }] }, watermark);
+			h.sessionManager.appendClmRevision(
+				{ blocks: [{ id: watermark, message: userMsg("accepted context") }] },
+				watermark,
+				"forget",
+			);
+			completeSimpleMock.mockImplementation(original.completeSimple);
+			const requests: string[] = [];
+			h.setResponses([
+				...(mode === "automatic"
+					? [
+							assistantText("turn"),
+							(context: PiAi.Context) => {
+								requests.push(JSON.stringify(context.messages));
+								return assistantText(JSON.stringify({ shouldRefine: true, rationale: "record learning" }));
+							},
+						]
+					: []),
+				(context) => {
+					requests.push(JSON.stringify(context.messages));
+					if (mode === "apply-marker") writeFileSync(`${h.session.sessionFile}.clm-writer`, "unknown");
+					return emptyProposalResponse();
+				},
+			]);
+			if (mode === "off") await h.session.setClmMode(false);
+			if (mode === "marker") {
+				writeFileSync(`${h.session.sessionFile}.clm-writer`, "unknown");
+				await expect(h.session.refine()).rejects.toThrow(/CLM/);
+				expect(h.faux.state.callCount).toBe(0);
+				expect(preparations).toEqual([]);
+			} else if (mode === "apply-marker") {
+				await expect(h.session.refine()).rejects.toThrow(/CLM/);
+				expect(h.sessionManager.getEntries().filter((entry) => entry.type === "custom_message")).toEqual([]);
+			} else {
+				if (mode === "automatic") await h.session.prompt("next");
+				else await h.session.refine();
+				expect(requests).toHaveLength(mode === "automatic" ? 2 : 1);
+			}
+			for (const text of [...preparations, ...requests]) {
+				expect(text).toContain("accepted context");
+				expect(text).not.toContain("obsolete audit");
+			}
+			expect(JSON.stringify(h.sessionManager.getEntries())).toContain("obsolete audit");
+			if (!mode.endsWith("marker")) {
+				const pinned = await h.session.getAcceptedModelContextSnapshot();
+				pinned.length = 0;
+				expect(JSON.stringify(await h.session.getAcceptedModelContextSnapshot())).toContain("accepted context");
+			}
+		},
+	);
 
 	it("routes refinement planning to the configured auxiliary model", async () => {
 		const harness = await createRefineHarness({ auxiliaryModel: "faux/aux-model" });

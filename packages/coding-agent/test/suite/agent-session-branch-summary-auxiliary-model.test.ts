@@ -2,6 +2,7 @@ import type * as PiAi from "@earendil-works/pi-ai";
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { describe, expect, it, vi } from "vitest";
 import { SUMMARIZATION_SYSTEM_PROMPT } from "../../src/core/compaction/utils.js";
+import { userMsg } from "../utilities.js";
 import { createHarness } from "./harness.js";
 
 const { completeSimpleMock } = vi.hoisted(() => ({ completeSimpleMock: vi.fn() }));
@@ -10,6 +11,28 @@ vi.mock("@earendil-works/pi-ai", async (importOriginal) => {
 	return { ...actual, completeSimple: completeSimpleMock };
 });
 describe("AgentSession branch summary auxiliary model", () => {
+	it("rejects a post-off historical summary before exposing forgotten audit", async () => {
+		const h = await createHarness({ persistSession: true });
+		try {
+			const target = h.sessionManager.appendMessage(userMsg("before forgotten turn"));
+			const watermark = h.sessionManager.appendMessage(userMsg("obsolete audit"));
+			h.sessionManager.appendClmOn({ blocks: [{ id: watermark, message: userMsg("obsolete audit") }] }, watermark);
+			h.sessionManager.appendClmRevision(
+				{ blocks: [{ id: target, message: userMsg("accepted context") }] },
+				watermark,
+				"forget",
+			);
+			await h.session.setClmMode(false);
+			completeSimpleMock.mockReset().mockResolvedValue(fauxAssistantMessage("must not summarize audit"));
+			await expect(h.session.navigateTree(target, { summarize: true })).rejects.toThrow(/CLM/);
+			expect(completeSimpleMock).not.toHaveBeenCalled();
+			expect(JSON.stringify(h.sessionManager.getEntries())).toContain("obsolete audit");
+		} finally {
+			await h.session.disposeAsync();
+			h.cleanup();
+		}
+	});
+
 	type Case = { auxiliaryModel?: string; window?: number; sessionWindow?: number; stub?: boolean };
 	const cases: Array<[string, Case, string]> = [
 		["routes branch summaries to the auxiliary model", { auxiliaryModel: "faux/aux-model" }, "aux-model"],

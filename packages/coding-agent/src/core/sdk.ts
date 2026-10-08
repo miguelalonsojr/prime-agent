@@ -377,6 +377,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		mcpManager,
 		initialActiveToolNames,
 		allowedToolNames,
+		inheritedClmMode: options.inheritedClmMode,
 		includeGoals,
 		includeCompactSkill: options.includeCompactSkill,
 		rlmHeartbeatController: options.rlmHeartbeatController,

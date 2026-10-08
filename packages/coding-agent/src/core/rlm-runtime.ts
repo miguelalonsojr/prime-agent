@@ -451,6 +451,8 @@ export interface RlmSubagentRuntime {
 }
 
 export interface CreateRlmSubagentRuntimeOptions {
+	/** Effective parent mode captured once at admission. */
+	readonly inheritedClmMode?: boolean;
 	parentSession: AgentSession;
 	id: string;
 	prompt: string;

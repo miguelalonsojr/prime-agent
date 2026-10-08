@@ -50,6 +50,18 @@ async function fixture(messages: AuditMessage[] = [user("obsolete"), user("curre
 }
 
 describe("CLM live context", () => {
+	it("admits only the healthy owned writer and rejects cancellation or unknown markers", async () => {
+		const f = await fixture();
+		await f.prepare();
+		expect(() => f.controller.assertChildAdmissionAvailable("tool")).not.toThrow();
+		for (const id of [undefined, "other"]) expect(() => f.controller.assertChildAdmissionAvailable(id)).toThrow();
+		f.controller.abortToolAction("tool");
+		expect(() => f.controller.assertChildAdmissionAvailable("tool")).toThrow(/writer/);
+		const other = await fixture();
+		await writeFile(`${other.manager.getSessionFile()}.clm-writer`, "unknown");
+		expect(() => other.controller.assertChildAdmissionAvailable()).toThrow(/writer/);
+	});
+
 	it.each(["marker", "directory", "removal"])("fails closed when %s fsync fails", async (kind) => {
 		const f = await fixture();
 		if (kind === "removal") await f.prepare();

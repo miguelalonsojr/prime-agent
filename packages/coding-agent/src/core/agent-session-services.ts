@@ -53,6 +53,8 @@ export interface CreateAgentSessionServicesOptions {
 }
 
 export interface AgentSessionCreationOptions {
+	/** Admission-only override for a new RLM child; ignored on resume. */
+	inheritedClmMode?: boolean;
 	model?: Model<any>;
 	thinkingLevel?: ThinkingLevel;
 	serviceTier?: ServiceTier;
@@ -274,6 +276,7 @@ export async function createAgentSessionFromServices(
 		customTools: options.customTools,
 		initialActiveToolNames: options.initialActiveToolNames,
 		allowedToolNames: options.allowedToolNames,
+		inheritedClmMode: options.inheritedClmMode,
 		includeGoals: options.includeGoals,
 		includeCompactSkill: options.includeCompactSkill,
 		agentMessageController: options.agentMessageController,

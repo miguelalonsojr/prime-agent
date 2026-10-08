@@ -197,6 +197,18 @@ export class LiveContextController {
 		this.assertIdle();
 	}
 
+	/** A child may be admitted from this exact live tool, but never from an unknown writer. */
+	assertChildAdmissionAvailable(actionId?: string): void {
+		if (actionId === undefined) {
+			this.assertIdle();
+			return;
+		}
+		this.assertHealthy();
+		if (this.cancelled || !this.markerArmed || this.action?.id !== actionId)
+			throw new Error("CLM child admission does not own the active writer");
+		if (!lstatSync(this.markerPath()).isFile()) throw new Error("CLM writer marker is invalid");
+	}
+
 	getClmStatus(): ClmStatus {
 		return structuredClone(this.status);
 	}

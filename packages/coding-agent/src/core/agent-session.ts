@@ -267,6 +267,7 @@ import {
 	reviewAutoRefine,
 	saveHarnessState,
 } from "./refinement/index.js";
+import { instrumentTransformContext, isRequestTimingEnabled } from "./request-timing.js";
 import { resolveConfigValue } from "./resolve-config-value.js";
 import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.js";
 import {
@@ -513,6 +514,7 @@ export class CompactionSkippedError extends Error {}
 export class RefineSkippedError extends Error {}
 
 export interface AgentSessionConfig {
+	inheritedClmMode?: boolean;
 	agent: Agent;
 	sessionManager: SessionManager;
 	settingsManager: SettingsManager;
@@ -1957,7 +1959,7 @@ export class AgentSession {
 			activeToolNames: this._initialActiveToolNames,
 			includeAllExtensionTools: true,
 		});
-		if (applyClmDefault && this.settingsManager.getClmEnabled()) {
+		if (applyClmDefault && (config.inheritedClmMode ?? this.settingsManager.getClmEnabled())) {
 			this.assertModelContextAvailable();
 			LiveContextController.initializeEpoch(this.sessionManager);
 			this.syncClmMode();
@@ -5761,6 +5763,18 @@ export class AgentSession {
 		if (active) throw active;
 		this._clmRecoveryError ??= getClmRecoveryError(this.sessionManager, this._clmController !== undefined);
 		if (this._clmRecoveryError) throw this._clmRecoveryError;
+	}
+
+	/** Copy the selected branch's accepted view, never its covered audit messages. */
+	async getAcceptedModelContextSnapshot(): Promise<AgentMessage[]> {
+		this._assertModelRequestAvailable();
+		await this._agentEventQueue;
+		const source = this.sessionManager.getClmBranchState().epochId
+			? this.buildSessionContext().messages
+			: this.agent.state.messages;
+		const messages = await this.projectClmContext(source);
+		this._assertModelRequestAvailable();
+		return structuredClone(messages);
 	}
 
 	buildSessionContext(): SessionContext {
@@ -10026,8 +10040,9 @@ export class AgentSession {
 			return { shouldRefine: false, rationale: "No model selected." };
 		}
 		this._assertModelRequestAvailable();
+		const messages = await this.getAcceptedModelContextSnapshot();
 		return reviewAutoRefine(
-			this.agent.state.messages,
+			messages,
 			this._loadMergedHarnessState(),
 			this._loadRefinementHistory(),
 			refinementModel.model,
@@ -10390,6 +10405,7 @@ export class AgentSession {
 		if (!refinementModel) {
 			throw new Error(formatNoModelSelectedMessage());
 		}
+		const messages = await this.getAcceptedModelContextSnapshot();
 		const globalHarnessStateDir = getGlobalHarnessStateDir();
 		const localHarnessStateDir = this._localHarnessStateDir();
 		const requestedScope = options.global ? "global" : "local";
@@ -10429,7 +10445,7 @@ export class AgentSession {
 					scope: requestedScope,
 					planningState,
 					history,
-					conversationText: serializeConversation(convertToLlm(this.agent.state.messages)).slice(-80_000),
+					conversationText: serializeConversation(convertToLlm(messages)).slice(-80_000),
 				},
 				signal,
 			})) as SessionBeforeRefineResult | undefined;
@@ -10449,7 +10465,7 @@ export class AgentSession {
 		}
 		this._assertModelRequestAvailable();
 		const plan = await planRefinement(
-			this.agent.state.messages,
+			messages,
 			planningState,
 			history,
 			refinementModel.model,
@@ -10507,11 +10523,14 @@ export class AgentSession {
 		if (this._disposed) {
 			throw new Error("Cannot refine a disposed session.");
 		}
+		const clmFence = this.sessionManager.getClmBranchState().epochId
+			? await this._acquireSessionActionCommitFence()
+			: undefined;
 		// The caller has already set _refineInFlight and waited for agent idle.
 		// Disconnect only for the brief apply + save + reconnect critical section.
-		this._disconnectFromAgent();
-
 		try {
+			this._assertModelRequestAvailable();
+			this._disconnectFromAgent();
 			const globalHarnessStateDir = getGlobalHarnessStateDir();
 			const localHarnessStateDir = this._localHarnessStateDir();
 			const requestedScope = options.global ? "global" : "local";
@@ -10603,8 +10622,10 @@ export class AgentSession {
 			if (this._refineAbortController === refineAbort) {
 				this._refineAbortController = undefined;
 			}
-			if (!this._disposed) {
-				this._reconnectToAgent();
+			try {
+				if (!this._disposed) this._reconnectToAgent();
+			} finally {
+				clmFence?.release();
 			}
 		}
 	}
@@ -11752,7 +11773,14 @@ export class AgentSession {
 			.find((entry): entry is SessionMessageEntry => entry.type === "message" && entry.message === message);
 	}
 
+	private _assertRlmChildAdmissionAvailable(): void {
+		this.assertModelContextAvailable();
+		if (this._clmController) this._clmController.assertChildAdmissionAvailable(this._clmToolFence?.id);
+		else LiveContextController.assertWriterSettled(this.sessionManager);
+	}
+
 	private _createRlmSubagentRuntimeOptions(options: {
+		inheritedClmMode: boolean;
 		id: string;
 		prompt: string;
 		sessionName: string;
@@ -11765,6 +11793,7 @@ export class AgentSession {
 		const freedSessionIds = this._freedRlmChildSessionIds();
 		return {
 			parentSession: this,
+			inheritedClmMode: options.inheritedClmMode,
 			id: options.id,
 			prompt: options.prompt,
 			sessionName: options.sessionName,
@@ -11811,6 +11840,7 @@ export class AgentSession {
 		childSessionManager.appendThinkingLevelChange(options.thinkingLevel);
 		childSessionManager.appendServiceTierChange(options.serviceTier);
 
+		const extensionRunnerRef: { current?: ExtensionRunner } = {};
 		const childAgent = new Agent({
 			initialState: {
 				systemPrompt: "",
@@ -11820,11 +11850,22 @@ export class AgentSession {
 				tools: [],
 			},
 			convertToLlm: this.agent.convertToLlm,
-			transformContext: this.agent.transformContext,
+			transformContext: instrumentTransformContext(
+				() => isRequestTimingEnabled(this.settingsManager.getRequestTiming()),
+				async (messages) => extensionRunnerRef.current?.emitContext(messages) ?? messages,
+			),
 			streamFn: this._unguardedStreamFn,
 			getApiKey: this.agent.getApiKey,
-			onPayload: this.agent.onPayload,
-			onResponse: this.agent.onResponse,
+			onPayload: async (payload) => {
+				return extensionRunnerRef.current?.emitBeforeProviderRequest(payload) ?? payload;
+			},
+			onResponse: async (response) => {
+				await extensionRunnerRef.current?.emit({
+					type: "after_provider_response",
+					status: response.status,
+					headers: response.headers,
+				});
+			},
 			steeringMode: this.settingsManager.getSteeringMode(),
 			followUpMode: this.settingsManager.getFollowUpMode(),
 			sessionId: childSessionManager.getSessionId(),
@@ -11835,6 +11876,8 @@ export class AgentSession {
 
 		const child = new AgentSession({
 			agent: childAgent,
+			inheritedClmMode: options.inheritedClmMode,
+			extensionRunnerRef,
 			sessionManager: childSessionManager,
 			settingsManager: this.settingsManager,
 			serviceTierPreference: options.serviceTier,
@@ -13127,6 +13170,8 @@ export class AgentSession {
 		// Snapshot before any await: the spawning request is the turn whose tool call is
 		// executing now. A spawn arriving outside an active run (a detached kernel task
 		// firing while the parent is idle) has no such turn; an absent edge beats a wrong one.
+		this._assertRlmChildAdmissionAvailable();
+		const inheritedClmMode = this.sessionManager.getClmBranchState().mode === "on";
 		const spawnedByRequestId = this.isStreaming ? this._semanticEdges.lastTurnRequestId : undefined;
 		const { name: rawName, model: rawModel, thinking: rawThinking, ...unsupported } = kwargs;
 		const unsupportedKwargs = Object.keys(unsupported);
@@ -13175,6 +13220,7 @@ export class AgentSession {
 			if (this._disposed || this._disposing) {
 				throw new Error("Cannot spawn a subagent after its parent was disposed");
 			}
+			this._assertRlmChildAdmissionAvailable();
 			childSessionDir = this._createChildRlmSessionDir();
 		} catch (error) {
 			releaseReservedSessionName();
@@ -13182,7 +13228,13 @@ export class AgentSession {
 		}
 		const childNodeId = basename(childSessionDir);
 		const sessionName = requestedSessionName ?? createDefaultRlmSubagentSessionName(prompt, childNodeId);
-		if (!requestedSessionName) await this._assertRlmSubagentSessionNameAvailable(sessionName);
+		try {
+			if (!requestedSessionName) await this._assertRlmSubagentSessionNameAvailable(sessionName);
+			this._assertRlmChildAdmissionAvailable();
+		} catch (error) {
+			releaseReservedSessionName();
+			throw error;
+		}
 		const startedAt = Date.now();
 		const parentAssistantForUsage = this._findLastAssistantMessage();
 		if (parentAssistantForUsage && !this._rlmDurableParentUsage.has(parentAssistantForUsage)) {
@@ -13310,6 +13362,7 @@ export class AgentSession {
 		};
 		const subagentOptions: CreateRlmSubagentRuntimeOptions = {
 			...this._createRlmSubagentRuntimeOptions({
+				inheritedClmMode,
 				id: childNodeId,
 				prompt,
 				sessionName,
@@ -15116,6 +15169,13 @@ export class AgentSession {
 		// Do not switch branches while /refine has detached event handling and is
 		// about to persist harness/session entries for the current branch.
 		await this._invalidatePendingAutoRefineForBranchChange();
+
+		// Historical audit entries cannot be mapped back to an edited accepted snapshot.
+		if (
+			(options.summarize || this._extensionRunner.hasHandlers("session_before_tree")) &&
+			this.sessionManager.getClmBranchState().epochId
+		)
+			throw new Error("CLM accepted context cannot be mapped safely for historical branch preparation");
 
 		const { entries: entriesToSummarize, commonAncestorId } = collectEntriesForBranchSummary(
 			this.sessionManager,

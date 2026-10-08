@@ -56,6 +56,7 @@ export function rlmSubagentRuntimeSpec(options: CreateRlmSubagentRuntimeOptions)
 } {
 	return {
 		sessionOptions: {
+			inheritedClmMode: options.inheritedClmMode,
 			model: options.model,
 			thinkingLevel: options.thinkingLevel,
 			serviceTier: options.serviceTier,

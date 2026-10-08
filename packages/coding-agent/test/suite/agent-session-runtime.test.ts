@@ -37,6 +37,9 @@ import type {
 } from "../../src/index.js";
 import { createDefaultRuntimeFactory } from "../../src/main.js";
 import { InProcessAgentConnection } from "../../src/modes/agent-connection/in-process-agent-connection.js";
+import type { ActiveSessionState } from "../../src/modes/daemon/active-session-state.js";
+import { AgentDaemon } from "../../src/modes/daemon/daemon-mode.js";
+import type { DaemonCommand } from "../../src/modes/daemon/daemon-protocol.js";
 import { assistantMsg, createTestResourceLoader, userMsg } from "../utilities.js";
 import { conversationMessages, createHarness, getMessageText, type Harness } from "./harness.js";
 
@@ -162,7 +165,7 @@ describe("AgentSessionRuntime characterization", () => {
 			}
 		});
 
-		return { runtime, faux, tempDir };
+		return { runtime, faux, tempDir, createRuntime };
 	}
 
 	function createRuntimeWithFakeSession(options?: { onShutdown?: () => void }) {
@@ -724,6 +727,65 @@ describe("AgentSessionRuntime characterization", () => {
 		expect(disposeRetained).toHaveBeenCalledOnce();
 	});
 
+	it("inherits CLM in daemon admission and preserves the child's mode on rehydration", async () => {
+		const { faux, tempDir, createRuntime } = await createRuntimeForTest(() => {});
+		const daemon = new AgentDaemon(join(tempDir, "clm.sock"), {
+			defaultSessionConfig: { cwd: tempDir, agentDir: tempDir, sessionDir: join(tempDir, "daemon-sessions") },
+			createRuntime,
+		}) as unknown as {
+			createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
+			closeSession(state: ActiveSessionState, reason: "shutdown"): Promise<void>;
+			sessions: Map<string, ActiveSessionState>;
+		};
+		try {
+			const parent = (await daemon.createRuntime({ type: "create" })).runtime.session;
+			faux.setResponses([fauxAssistantMessage("parent answer")]);
+			await parent.prompt("daemon parent-only audit");
+			const on = await parent.setClmMode(true);
+			const requests: string[] = [];
+			faux.setResponses([
+				(context) => {
+					requests.push(JSON.stringify(context.messages));
+					return fauxAssistantMessage("child done");
+				},
+			]);
+			const spawned = await parent.runRlmChild("daemon child task");
+			await parent.collectRlmChildren([spawned.rlm_child_id], 10_000);
+			const child = [...daemon.sessions.values()].find(
+				(state) => state.runtime.metadata.rlmChildId === spawned.rlm_child_id,
+			)!;
+			const status = await child.runtime.session.getClmStatus();
+			expect(status.mode).toBe("on");
+			expect(status.path).not.toBe(on.path);
+			expect(requests[0]).toContain("daemon child task");
+			expect(requests[0]).not.toContain("daemon parent-only audit");
+			await parent.waitForSessionInputIdle();
+			await parent.setClmMode(false);
+			const path = child.runtime.session.sessionFile!;
+			await daemon.closeSession(child, "shutdown");
+			const resumed = await daemon.createRuntime({ type: "create", sessionPath: path });
+			expect(resumed.runtime.metadata.rehydratedCompleted).toBe(true);
+			expect(await resumed.runtime.session.getClmStatus()).toMatchObject({ mode: "on", epochId: status.epochId });
+		} finally {
+			for (const state of [...daemon.sessions.values()].reverse()) await daemon.closeSession(state, "shutdown");
+		}
+	});
+
+	it("captures CLM mode once for a runtime-hosted child", async () => {
+		const { runtime, faux } = await createRuntimeForTest(() => {});
+		const parent = await runtime.session.setClmMode(true);
+		faux.setResponses([fauxAssistantMessage("child answer")]);
+		const spawned = await runtime.session.runRlmChild("runtime child task");
+		await runtime.session.collectRlmChildren([spawned.rlm_child_id], 10_000);
+		const child = runtime.listSubagentRuntimes()[0].session;
+		expect(await child.getClmStatus()).toMatchObject({ mode: "on" });
+		expect((await child.getClmStatus()).path).not.toBe(parent.path);
+		expect(JSON.stringify(child.sessionManager.buildSessionContext().messages)).toContain("runtime child task");
+		await runtime.session.waitForSessionInputIdle();
+		await runtime.session.setClmMode(false);
+		expect((await child.getClmStatus()).mode).toBe("on");
+	});
+
 	it("publishes in-process RLM sessions before create resolves and rejects cancelled startup", async () => {
 		const { runtime, faux, tempDir } = await createRuntimeForTest(() => {});
 		const parentSession = runtime.session;
@@ -909,9 +971,11 @@ describe("AgentSessionRuntime characterization", () => {
 				rlmParentAgent: "parent-worker",
 				semanticParentSessionId: "parent-session-id",
 				semanticSpawnedByRequestId: spawnedByRequestId,
+				inheritedClmMode: true,
 			},
 		});
 		cleanups.push(() => created.session.dispose());
+		expect((await created.session.getClmStatus()).mode).toBe("on");
 		expect(created.services.modelRegistry.authStorage).toBe(created.services.authStorage);
 		expect(created.services.authStorage.getPrimeCliConfigPath()).toBe(join(tempDir, ".prime", "config.json"));
 		await created.session.bindExtensions({});

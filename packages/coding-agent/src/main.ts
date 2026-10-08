@@ -708,6 +708,7 @@ export function resolveRuntimeSessionOptions(
 		customTools: runtimeSessionOptions?.customTools ?? sessionOptions.customTools,
 		initialActiveToolNames: runtimeSessionOptions?.initialActiveToolNames,
 		allowedToolNames: runtimeSessionOptions?.allowedToolNames,
+		inheritedClmMode: runtimeSessionOptions?.inheritedClmMode,
 		includeGoals: runtimeSessionOptions?.includeGoals,
 		includeCompactSkill: runtimeSessionOptions?.includeCompactSkill,
 		rlmHeartbeatController: runtimeSessionOptions?.rlmHeartbeatController,
