@@ -2994,12 +2994,15 @@ export class SessionManager {
 				this.leafBranchCache = null;
 				// The failed append may have left a torn line on disk. Restore the file
 				// from the rolled-back entries now; if that also fails (e.g. the disk is
-				// still full), fall back to forcing the next persist to rewrite.
+				// still full), block CLM; ordinary sessions retry on the next persist.
 				this.flushed = false;
 				try {
 					this.flushNow();
 				} catch {
 					this.flushed = false;
+					if (this.fileEntries.some(isClmEntry))
+						this.clmRecoveryError =
+							"CLM session log repair failed; repair and reopen before requesting model context";
 				}
 			}
 			throw error;

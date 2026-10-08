@@ -470,6 +470,72 @@ describe("AgentSessionRuntime characterization", () => {
 		},
 	);
 
+	it.each([0, 17])("blocks helper dispatch when a receipt rollback cannot repair JSONL (input=%s)", async (input) => {
+		const h = await createHarness({
+			persistSession: true,
+			provider: "prime-inference",
+			models: [{ id: "qwen/qwen3-30b-a3b-instruct-2507" }],
+		});
+		const state = { activeSessionId: "unrepaired-receipt", runtime: { session: h.session } } as ActiveSessionState;
+		const summarizer = new DaemonSessionSummarizer(() => [state]);
+		const faults: Array<ReturnType<typeof vi.spyOn>> = [];
+		try {
+			h.setResponses([fauxAssistantMessage("seed")]);
+			await h.session.prompt("seed");
+			await h.session.setClmMode(true);
+			const file = h.session.sessionFile!;
+			const before = readFileSync(file, "utf8");
+			const pin = h.sessionManager.captureClmUsagePin();
+			const append = fs.appendFileSync;
+			const rename = fs.renameSync;
+			faults.push(
+				vi.spyOn(fs, "appendFileSync").mockImplementation((path, data, options) => {
+					if (path === file && String(data).includes("clm_usage_")) {
+						append(path, '{"type":"custom"', options);
+						throw Object.assign(new Error("partial receipt append"), { code: "EIO" });
+					}
+					return append(path, data, options);
+				}),
+			);
+			faults.push(
+				vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+					if (to === file) throw Object.assign(new Error("rollback rewrite failed"), { code: "EIO" });
+					return rename(from, to);
+				}),
+			);
+			syncBuiltinESMExports();
+			h.session.recordClmUsage(pin, { ...fauxAssistantMessage("observed").usage, input });
+			const viewAvailable = await h.session.getClmAcceptedView().then(
+				() => true,
+				() => false,
+			);
+			for (const fault of faults) fault.mockRestore();
+			syncBuiltinESMExports();
+			expect(readFileSync(file, "utf8")).toBe(`${before}{"type":"custom"`);
+			h.setResponses([fauxAssistantMessage("<recap>Must not dispatch</recap><status>COMPLETED</status>")]);
+			vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+			summarizer.start();
+			await vi.advanceTimersByTimeAsync(25_000);
+			expect(h.getPendingResponseCount()).toBe(1);
+			expect(viewAvailable).toBe(false);
+			await expect(h.session.getClmStatus()).rejects.toThrow(/repair/);
+			await expect(h.session.prompt("must not dispatch")).rejects.toThrow(/repair/);
+			expect(() => SessionManager.open(file).getClmBranchState()).toThrow(/damaged/);
+			expect(JSON.stringify(h.session.getTranscriptMessages())).toContain("seed");
+			writeFileSync(file, before);
+			const repaired = SessionManager.open(file);
+			expect(repaired.getClmBranchState()).toMatchObject({ mode: "on", epochId: pin.epochId, revision: 0 });
+			expect(repaired.getClmMeasuredUsage()).toBeUndefined();
+		} finally {
+			for (const fault of faults) fault.mockRestore();
+			syncBuiltinESMExports();
+			summarizer.stop();
+			vi.useRealTimers();
+			await h.session.disposeAsync();
+			h.cleanup();
+		}
+	});
+
 	it("flushes a helper receipt queued synchronously by a persistence observer", async () => {
 		const h = await createHarness({ persistSession: true, tools: [] });
 		let unsubscribe = () => {};
