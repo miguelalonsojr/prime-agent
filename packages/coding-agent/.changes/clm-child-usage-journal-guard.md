@@ -1,0 +1,1 @@
+- Fixed child usage accounting from rejecting an active CLM tool edit while keeping unrelated journal changes blocked.

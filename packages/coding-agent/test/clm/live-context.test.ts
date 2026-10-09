@@ -454,6 +454,124 @@ describe("CLM live context", () => {
 		);
 	});
 
+	it("accepts multiple durable child attributions during an edited tool action", async () => {
+		const f = await fixture();
+		const assistant = fauxAssistantMessage("parent tool call");
+		const targetId = f.manager.appendMessage(assistant);
+		await f.prepare();
+		const first = { ...emptyUsage(), output: 3 };
+		const total = { ...emptyUsage(), output: 8 };
+		f.manager.appendChildUsageAttribution(targetId, first, first);
+		f.manager.appendChildUsageAttribution(targetId, { ...emptyUsage(), output: 5 }, total);
+		await f.change((text) => text.replace("obsolete", "summary"));
+		expect((await f.settle())?.revision).toBe(1);
+		f.manager.flushNow();
+		const reopened = SessionManager.open(f.manager.getSessionFile()!);
+		const attributions = reopened.getBranch().filter((entry) => entry.type === "child_usage_attributed");
+		expect(attributions).toHaveLength(2);
+		expect(attributions.map((entry) => entry.childUsage.output)).toEqual([3, 5]);
+		expect(reopened.getEntry(targetId)).toMatchObject({ message: { usage: { output: 8 } } });
+		expect(reopened.getClmBranchState()).toMatchObject({ revision: 1, auditWatermark: targetId });
+		expect(JSON.stringify(reopened.getClmBranchState().snapshot)).toContain("summary");
+	});
+
+	it("admits child accounting while publishing the tool mirror", async () => {
+		const f = await fixture();
+		const targetId = f.manager.appendMessage(fauxAssistantMessage("parent tool call"));
+		const started = createDeferred();
+		const release = createDeferred();
+		const original = fileSystem.rename;
+		const fault = vi.spyOn(fileSystem, "rename").mockImplementation(async (from, to) => {
+			await original(from, to);
+			if (to === f.path) {
+				started.resolve();
+				await release.promise;
+			}
+		});
+		syncBuiltinESMExports();
+		try {
+			const preparation = f.prepare();
+			try {
+				await started.promise;
+				f.manager.appendChildUsageAttribution(targetId, emptyUsage(), emptyUsage());
+			} finally {
+				release.resolve();
+			}
+			await preparation;
+			expect(await f.settle()).toBeNull();
+		} finally {
+			fault.mockRestore();
+			syncBuiltinESMExports();
+		}
+	});
+
+	it("clears the writer marker without a revision when only child accounting changed", async () => {
+		const f = await fixture();
+		const targetId = f.manager.appendMessage(fauxAssistantMessage("parent tool call"));
+		await f.prepare();
+		f.manager.appendChildUsageAttribution(targetId, emptyUsage(), emptyUsage());
+		expect(await f.settle()).toBeNull();
+		expect(f.manager.getClmBranchState().revision).toBe(0);
+		expect(existsSync(`${f.manager.getSessionFile()}.clm-writer`)).toBe(false);
+	});
+
+	it("accepts child accounting during the awaited mirror read before committing", async () => {
+		const f = await fixture();
+		const targetId = f.manager.appendMessage(fauxAssistantMessage("parent tool call"));
+		await f.prepare();
+		await f.change((text) => text.replace("obsolete", "summary"));
+		const started = createDeferred();
+		const release = createDeferred();
+		const original = fileSystem.open;
+		const fault = vi.spyOn(fileSystem, "open").mockImplementation(async (...args) => {
+			const file = await original(...args);
+			if (args[0] === f.path) {
+				started.resolve();
+				await release.promise;
+			}
+			return file;
+		});
+		syncBuiltinESMExports();
+		try {
+			const settlement = f.settle();
+			try {
+				await started.promise;
+				f.manager.appendChildUsageAttribution(targetId, emptyUsage(), emptyUsage());
+			} finally {
+				release.resolve();
+			}
+			expect((await settlement)?.revision).toBe(1);
+		} finally {
+			fault.mockRestore();
+			syncBuiltinESMExports();
+		}
+	});
+
+	it.each(["message", "custom"])("rejects %s after child accounting during a tool action", async (kind) => {
+		const f = await fixture();
+		const targetId = f.manager.appendMessage(fauxAssistantMessage("parent tool call"));
+		await f.prepare();
+		f.manager.appendChildUsageAttribution(targetId, emptyUsage(), emptyUsage());
+		if (kind === "message") f.manager.appendMessage(user("unrelated"));
+		else f.manager.appendCustomEntry("unrelated", {});
+		await f.change((text) => text.replace("obsolete", "summary"));
+		await expect(f.settle()).rejects.toThrow(/session changed during tool action/);
+		expect(f.manager.getClmBranchState().revision).toBe(0);
+		expect(existsSync(`${f.manager.getSessionFile()}.clm-writer`)).toBe(true);
+	});
+
+	it("rejects a branch that drops the captured leaf despite new child accounting", async () => {
+		const f = await fixture();
+		const priorLeaf = f.manager.getLeafId()!;
+		const targetId = f.manager.appendMessage(fauxAssistantMessage("parent tool call"));
+		await f.prepare();
+		f.manager.branch(priorLeaf);
+		f.manager.appendChildUsageAttribution(targetId, emptyUsage(), emptyUsage());
+		await f.change((text) => text.replace("obsolete", "summary"));
+		await expect(f.settle()).rejects.toThrow(/session changed during tool action/);
+		expect(f.manager.getClmBranchState().revision).toBe(0);
+	});
+
 	it("preserves native tools without creating a revision when unchanged", async () => {
 		const native: AuditMessage[] = [
 			{

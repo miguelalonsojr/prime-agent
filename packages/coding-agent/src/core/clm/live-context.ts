@@ -328,7 +328,7 @@ export class LiveContextController {
 			const { snapshot, pending, watermark } = this.acceptedContext();
 			const protectedIds = this.validateProtection(snapshot, originals);
 			await this.publish(snapshot, protectedIds);
-			if (this.sessionManager.getLeafId() !== leafId) {
+			if (!this.hasOnlyChildUsageSince(leafId)) {
 				this.conflict = "CLM session changed while preparing tool action";
 				throw new Error(this.conflict);
 			}
@@ -357,7 +357,7 @@ export class LiveContextController {
 			if (!action || action.id !== actionId) throw new Error("CLM tool action does not own this mirror");
 			if (!isDeepStrictEqual(originals, action.protectedActions))
 				throw new Error("CLM protected action ownership changed during tool execution");
-			if (this.sessionManager.getLeafId() !== action.leafId) {
+			if (!this.hasOnlyChildUsageSince(action.leafId)) {
 				this.conflict = "CLM session changed during tool action; settle persistence before importing";
 				throw new Error(this.conflict);
 			}
@@ -385,7 +385,7 @@ export class LiveContextController {
 				LiveContextController.checkSnapshotCap(candidate, this.sessionManager);
 				LiveContextController.checkDocumentSize(renderContextDocument(candidate, new Set()));
 				// No awaited work between branch validation and the durable commit.
-				if (this.sessionManager.getLeafId() !== action.leafId) throw new Error("CLM session changed before import");
+				if (!this.hasOnlyChildUsageSince(action.leafId)) throw new Error("CLM session changed before import");
 				committedId = this.sessionManager.appendClmRevision(candidate, action.watermark, actionId);
 			} catch (error) {
 				if (!this.cancelled) await this.repairRejectedMirror(originals);
@@ -480,6 +480,15 @@ export class LiveContextController {
 			}
 		}
 		return structuredClone(entry);
+	}
+
+	private hasOnlyChildUsageSince(leafId: string | null): boolean {
+		const branch = this.sessionManager.getBranch();
+		const index = leafId === null ? -1 : branch.findIndex((entry) => entry.id === leafId);
+		return (
+			(leafId === null || index !== -1) &&
+			branch.slice(index + 1).every((entry) => entry.type === "child_usage_attributed")
+		);
 	}
 
 	private enqueue<T>(operation: () => Promise<T>): Promise<T> {
