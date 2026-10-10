@@ -106,7 +106,7 @@ import {
 	UNLIMITED_AUTONOMOUS_LIMIT,
 } from "./autonomous.js";
 import { type BashResult, executeBashWithOperations } from "./bash-executor.js";
-import { estimateClmRequestTokens } from "./clm/budget.js";
+import { CLM_CONTEXT_WARNING_RATIO, estimateClmRequestTokens } from "./clm/budget.js";
 import {
 	type ClmAcceptedView,
 	type ClmRequestInputs,
@@ -2174,14 +2174,31 @@ export class AgentSession {
 			...context,
 			tools: context.tools?.map(({ name, description, parameters }) => ({ name, description, parameters })),
 		});
-		const estimate = estimateClmRequestTokens({
+		const request = {
 			model,
 			systemPrompt: snapshot.systemPrompt ?? "",
 			messages: snapshot.messages,
 			tools: (snapshot.tools ?? []).map(({ name, description, parameters }) => ({ name, description, parameters })),
-		});
+		};
+		const estimate = estimateClmRequestTokens(request);
+		this._clmController?.recordRequestEstimate(estimate);
 		if (estimate.maxInputTokens !== null && estimate.estimatedInputTokens > estimate.maxInputTokens)
 			throw new Error("CLM final request exceeds its input budget after extension transforms");
+		if (
+			estimate.maxInputTokens !== null &&
+			estimate.estimatedInputTokens >= estimate.maxInputTokens * CLM_CONTEXT_WARNING_RATIO
+		) {
+			const reminder =
+				"Before other work, shorten older, completed CLM context via its working file. " +
+				"Aim below 60% of the input budget; preserve protected references and needed facts.";
+			const systemPrompt = `${request.systemPrompt}\n\n${reminder}`;
+			const remindedEstimate = estimateClmRequestTokens({ ...request, systemPrompt });
+			// Do not block a valid request just to deliver the reminder.
+			if (remindedEstimate.estimatedInputTokens <= estimate.maxInputTokens) {
+				snapshot.systemPrompt = systemPrompt;
+				this._clmController?.recordRequestEstimate(remindedEstimate);
+			}
+		}
 		return snapshot;
 	}
 

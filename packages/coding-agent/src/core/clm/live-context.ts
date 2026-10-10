@@ -14,7 +14,7 @@ import type {
 	ClmSnapshot,
 	SessionManager,
 } from "../session-manager.js";
-import { type ClmRequestBudget, estimateClmRequestTokens } from "./budget.js";
+import { CLM_CONTEXT_WARNING_RATIO, type ClmRequestBudget, estimateClmRequestTokens } from "./budget.js";
 import { parseContextDocument, renderContextDocument } from "./context-document.js";
 
 const MAX_DOCUMENT_BYTES = 32 * 1024 * 1024;
@@ -611,6 +611,15 @@ export class LiveContextController {
 		return protectedIds;
 	}
 
+	recordRequestEstimate(estimate: ClmRequestBudget): void {
+		this.status.estimatedOccupancy = estimate;
+		this.status.warning =
+			estimate.maxInputTokens !== null &&
+			estimate.estimatedInputTokens >= estimate.maxInputTokens * CLM_CONTEXT_WARNING_RATIO
+				? "CLM context is near its request budget; shorten stale history"
+				: undefined;
+	}
+
 	private checkBudget(snapshot: ClmSnapshot, request: ClmRequestInputs): void {
 		if (
 			!request ||
@@ -625,11 +634,7 @@ export class LiveContextController {
 			...request,
 			messages: snapshot.blocks.map((block) => block.message),
 		});
-		this.status.estimatedOccupancy = estimate;
-		this.status.warning =
-			estimate.maxInputTokens !== null && estimate.estimatedInputTokens >= estimate.maxInputTokens * 0.9
-				? "CLM context is near its request budget; shorten stale history"
-				: undefined;
+		this.recordRequestEstimate(estimate);
 		if (estimate.maxInputTokens !== null && estimate.estimatedInputTokens > estimate.maxInputTokens)
 			throw new Error("CLM request exceeds its input budget; shorten context or restore an accepted revision");
 	}

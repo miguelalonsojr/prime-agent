@@ -9,6 +9,8 @@ import {
 	HARNESS_DIGEST_SUFFIX,
 } from "../messages.js";
 
+export const CLM_CONTEXT_WARNING_RATIO = 0.75;
+
 export interface ClmRequestBudget {
 	estimatedInputTokens: number;
 	outputReserveTokens: number | null;

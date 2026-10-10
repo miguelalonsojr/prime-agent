@@ -12,7 +12,7 @@ Please shorten older context using the model tool and the CLM context.txt path i
 
 ## Managing context
 
-While CLM is on, the model can edit older, completed messages without a separate compaction command. Let useful recent work stay intact. After a work unit, replace stale tool output, dead ends, or superseded notes with a specific summary; edit sooner if the context is near its budget. Batch related edits so an early change does not repeatedly force the unchanged later context to be read again. A shorter context alone does not prove lower billed cost.
+While CLM is on, the model can edit older, completed messages without a separate compaction command. Let useful recent work stay intact. After a work unit, replace stale tool output, dead ends, or superseded notes with a specific summary. At 75% of the estimated input budget, CLM adds a request-only reminder to shorten older context before other work, targeting below 60%. If the reminder itself would exceed the budget, the request proceeds without it. The reminder does not edit context automatically; a single large result can still exceed the hard limit. Batch related edits so an early change does not repeatedly force the unchanged later context to be read again. A shorter context alone does not prove lower billed cost.
 
 Keep the facts needed to finish the task: decisions and their evidence, exact commands or queries already tried, ruled-out approaches and why not to retry them, values marked VERIFIED or UNVERIFIED, and the next action. For example, replacement text inside an existing completed turn might be:
 

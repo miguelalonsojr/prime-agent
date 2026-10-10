@@ -1194,7 +1194,7 @@ describe("CLM provider projection", () => {
 			expect(JSON.stringify(harness.sessionManager.getEntries())).toContain("obsolete SKILL.md");
 		},
 	);
-	it.each(["unchanged", "in-place", "returned", "null", "hidden", "disabled", "over-budget"])(
+	it.each(["unchanged", "in-place", "returned", "null", "hidden", "disabled", "near-budget", "over-budget"])(
 		"checks final payload hook: %s",
 		async (mutation) => {
 			let calls = 0;
@@ -1208,7 +1208,12 @@ describe("CLM provider projection", () => {
 								...event.messages,
 								{
 									role: "user",
-									content: mutation === "over-budget" ? "x".repeat(600_000) : "extension context",
+									content:
+										mutation === "over-budget"
+											? "x".repeat(600_000)
+											: mutation === "near-budget"
+												? `extension context ${"x".repeat(330_000)}`
+												: "extension context",
 									timestamp: 1,
 								},
 							],
@@ -1234,15 +1239,21 @@ describe("CLM provider projection", () => {
 			let requestText = "";
 			harness.setResponses([
 				(context) => {
-					requestText = JSON.stringify(context.messages);
+					requestText = `${context.systemPrompt ?? ""}\n${JSON.stringify(context.messages)}`;
 					return fauxAssistantMessage("done");
 				},
 			]);
 			await harness.session.prompt("request");
-			const allowed = mutation === "unchanged" || mutation === "disabled";
+			const allowed = mutation === "unchanged" || mutation === "disabled" || mutation === "near-budget";
 			expect(harness.faux.state.callCount).toBe(allowed ? 1 : 0);
-			if (allowed) expect(requestText).toContain("extension context");
-			else expect(harness.session.agent.state.errorMessage).toMatch(/CLM.*(payload|budget)/);
+			if (allowed) {
+				expect(requestText).toContain("extension context");
+				expect(requestText.includes("Before other work")).toBe(mutation === "near-budget");
+			} else expect(harness.session.agent.state.errorMessage).toMatch(/CLM.*(payload|budget)/);
+			if (mutation === "near-budget") {
+				expect(harness.session.agent.state.systemPrompt).not.toContain("Before other work");
+				expect((await harness.session.getClmStatus()).warning).toMatch(/near its request budget/);
+			}
 			expect(calls).toBe(1);
 		},
 	);

@@ -639,7 +639,7 @@ describe("CLM live context", () => {
 
 	it("rejects over-budget requests and keeps a nonaccumulating near-budget status", async () => {
 		const f = await fixture();
-		const near = { ...f.request, systemPrompt: "x".repeat(2700) };
+		const near = { ...f.request, systemPrompt: "x".repeat(2300) };
 		const first = await f.controller.projectRequest(new Set(["request"]), near);
 		expect(f.controller.getClmStatus().warning).toBeTruthy();
 		expect(await f.controller.projectRequest(new Set(["request"]), near)).toEqual(first);
