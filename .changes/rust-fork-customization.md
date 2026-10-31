@@ -1,0 +1,3 @@
+- Added a checkout-bound local Rust installer that preserves the caller directory and refuses command collisions unless forced.
+- Added optional daemon-negotiated kernel working-directory propagation for local shells and Python cells, with the effective directory and branch in the TUI footer.
+- Fixed peer-grant admission after supervisor loss and persisted-worker adoption when process identity differs.

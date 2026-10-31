@@ -54,7 +54,7 @@ use stream::LoaderTokenTracker;
 use stream::SpeedStats;
 
 use std::collections::{BTreeMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 use pa_types::daemon::{CycleDirection, DaemonCommand};
@@ -165,6 +165,7 @@ pub(crate) struct SessionUi {
     pub(crate) attach_cursor_present: bool,
     session_name: Option<String>,
     cwd: PathBuf,
+    kernel_cwd: PathBuf,
     session_dir: Option<PathBuf>,
     script_path: Option<PathBuf>,
     model_selection: ModelSelection,
@@ -405,6 +406,7 @@ pub(crate) struct SessionUi {
     /// loop performs the cycle right after dispatch, because the renderer is the loop's terminal.
     suspend_requested: bool,
     external_editor_request: Option<String>,
+    shell_request: Option<(PathBuf, PathBuf)>,
     /// The `/mcp` view's internal auth resolution: the loop mounts the panel
     /// and spawns the command through the auth seam, never the typed-command path.
     pending_mcp_auth: Option<McpAuthIntent>,
@@ -512,6 +514,42 @@ impl SessionUi {
         self.session_name
             .clone()
             .unwrap_or_else(|| crate::chrome::display_name(&self.cwd.to_string_lossy()))
+    }
+
+    pub(crate) fn take_shell_request(&mut self) -> Option<(PathBuf, PathBuf)> {
+        self.shell_request.take()
+    }
+
+    pub(crate) fn effective_cwd(&self) -> &Path {
+        &self.kernel_cwd
+    }
+
+    /// Apply a directory only when the connected daemon negotiated the optional CWD wire.
+    pub(crate) async fn set_kernel_cwd(
+        &mut self,
+        dir: &Path,
+        view: &mut AgentView,
+    ) -> Result<bool> {
+        if !self.client.supports_kernel_cwd_propagation() {
+            self.note("The daemon does not support kernel CWD propagation.", view);
+            return Ok(false);
+        }
+        let result = self
+            .bounded_request(
+                Duration::from_millis(UI_REQUEST_TIMEOUT_MS),
+                DaemonCommand::SetKernelCwd {
+                    id: None,
+                    active_session_id: self.active_session_id.clone(),
+                    dir: dir.to_string_lossy().into_owned(),
+                    rest: Map::default(),
+                },
+            )
+            .await;
+        if let Err(error) = result {
+            self.error_row(&format!("Kernel CWD change failed: {error:#}"), view);
+            return Err(error);
+        }
+        Ok(true)
     }
 
     pub(crate) async fn current_model_provider(&mut self) -> Option<String> {

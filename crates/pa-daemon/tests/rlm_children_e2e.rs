@@ -727,3 +727,190 @@ async fn parallel_same_name_subagent_creates_admit_exactly_one() {
         "the freed name admits again: {retry}"
     );
 }
+
+/// A child restored from its own session file sends its saved selector and effort
+/// on the next provider request, rather than its parent's scripted defaults.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn saved_child_request_keeps_explicit_model_and_low_effort() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let server = tokio::spawn(async move {
+        let mut completed_posts = 0;
+        let mut account_catalog_requests = 0;
+        while completed_posts < 2 {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 8192];
+            loop {
+                let count = socket.read(&mut chunk).await.unwrap();
+                assert!(count > 0, "request closed early");
+                request.extend_from_slice(&chunk[..count]);
+                let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") else {
+                    continue;
+                };
+                let head = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+                if head.starts_with("get /codex/models ") {
+                    account_catalog_requests += 1;
+                }
+                if head.starts_with("get ") {
+                    socket
+                        .write_all(b"HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\n\r\n")
+                        .await
+                        .unwrap();
+                    break;
+                }
+                let length: usize = head
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length: "))
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                if request.len() >= end + 4 + length {
+                    break;
+                }
+            }
+            if request.starts_with(b"GET ") {
+                continue;
+            }
+            completed_posts += 1;
+            sender.send(String::from_utf8(request).unwrap()).unwrap();
+            let sse = concat!(
+                "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg\",\"role\":\"assistant\",\"status\":\"in_progress\",\"content\":[]}}\n\n",
+                "data: {\"type\":\"response.content_part.added\",\"output_index\":0,\"content_index\":0,\"part\":{\"type\":\"output_text\",\"text\":\"\"}}\n\n",
+                "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"Done\"}\n\n",
+                "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"id\":\"msg\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"Done\"}]}}\n\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"fixture\",\"status\":\"completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n"
+            );
+            socket.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\n\r\n{sse}",sse.len()).as_bytes()).await.unwrap();
+        }
+        account_catalog_requests
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let agent_dir = dir.path().join("agent");
+    std::fs::create_dir_all(&agent_dir).unwrap();
+    let token = "header.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoic2F2ZWQtY2hpbGQifX0.signature";
+    std::fs::write(
+        agent_dir.join("auth.json"),
+        json!({"openai-codex":{"type":"api_key","key":token}}).to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        agent_dir.join("models.json"),
+        json!({"providers":{"openai-codex":{"baseUrl":url,"models":[{"id":"gpt-5.1-local-manual","name":"Local manual Codex","api":"openai-codex-responses","reasoning":true}]}}}).to_string(),
+    )
+    .unwrap();
+    let socket = dir.path().join("daemon.sock");
+    let _daemon = spawn_daemon(&socket, &agent_dir);
+    let (mut client, _) = Client::connect(&socket);
+    let script = write_script(dir.path(), "parent answer");
+    let children = children(&socket, &agent_dir, &script, 0);
+    children.set_identity(ParentIdentity {
+        rlm_depth: 0,
+        rlm_max_depth: 2,
+        model: Some("scripted/faux-1".into()),
+        cwd: Some(agent_dir.to_string_lossy().to_string()),
+        session_id: Some("parent-session-uuid".into()),
+        session_file: Some(agent_dir.join("parent.jsonl").to_string_lossy().to_string()),
+        thinking: None,
+        child_script: None,
+    });
+    let mut request = spawn_request("saved-child", "start");
+    request.model = Some("openai-codex/gpt-5.1-local-manual".into());
+    request.thinking = Some("low".into());
+    let child = children.spawn(request).await.unwrap();
+    children.notify_turn_done();
+    let first = match tokio::time::timeout(Duration::from_secs(10), receiver.recv()).await {
+        Ok(Some(request)) => request,
+        outcome => {
+            let children_rows = children.collect(vec![child.rlm_child_id.clone()], 0).await;
+            let files: Vec<_> = std::fs::read_dir(&child.session_dir)
+                .unwrap()
+                .filter_map(Result::ok)
+                .map(|entry| {
+                    (
+                        entry.path(),
+                        std::fs::read_to_string(entry.path()).unwrap_or_default(),
+                    )
+                })
+                .collect();
+            panic!("no first provider request {outcome:?}; children {children_rows:?}; files {files:?}");
+        }
+    };
+    assert!(first.starts_with("POST /codex/responses "), "{first}");
+    let initial_body: Value =
+        serde_json::from_str(first.split_once("\r\n\r\n").unwrap().1).unwrap();
+    assert_eq!(
+        (
+            initial_body["model"].clone(),
+            initial_body["reasoning"]["effort"].clone()
+        ),
+        (json!("gpt-5.1-local-manual"), json!("low"))
+    );
+    let rows = children
+        .collect(vec![child.rlm_child_id.clone()], 30_000)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].rlm_child_id, child.rlm_child_id);
+    assert!(rows[0].settled, "{rows:?}");
+    assert_eq!(rows[0].status, "done", "{rows:?}");
+    assert_eq!(rows[0].answer_text.as_deref(), Some("Done"), "{rows:?}");
+    let child_file = std::fs::read_dir(&child.session_dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.extension().is_some_and(|ext| ext == "jsonl")
+                && path
+                    .file_name()
+                    .is_some_and(|name| name != "semantic-edges.jsonl")
+        })
+        .unwrap();
+    children.delete_subagent(child.rlm_child_id).await.unwrap();
+    // No explicit selector or effort in create: the saved child owns both.
+    client.send_command(
+        "resume",
+        &json!({"type":"create", "sessionPath":child_file,
+        "config":{"cwd":agent_dir,"sessionDir":child.session_dir,"rlmDepth":1,"rlmMaxDepth":2}}),
+    );
+    let resumed = client.read_response_slow("resume");
+    assert_eq!(resumed["success"], true, "{resumed}");
+    let active = resumed["data"]["activeSessionId"]
+        .as_str()
+        .expect("restored active id");
+    client.send_command(
+        "follow-up",
+        &json!({"type":"prompt","activeSessionId":active,"message":"next"}),
+    );
+    assert_eq!(client.read_response("follow-up")["success"], true);
+    let second = tokio::time::timeout(Duration::from_secs(30), receiver.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        second
+            .to_ascii_lowercase()
+            .contains(&format!("authorization: bearer {token}").to_ascii_lowercase()),
+        "{second}"
+    );
+    assert!(
+        second
+            .to_ascii_lowercase()
+            .contains("chatgpt-account-id: saved-child"),
+        "{second}"
+    );
+    let body: Value = serde_json::from_str(second.split_once("\r\n\r\n").unwrap().1).unwrap();
+    assert_eq!(
+        (body["model"].clone(), body["reasoning"]["effort"].clone()),
+        (json!("gpt-5.1-local-manual"), json!("low"))
+    );
+    assert!(body["input"].to_string().contains("next"), "{body}");
+    client.send_command(
+        "kill-resumed",
+        &json!({"type":"kill","activeSessionId":active}),
+    );
+    assert_eq!(client.read_response("kill-resumed")["success"], true);
+    assert_eq!(server.await.unwrap(), 0, "no account-catalog requests");
+}

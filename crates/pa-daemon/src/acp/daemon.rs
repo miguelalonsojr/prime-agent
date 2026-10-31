@@ -2168,15 +2168,26 @@ mod tests {
             "ACP session is closing: acp-1"
         );
 
-        let mut cancelling = state(Some(hosted_session()));
-        cancelling.session.as_mut().unwrap().cancelling = true;
-        let cancelling = Arc::new(Mutex::new(cancelling));
+        let cancelling = Arc::new(Mutex::new(state(Some(hosted_session()))));
+        admit_prompt(&json!({ "sessionId": "acp-1" }), &cancelling)
+            .await
+            .unwrap();
+        let cancel = Incoming::Notification {
+            method: "session/cancel".into(),
+            params: json!({ "sessionId": "acp-1" }),
+        };
+        let FrameOrder::Cancel(CancelOrder::Armed(stop)) =
+            frame_order_prefix(&cancel, &cancelling).await
+        else {
+            panic!("the cancellation must arm a stop");
+        };
         assert_eq!(
             admit_prompt(&json!({ "sessionId": "acp-1" }), &cancelling)
                 .await
                 .unwrap_err(),
             "ACP session is cancelling: acp-1"
         );
+        drop(stop);
 
         let mut failed = state(Some(hosted_session()));
         failed.session.as_mut().unwrap().stop_failure = Some("boom".to_string());

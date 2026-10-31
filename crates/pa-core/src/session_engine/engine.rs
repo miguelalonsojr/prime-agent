@@ -867,6 +867,7 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
     // Rows parked by a boot that settled mid-build merge in; later boots
     // push straight into the live session's queue.
     session.adopt_next_turn_rows(boot_notice_rows);
+    session.bind_kernel_cwd(&provisioner);
 
     turn_boundary.bind(super::turn_boundary::TurnBoundaryRuntime {
         agent,
@@ -950,6 +951,14 @@ impl SessionEngine {
             },
             (model.context_window > 0).then_some(model.context_window),
         );
+    }
+
+    /// Install the host's CWD event publisher on this session's kernel owner.
+    pub fn set_kernel_cwd_changed_sink(
+        &self,
+        sink: crate::kernel::provisioner::KernelCwdChangedCallback,
+    ) {
+        self.provisioner.set_cwd_changed_sink(sink);
     }
 
     /// A weak reference for lock-free kernel liveness probes without

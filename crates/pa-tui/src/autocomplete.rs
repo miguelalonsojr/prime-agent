@@ -56,6 +56,8 @@ pub struct CompletionResult {
 
 /// Provider contract mirroring TS `AutocompleteProvider` (synchronous).
 pub trait AutocompleteProvider: Send {
+    /// Move file completion to a confirmed directory; providers without files ignore it.
+    fn set_file_completion_base(&mut self, _base: std::path::PathBuf) {}
     fn get_suggestions(
         &self,
         lines: &[String],
@@ -882,6 +884,15 @@ impl CombinedAutocompleteProvider {
 }
 
 impl AutocompleteProvider for CombinedAutocompleteProvider {
+    fn set_file_completion_base(&mut self, base: std::path::PathBuf) {
+        if self.paths.base == base {
+            return;
+        }
+        self.paths.base = base;
+        self.file_index = file_index::FileIndex::new();
+        self.file_index.start_build(&self.paths.base);
+    }
+
     fn set_hidden_commands(&mut self, hidden: std::collections::HashSet<String>) {
         self.hidden = hidden;
     }

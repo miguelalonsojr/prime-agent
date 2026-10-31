@@ -82,6 +82,9 @@ pub struct ChromeState {
     /// The footer's tok/sec readout: the dim bottom row's text; `None`
     /// renders no row (kept until the first completed response).
     pub speed_text: Option<String>,
+    /// Confirmed effective CWD and asynchronously cached branch for the footer.
+    pub footer_cwd: Option<String>,
+    pub footer_branch: Option<String>,
     /// Hide the splash `cwd` line (the scoped agents view keeps its
     /// metadata rows centered against the logo).
     pub splash_hide_cwd: bool,
@@ -1009,6 +1012,35 @@ pub fn render_speed_footer(text: &str, theme: &Theme, width: usize) -> Line {
     let dim = theme.fg_style(ThemeColor::Dim);
     let text = truncate_to_width(text, width, "");
     vec![Span::styled(text, dim)]
+}
+
+/// Cached effective-directory footer; rendering never probes the filesystem or Git.
+#[must_use]
+pub fn render_cwd_footer(
+    speed: Option<&str>,
+    cwd: &str,
+    branch: Option<&str>,
+    home: Option<&str>,
+    theme: &Theme,
+    width: usize,
+) -> Line {
+    if let Some(speed) = speed {
+        return render_speed_footer(speed, theme, width);
+    }
+    let short = home
+        .filter(|home| !home.is_empty())
+        .and_then(|home| {
+            cwd.strip_prefix(home)
+                .filter(|suffix| suffix.is_empty() || suffix.starts_with(std::path::MAIN_SEPARATOR))
+        })
+        .map_or_else(|| cwd.to_string(), |suffix| format!("~{suffix}"));
+    let text = branch
+        .filter(|branch| !branch.is_empty())
+        .map_or(short.clone(), |branch| format!("{short} ({branch})"));
+    vec![Span::styled(
+        truncate_to_width(&text, width, ""),
+        theme.fg_style(ThemeColor::Dim),
+    )]
 }
 
 /// The editor surface background: `userMessageBg` (TS `getEditorTheme`).

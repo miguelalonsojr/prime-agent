@@ -997,3 +997,54 @@ fn at_index_tracks_watcher_events() {
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
 }
+
+#[test]
+fn cwd_switch_replaces_ready_file_index_without_losing_commands() {
+    let root = tempfile::tempdir().unwrap();
+    let old = root.path().join("old");
+    let new = root.path().join("new");
+    std::fs::create_dir_all(&old).unwrap();
+    std::fs::create_dir_all(&new).unwrap();
+    std::fs::write(old.join("old-only.txt"), "old").unwrap();
+    std::fs::write(new.join("new-only.txt"), "new").unwrap();
+    let mut provider = CombinedAutocompleteProvider::from_registry(old.clone());
+    assert!(provider
+        .file_index
+        .build(&old, file_index::MAX_INDEX_ENTRIES));
+    assert_eq!(
+        at_item_values(&provider, "@old-only"),
+        vec!["@old-only.txt"]
+    );
+    provider.set_hidden_commands(std::collections::HashSet::from(["fast".to_string()]));
+    provider.set_skill_commands(vec![SlashCommandEntry {
+        name: "skill:my-skill".into(),
+        aliases: Vec::new(),
+        description: None,
+        argument_hint: None,
+        takes_argument: true,
+        source_tag: None,
+    }]);
+    provider.set_argument_completions("tier", vec![item("flex")]);
+    provider.set_file_completion_base(new);
+    assert_eq!(
+        at_item_values(&provider, "@new-only"),
+        vec!["@new-only.txt"]
+    );
+    assert!(at_item_values(&provider, "@old-only").is_empty());
+    assert!(
+        ready(provider.get_suggestions(&["/skill:my".into()], 0, 9, false))
+            .items
+            .iter()
+            .any(|item| item.value == "skill:my-skill")
+    );
+    assert!(
+        !ready(provider.get_suggestions(&["/fa".into()], 0, 3, false))
+            .items
+            .iter()
+            .any(|item| item.value == "fast")
+    );
+    assert_eq!(
+        ready(provider.get_suggestions(&["/tier f".into()], 0, 7, false)).items,
+        vec![item("flex")]
+    );
+}

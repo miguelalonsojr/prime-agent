@@ -133,6 +133,8 @@ impl AgentSessionEngine {
             mcp,
             published_goal: std::sync::Mutex::new(None),
             late_agent_message_sink: std::sync::Mutex::new(None),
+            kernel_cwd_changed_sink: std::sync::Mutex::new(None),
+            kernel_cwd_probe: std::sync::Mutex::new(None),
             goal_runtime: std::sync::Mutex::new(None),
             pending_goal_continuation: std::sync::Mutex::new(None),
             goal_budget_crossed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -306,6 +308,21 @@ impl AgentSessionEngine {
             .expect("progress note emit lock") = Some(emit);
     }
 
+    /// Register the worker event emitter before the session build; every rebuild adopts it.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the sink mutex was poisoned by a failed installer.
+    pub fn set_kernel_cwd_changed_sink(
+        &self,
+        sink: pa_core::kernel::provisioner::KernelCwdChangedCallback,
+    ) {
+        *self
+            .kernel_cwd_changed_sink
+            .lock()
+            .expect("kernel cwd sink lock") = Some(sink);
+    }
+
     /// The stale-row guard's deferred durable write: the terminal row
     /// lands AFTER the context adoption, so the active row stops being
     /// rediscovered.
@@ -340,6 +357,16 @@ impl AgentSessionEngine {
     }
 
     async fn adopt_built_session(&self, built: &Arc<CoreSessionEngine>) -> anyhow::Result<()> {
+        *self.kernel_cwd_probe.lock().expect("kernel cwd probe lock") =
+            Some(built.kernel_provisioner_weak());
+        if let Some(sink) = self
+            .kernel_cwd_changed_sink
+            .lock()
+            .expect("kernel cwd sink lock")
+            .clone()
+        {
+            built.set_kernel_cwd_changed_sink(sink);
+        }
         self.mirror_goal_runtime(built).await;
         *self
             .progress_notes
@@ -765,6 +792,7 @@ impl AgentSessionEngine {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         *self.goal_runtime.lock().expect("goal runtime lock") = None;
         *self.progress_notes.lock().expect("progress notes lock") = None;
+        *self.kernel_cwd_probe.lock().expect("kernel cwd probe lock") = None;
         *self.turn_agent.lock().expect("turn agent lock") = None;
         *self
             .autonomous_boundary

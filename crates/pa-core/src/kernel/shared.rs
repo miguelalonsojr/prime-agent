@@ -213,6 +213,9 @@ pub struct ExecuteResult {
     pub duration_ms: u64,
 }
 
+/// Fires after the matching public cell's kernel Done, even if its tool result was aborted.
+pub type PublicCellDoneCallback = Arc<dyn Fn() + Send + Sync>;
+
 /// Options for one `execute` call.
 #[derive(Default)]
 pub struct ExecuteOptions {
@@ -222,6 +225,8 @@ pub struct ExecuteOptions {
     pub on_stream: Option<StreamCallback>,
     /// Receives agent messages the kernel reports after the cell settled.
     pub on_late_sent_agent_message: Option<LateSentAgentMessageCallback>,
+    /// Called only after the public cell's matching Done clears its active slot.
+    pub on_public_cell_done: Option<PublicCellDoneCallback>,
     /// Cap stdout / stderr / result at this many characters. Default 65536.
     pub max_output_chars: Option<usize>,
     /// Synthetic host cell (snapshot/restore/list); excluded from lastCellCode attribution.

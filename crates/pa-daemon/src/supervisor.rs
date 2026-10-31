@@ -18,6 +18,12 @@ mod update_restart;
 mod worker_lifecycle;
 
 use adoption::AdoptionBoot;
+/// Durable refusal marker: this Failed descriptor is a disputed live process,
+/// not a crash-give-up owner that boot cleanup may reap.
+pub(crate) const ORDINARY_WORKER_IDENTITY_REFUSAL: &str =
+    "Recorded worker process identity differs from the observed process";
+#[cfg(test)]
+type ProcessStartIdObserver = Arc<dyn Fn(u32) -> Option<String> + Send + Sync>;
 use launch_budget::WORKER_AUTH_FLOOR_MS;
 // Called only by the clients sibling module (its `use super::*` glob); unused on the lib target.
 #[allow(unused_imports)]
@@ -130,6 +136,8 @@ pub struct Supervisor {
     /// mutating that env var (a set value would leak into every
     /// parallel test's launch).
     worker_connect_budget: std::sync::Mutex<Option<Duration>>,
+    #[cfg(test)]
+    process_start_id_observer: std::sync::Mutex<Option<ProcessStartIdObserver>>,
     /// The durable session-binding table (the stale-active-id rebind
     /// surface): every active id the supervisor has routed stays
     /// addressable through its session's durable identity, so a client
@@ -258,6 +266,8 @@ impl Supervisor {
             descriptor_dir,
             bound_socket_identity: std::sync::Mutex::new(None),
             worker_connect_budget: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            process_start_id_observer: std::sync::Mutex::new(None),
             session_bindings: crate::session_bindings::SessionBindingTable::new(),
             opening_files: std::sync::Mutex::new(std::collections::HashMap::new()),
             telemetry: std::sync::Mutex::new(None),

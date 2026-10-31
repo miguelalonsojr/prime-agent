@@ -29,6 +29,19 @@ mod scripted;
 
 /// The turn behavior a worker session runs.
 pub trait SessionEngine: Send + Sync {
+    /// Effective per-session Python kernel directory, if this engine owns a kernel.
+    fn kernel_cwd(&self) -> Option<std::path::PathBuf> {
+        None
+    }
+
+    /// Apply a valid directory to the current or next kernel, without changing session CWD.
+    fn set_kernel_cwd(
+        &self,
+        _dir: std::path::PathBuf,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<std::path::PathBuf>> + Send + '_>>
+    {
+        Box::pin(async { anyhow::bail!("Kernel CWD change unsupported") })
+    }
     /// The session's shared MCP manager, when the engine owns one: the
     /// `replace_acp_mcp_servers` command writes through it.
     fn acp_mcp_manager(

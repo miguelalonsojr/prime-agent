@@ -206,6 +206,14 @@ impl Editor {
         self.autocomplete_provider = Some(provider);
     }
 
+    /// Rebase file completion without losing commands, filters, or argument choices.
+    pub(crate) fn set_autocomplete_file_base(&mut self, base: std::path::PathBuf) {
+        self.cancel_autocomplete();
+        if let Some(provider) = self.autocomplete_provider.as_mut() {
+            provider.set_file_completion_base(base);
+        }
+    }
+
     /// Drop the installed autocomplete provider: an editor that must not complete
     /// (`Editor::new()` installs the builtin registry by default) answers nothing.
     pub fn clear_autocomplete_provider(&mut self) {
@@ -824,6 +832,48 @@ mod tests {
             e.autocomplete_state().is_none(),
             "the cancelled request never opens"
         );
+    }
+
+    #[test]
+    fn file_base_switch_cancels_parked_and_running_autocomplete_without_enabling_disabled_provider()
+    {
+        let (_old, mut editor) = at_editor();
+        let new = tempfile::tempdir().unwrap();
+        editor.handle_input(".");
+        editor.handle_input("/");
+        editor.handle_input("tab");
+        assert!(editor.has_pending_autocomplete());
+        editor.set_autocomplete_file_base(new.path().to_path_buf());
+        assert!(!editor.has_pending_autocomplete());
+        editor.materialize_autocomplete();
+        assert!(!editor.is_showing_autocomplete());
+
+        let (_old, mut editor) = at_editor();
+        for ch in "@prime-agent".chars() {
+            editor.handle_input(&ch.to_string());
+        }
+        editor.materialize_autocomplete();
+        assert!(
+            editor.autocomplete_search.is_some(),
+            "old-root file search started"
+        );
+        editor.set_autocomplete_file_base(new.path().to_path_buf());
+        assert!(!editor.has_pending_autocomplete());
+        editor.materialize_autocomplete();
+        assert!(!editor.is_showing_autocomplete());
+        let (_old, mut editor) = at_editor();
+        for ch in "/mo".chars() {
+            editor.handle_input(&ch.to_string());
+        }
+        editor.materialize_autocomplete();
+        assert!(editor.is_showing_autocomplete());
+        editor.set_autocomplete_file_base(new.path().to_path_buf());
+        assert!(!editor.is_showing_autocomplete());
+        editor.clear_autocomplete_provider();
+        editor.set_autocomplete_file_base(new.path().to_path_buf());
+        editor.set_text("/");
+        editor.materialize_autocomplete();
+        assert!(!editor.is_showing_autocomplete());
     }
 
     #[test]

@@ -329,12 +329,12 @@ fn the_startup_placeholder_carries_the_dock_a_fresh_session_mounts() {
         .map(|line| line.iter().map(|span| span.content.as_str()).collect())
         .collect();
     assert_eq!(
-        rows[rows.len() - 2..],
+        rows[rows.len() - 3..rows.len() - 1],
         [
             "\u{2500}".repeat(100),
             " \u{25c6} 0 subagents  \u{b7}  \u{25f7} 0 heartbeats  \u{b7}  \u{25b8} 0 shells"
                 .to_string(),
         ],
-        "the placeholder's last two rows are the dock's rule and zero row"
+        "the placeholder's dock rule and zero row remain adjacent before the CWD footer"
     );
 }

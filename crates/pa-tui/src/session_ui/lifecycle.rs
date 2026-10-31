@@ -5,7 +5,7 @@ use super::{
     attach_capabilities, attach_data_from_response, create_session, last_assistant_text_of, mpsc,
     reconstruct, resume_hint_from_stats, ActivityUpdates, AgentView, BTreeMap, ChatEntry,
     CompactionAbortNote, Context, DaemonClient, DaemonCommand, DockFold, Duration, GoalView,
-    HashSet, InteractiveOptions, LoaderTokenTracker, Map, ModelCatalogUpdate, PromptOrder,
+    HashSet, InteractiveOptions, LoaderTokenTracker, Map, ModelCatalogUpdate, PathBuf, PromptOrder,
     PromptSubmitNote, ReattachOutcome, RebuildKind, RecoveryKind, ReloadNote, Result, ResyncBash,
     SessionSelection, SessionUi, ShareNote, TranscriptPageNote, UpdateNote, Value,
     EXIT_DETACH_TIMEOUT_MS, EXIT_STATS_TIMEOUT_MS, UI_REQUEST_TIMEOUT_MS,
@@ -63,6 +63,7 @@ impl SessionUi {
             attach_cursor_present: false,
             session_name: None,
             cwd: options.cwd.clone(),
+            kernel_cwd: options.cwd.clone(),
             session_dir: options.session_dir.clone(),
             script_path: options.script_path.clone(),
             model_selection: options.model_selection.clone(),
@@ -196,6 +197,7 @@ impl SessionUi {
             side_bash_counter: 0,
             suspend_requested: false,
             external_editor_request: None,
+            shell_request: None,
             pending_mcp_auth: None,
             picker_restored_draft: false,
             suspend_adoption_emitted: false,
@@ -381,6 +383,14 @@ impl SessionUi {
         // The bash slot follows the attached session's live state: the captured
         // state drives the next rebuild's resync edge.
         let state = attach.snapshot.get("state");
+        self.kernel_cwd = state
+            .and_then(|state| {
+                state
+                    .get("kernelCwd")
+                    .and_then(Value::as_str)
+                    .or_else(|| state.get("cwd").and_then(Value::as_str))
+            })
+            .map_or_else(|| self.cwd.clone(), PathBuf::from);
         let resync_bash = ResyncBash {
             was_running: self.user_bash_running,
             snap_running: state
@@ -797,24 +807,58 @@ mod backfill_tests {
     async fn mock_session(
         socket: &std::path::Path,
         backfill_tx: mpsc::UnboundedSender<TranscriptPageNote>,
+        seen: std::sync::Arc<std::sync::Mutex<Vec<Value>>>,
+        protocol: u64,
+        revision: Option<u64>,
+        capable: bool,
+        legacy_snapshot_switch: bool,
     ) -> (SessionUi, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::UnixListener::bind(socket).unwrap();
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let (read, mut write) = stream.into_split();
-            write.write_all(b"{\"type\":\"daemon_hello\",\"protocol\":{\"name\":\"prime-agent.daemon\",\"version\":7},\"serverCapabilities\":[],\"clientId\":\"mock\"}\n").await.unwrap();
+            let capabilities = if capable {
+                vec!["kernel_cwd_propagation"]
+            } else {
+                vec![]
+            };
+            let hello = json!({"type":"daemon_hello","protocol":{"name":"prime-agent.daemon","version":protocol},
+                "schemaRevision": revision, "serverCapabilities":capabilities,"clientId":"mock"});
+            write
+                .write_all(format!("{hello}\n").as_bytes())
+                .await
+                .unwrap();
             let mut lines = BufReader::new(read).lines();
             while let Some(line) = lines.next_line().await.unwrap() {
                 let request: Value = serde_json::from_str(&line).unwrap();
+                seen.lock().unwrap().push(request.clone());
                 let kind = request["command"]["type"].as_str().unwrap();
+                let attach_count = seen
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|request| request["command"]["type"] == "attach")
+                    .count();
+                let state = if legacy_snapshot_switch && attach_count == 1 {
+                    json!({"sessionId":"s1","cwd":"/first","kernelCwd":"/effective","isStreaming":false})
+                } else if legacy_snapshot_switch {
+                    json!({"sessionId":"s1","cwd":"/second","isStreaming":false})
+                } else {
+                    json!({"sessionId":"s1","cwd":"/tmp","isStreaming":false})
+                };
+                let snapshot_sequence = if legacy_snapshot_switch {
+                    attach_count as u64 + 9
+                } else {
+                    0
+                };
                 let data = match kind {
                     "attach" => json!({
                         "activeSessionId": "s1", "snapshot": {
                             "activeSessionId": "s1", "summary": {"id": "s1", "cwd": "/tmp"},
-                            "state": {"sessionId": "s1", "cwd": "/tmp", "isStreaming": false},
-                            "messages": [], "historyBefore": 1, "lastEventSequence": 0,
-                        }, "replay": {"status": "complete", "toSequence": 0},
-                        "lastEventSequence": 0,
+                            "state": state,
+                            "messages": [], "historyBefore": 1, "lastEventSequence": snapshot_sequence,
+                        }, "replay": {"status": "complete", "toSequence": snapshot_sequence},
+                        "lastEventSequence": snapshot_sequence,
                     }),
                     "get_messages" => {
                         json!({"messages": [{"role": "user", "content": "rebuilt transcript", "timestamp": 1}]})
@@ -823,7 +867,9 @@ mod backfill_tests {
                 };
                 let mut reply = serde_json::to_vec(&json!({
                     "type": "response", "id": request["id"], "command": kind,
-                    "success": true, "data": data,
+                    "success": !(kind == "set_kernel_cwd" && request["command"]["dir"] == "reject"),
+                    "error": (kind == "set_kernel_cwd" && request["command"]["dir"] == "reject").then_some("refused"),
+                    "data": data,
                 }))
                 .unwrap();
                 reply.push(b'\n');
@@ -860,6 +906,261 @@ mod backfill_tests {
         (session, server)
     }
 
+    #[tokio::test]
+    async fn kernel_cwd_old_daemon_never_receives_new_command_and_still_serves_legacy_state() {
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("cwd.sock");
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (mut session, server) = mock_session(
+            &socket,
+            mpsc::unbounded_channel().0,
+            seen.clone(),
+            7,
+            None,
+            false,
+            false,
+        )
+        .await;
+        let mut view = AgentView::new(crate::theme::Theme::builtin(
+            "prime",
+            crate::theme::ColorMode::TrueColor,
+        ));
+        assert!(!session
+            .set_kernel_cwd(root.path(), &mut view)
+            .await
+            .unwrap());
+        session
+            .client
+            .request_ok(DaemonCommand::GetConnectionState {
+                id: None,
+                active_session_id: "s1".to_string(),
+                rest: Map::default(),
+            })
+            .await
+            .unwrap();
+        let requests = seen.lock().unwrap();
+        assert!(
+            !requests
+                .iter()
+                .any(|request| request["command"]["type"] == "set_kernel_cwd"),
+            "unsupported CWD wrote to daemon"
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|request| request["command"]["type"] == "get_connection_state"),
+            "legacy state still works"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn kernel_cwd_session_ui_gates_each_socket_write_and_reports_rejection() {
+        for (protocol, revision, capable, allowed) in [
+            (7, None, false, false),
+            (7, Some(30), true, false),
+            (6, Some(32), true, false),
+            (7, Some(31), true, true),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let socket = root.path().join("cwd.sock");
+            let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let (mut session, server) = mock_session(
+                &socket,
+                mpsc::unbounded_channel().0,
+                seen.clone(),
+                protocol,
+                revision,
+                capable,
+                false,
+            )
+            .await;
+            let mut view = AgentView::new(crate::theme::Theme::builtin(
+                "prime",
+                crate::theme::ColorMode::TrueColor,
+            ));
+            assert_eq!(
+                session
+                    .set_kernel_cwd(root.path(), &mut view)
+                    .await
+                    .unwrap(),
+                allowed
+            );
+            {
+                let requests = seen.lock().unwrap();
+                let cwd: Vec<_> = requests
+                    .iter()
+                    .filter(|request| request["command"]["type"] == "set_kernel_cwd")
+                    .collect();
+                assert_eq!(
+                    cwd.len(),
+                    usize::from(allowed),
+                    "protocol {protocol}, revision {revision:?}"
+                );
+                if allowed {
+                    assert_eq!(cwd[0]["command"]["activeSessionId"], "s1");
+                    assert_eq!(cwd[0]["command"]["dir"], json!(root.path()));
+                }
+            }
+            if allowed {
+                assert!(session
+                    .set_kernel_cwd(std::path::Path::new("reject"), &mut view)
+                    .await
+                    .is_err());
+                assert_eq!(session.kernel_cwd, std::path::Path::new("/tmp"));
+            }
+            drop(session);
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn kernel_cwd_successive_legacy_snapshots_reset_effective_fallback() {
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("snap.sock");
+        let (mut session, server) = mock_session(
+            &socket,
+            mpsc::unbounded_channel().0,
+            std::sync::Arc::default(),
+            7,
+            None,
+            false,
+            true,
+        )
+        .await;
+        assert_eq!(session.kernel_cwd, std::path::Path::new("/effective"));
+        session.attach_session("s1", DockFold::Held).await.unwrap();
+        assert_eq!(session.kernel_cwd, std::path::Path::new("/second"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn kernel_cwd_new_attach_snapshot_rejects_stale_and_equal_queued_events() {
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("ordered.sock");
+        let (mut session, server) = mock_session(
+            &socket,
+            mpsc::unbounded_channel().0,
+            std::sync::Arc::default(),
+            7,
+            None,
+            false,
+            true,
+        )
+        .await;
+        assert_eq!(session.kernel_cwd, std::path::Path::new("/effective"));
+        session.attach_session("s1", DockFold::Held).await.unwrap();
+        assert_eq!(session.last_event_sequence, 11);
+        assert_eq!(session.kernel_cwd, std::path::Path::new("/second"));
+        let mut view = AgentView::new(crate::theme::Theme::builtin(
+            "prime",
+            crate::theme::ColorMode::TrueColor,
+        ));
+        for (id, sequence, cwd, expected) in [
+            ("s1", 10, "/stale", "/second"),
+            ("s1", 11, "/equal", "/second"),
+            ("other", 12, "/foreign", "/second"),
+            ("s1", 12, "/newer", "/newer"),
+        ] {
+            session.apply_client_event(
+                crate::daemon_client::DaemonClientEvent::SessionEvent {
+                    active_session_id: id.into(),
+                    event: json!({"type":"kernel_cwd_changed","cwd":cwd}),
+                    meta_sequence: sequence,
+                },
+                &mut view,
+            );
+            assert_eq!(
+                session.kernel_cwd,
+                std::path::Path::new(expected),
+                "sequence {sequence}"
+            );
+        }
+        server.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kernel_cwd_symlink_request_preserves_confirmed_effective_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("symlink.sock");
+        let physical = root.path().join("physical");
+        std::fs::create_dir(&physical).unwrap();
+        let confirmed = std::fs::canonicalize(&physical).unwrap();
+        let link = root.path().join("directory-link");
+        std::os::unix::fs::symlink(&physical, &link).unwrap();
+        assert_ne!(link, confirmed);
+        assert_eq!(std::fs::canonicalize(&link).unwrap(), confirmed);
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (mut session, server) = mock_session(
+            &socket,
+            mpsc::unbounded_channel().0,
+            seen.clone(),
+            7,
+            Some(31),
+            true,
+            false,
+        )
+        .await;
+        let mut view = AgentView::new(crate::theme::Theme::builtin(
+            "prime",
+            crate::theme::ColorMode::TrueColor,
+        ));
+        session.apply_client_event(
+            crate::daemon_client::DaemonClientEvent::SessionEvent {
+                active_session_id: "s1".into(),
+                event: json!({"type":"kernel_cwd_changed","cwd":confirmed.to_string_lossy()}),
+                meta_sequence: 1,
+            },
+            &mut view,
+        );
+        assert_eq!(session.kernel_cwd, confirmed);
+        assert!(session.set_kernel_cwd(&link, &mut view).await.unwrap());
+        assert!(seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|request| request["command"]["dir"] == json!(link)));
+        assert_eq!(
+            session.kernel_cwd, confirmed,
+            "a successful request with no changed-CWD event keeps confirmed physical CWD"
+        );
+        drop(session);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn kernel_cwd_event_updates_only_the_attached_session() {
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("event.sock");
+        let (mut session, server) = mock_session(
+            &socket,
+            mpsc::unbounded_channel().0,
+            std::sync::Arc::default(),
+            7,
+            None,
+            false,
+            false,
+        )
+        .await;
+        let mut view = AgentView::new(crate::theme::Theme::builtin(
+            "prime",
+            crate::theme::ColorMode::TrueColor,
+        ));
+        for (id, cwd) in [("other", "/ignored"), ("s1", "/effective")] {
+            session.apply_client_event(
+                crate::daemon_client::DaemonClientEvent::SessionEvent {
+                    active_session_id: id.to_string(),
+                    event: json!({"type":"kernel_cwd_changed","cwd":cwd}),
+                    meta_sequence: 1,
+                },
+                &mut view,
+            );
+        }
+        assert_eq!(session.kernel_cwd, std::path::Path::new("/effective"));
+        server.abort();
+    }
+
     /// A rebind that tears down an agents-view panel drops its return: a later dock-opened shells
     /// panel closes back to the dock, never to the agents view.
     #[tokio::test]
@@ -867,7 +1168,16 @@ mod backfill_tests {
         tokio::time::timeout(Duration::from_secs(10), async {
             let dir = tempfile::tempdir().unwrap();
             let socket = dir.path().join("panel.sock");
-            let (mut session, server) = mock_session(&socket, mpsc::unbounded_channel().0).await;
+            let (mut session, server) = mock_session(
+                &socket,
+                mpsc::unbounded_channel().0,
+                std::sync::Arc::default(),
+                7,
+                None,
+                false,
+                false,
+            )
+            .await;
             let mut view = AgentView::new(crate::theme::Theme::builtin(
                 "prime",
                 crate::theme::ColorMode::TrueColor,
@@ -903,7 +1213,16 @@ mod backfill_tests {
         tokio::time::timeout(Duration::from_secs(10), async {
             let dir = tempfile::tempdir().unwrap();
             let socket = dir.path().join("shell.sock");
-            let (mut session, server) = mock_session(&socket, mpsc::unbounded_channel().0).await;
+            let (mut session, server) = mock_session(
+                &socket,
+                mpsc::unbounded_channel().0,
+                std::sync::Arc::default(),
+                7,
+                None,
+                false,
+                false,
+            )
+            .await;
             let shells = json!({"activities": [
                 {"id": "a", "command": "cargo build", "status": "running"},
                 {"id": "s2", "command": "sleep 600", "status": "running"},

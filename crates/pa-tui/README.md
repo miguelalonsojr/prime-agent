@@ -22,6 +22,14 @@ selection on-screen instead of the view snapping back to the top of the
 list; rows carry their session's `◷ N` heartbeat count from the
 `heartbeats_list` catalog, refreshed on `heartbeats_changed`), ctrl+o's spawn-program surface (`app.agents.program`: the selected row's target — the row itself for a top-level agent, its parent otherwise — expands its list and shows the program rows, one code block per spawn cell above the children it launched, capped at 10 lines with the remainder marker, on the tool-panel background, skipped by the selection and the click surface, a second press hides it, and collapsing the list clears it), ctrl+r's rename mode (`app.agents.rename`: the prompt becomes the "Rename agent session" header over the name buffer — the search grammar, Enter submits the trimmed name through the daemon `rename`/`rename_saved_session`, Esc cancels back to the untouched query — a saved rename patches the catalog row in place), and the `tui agents action` adoption events (`program_shown`, `renamed`) that ride the view outcome out of the run.
 
+## Local shell and working directory
+
+`/term` opens a local interactive shell when the current turn is idle. It refuses a busy turn and is unavailable on Windows and other unsupported platforms. Shell selection uses the configured `shellPath`, then `SHELL`, then `/bin/sh`. The shell starts in the effective kernel directory when it exists, or the session launch directory otherwise. The terminal returns to the TUI after the shell exits or fails to launch.
+
+Run `cd` in the shell and exit to request a kernel directory change. Supported shells report their physical final directory at exit; process-CWD observation is also used while the shell runs. Other executable names are launched, but may not report a final directory. A changed, existing directory can propagate even when the shell exits with a nonzero status. An unchanged, missing, or unobserved final directory leaves the kernel directory unchanged. The client sends the change only when the daemon negotiates CWD propagation; an older daemon leaves the effective directory unchanged and shows a warning. The session launch directory remains unchanged.
+
+The footer displays the confirmed effective kernel directory and cached Git branch. A completed `/speed` readout takes precedence. Path and branch work is kept off the frame render path; completion and footer caches update the display when results arrive. The path is clipped to the terminal width.
+
 ## Non-goals
 No session logic, no providers, no loop policy. The interactive UI renders daemon events and sends user intents (prompts, abort, switch) as daemon commands; the session loop itself lives in the pa-daemon worker. It never computes agent behavior and never spawns the supervisor (launch semantics live in pa-cli).
 

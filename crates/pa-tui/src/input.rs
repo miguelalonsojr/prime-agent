@@ -21,6 +21,35 @@ struct Reader {
 
 static PREVIOUS_READER: Mutex<Option<Reader>> = Mutex::new(None);
 
+#[cfg(test)]
+static READER_RECORDER: Mutex<Option<std::sync::mpsc::Sender<String>>> = Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn install_reader_recorder(sender: std::sync::mpsc::Sender<String>) {
+    *READER_RECORDER.lock().expect("reader recorder lock") = Some(sender);
+}
+
+#[cfg(test)]
+fn record_reader_lifecycle(event: &str, id: std::thread::ThreadId) {
+    if let Some(sender) = READER_RECORDER
+        .lock()
+        .expect("reader recorder lock")
+        .as_ref()
+    {
+        let _ = sender.send(format!("READER:{event}:{id:?}"));
+    }
+}
+
+#[cfg(test)]
+struct ReaderEnded(std::thread::ThreadId);
+
+#[cfg(test)]
+impl Drop for ReaderEnded {
+    fn drop(&mut self) {
+        record_reader_lifecycle("ENDED", self.0);
+    }
+}
+
 /// The bounded-poll cadence for the windows where the reader must share crossterm's
 /// process-global event-reader lock with another bounded poller (the kitty probe's answer window
 /// — an indefinite park would starve its slices), and the fallback when no wake handle exists.
@@ -107,6 +136,10 @@ where
     let waker = crossterm::event::waker();
     let thread_waker = waker.clone();
     let handle = std::thread::spawn(move || {
+        #[cfg(test)]
+        let _ended = ReaderEnded(std::thread::current().id());
+        #[cfg(test)]
+        record_reader_lifecycle("STARTED", std::thread::current().id());
         let mut guard = SequenceGuard::default();
         loop {
             if thread_stop.load(Ordering::Acquire) {
@@ -175,11 +208,15 @@ where
             }
         }
     });
+    #[cfg(test)]
+    let created_id = handle.thread().id();
     *previous = Some(Reader {
         handle,
         stop,
         waker,
     });
+    #[cfg(test)]
+    record_reader_lifecycle("CREATED", created_id);
 }
 
 /// [`forward`] one drained round, then mark its end with [`ReaderInput::ChunkEnd`] when the round

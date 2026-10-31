@@ -268,3 +268,204 @@ async fn the_attach_state_carries_the_stats_context_usage() {
         "a model-less session omits the field: {modelless}"
     );
 }
+
+fn strict_cwd_events(
+    subscription: &mut tokio::sync::broadcast::Receiver<Arc<OutboundFrame>>,
+) -> Vec<Value> {
+    let mut events = Vec::new();
+    loop {
+        match subscription.try_recv() {
+            Ok(frame) => {
+                let outbound: Value =
+                    serde_json::from_slice(&frame.payload).expect("valid worker frame");
+                if outbound["event"]["type"] == "kernel_cwd_changed" {
+                    events.push(outbound);
+                }
+            }
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+            Err(error) => panic!("worker event stream lost a frame: {error}"),
+        }
+    }
+    events
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // faux provider registration is process-global across the async flow
+async fn kernel_cwd_worker_routes_request_and_publishes_public_cell_readback() {
+    let _faux = crate::agent_engine::tests::FAUX_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let root = tempfile::tempdir().unwrap();
+    let first = root.path().join("first");
+    let second = root.path().join("second");
+    std::fs::create_dir(&first).unwrap();
+    std::fs::create_dir(&second).unwrap();
+    let script = json!({"engine":"faux","responses":[
+        {"content":[{"type":"toolCall","name":"python_repl","id":"cwd_cell",
+            "arguments":{"code":format!("import os; os.chdir({}); print('cwd tool stayed intact')", json!(second.to_str().unwrap()))}}]},
+        {"text":"done"},
+        {"content":[{"type":"toolCall","name":"python_repl","id":"cwd_unchanged",
+            "arguments":{"code":format!("import os; os.chdir({}); print('unchanged cell stayed intact')", json!(second.to_str().unwrap()))}}]},
+        {"text":"done"}
+    ]});
+    let worker = Worker::new(
+        WorkerConfig {
+            socket_path: root.path().join("w.sock"),
+            supervisor_socket_path: std::path::PathBuf::new(),
+            token: "cwd-test".into(),
+            worker_instance_id: String::new(),
+            active_session_id: "cwd-session".into(),
+            agent_dir: root.path().join("agent"),
+            recovery_journal_path: root.path().join("recovery.jsonl"),
+            telemetry_disabled: Some(true),
+            script: Some(script),
+        },
+        None,
+    );
+    assert!(
+        worker.agent_engine.is_some(),
+        "faux agent engine must be live"
+    );
+    let created = worker
+        .dispatch("create", &json!({"cwd":root.path(),"noSession":true}))
+        .await;
+    assert!(created.success, "{created:?}");
+    let mut events = worker.events.subscribe();
+    let wrong = worker
+        .dispatch(
+            "set_kernel_cwd",
+            &json!({"activeSessionId":"other","dir":first}),
+        )
+        .await;
+    assert!(
+        !wrong.success,
+        "wrong session changed kernel CWD: {wrong:?}"
+    );
+    let changed = worker
+        .dispatch(
+            "set_kernel_cwd",
+            &json!({"activeSessionId":"cwd-session","dir":first}),
+        )
+        .await;
+    assert!(changed.success, "{changed:?}");
+    let attached = worker.dispatch("attach", &json!({"clientId":"test"})).await;
+    assert_eq!(
+        attached.data.as_ref().unwrap()["snapshot"]["state"]["kernelCwd"],
+        json!(first)
+    );
+    assert_eq!(
+        attached.data.as_ref().unwrap()["snapshot"]["state"]["cwd"],
+        json!(root.path())
+    );
+    strict_cwd_events(&mut events);
+    let engine = worker.agent_engine.as_ref().unwrap().clone();
+    let provisioner = engine
+        .kernel_cwd_probe
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .upgrade()
+        .unwrap();
+    let mut changed_receipt = provisioner.subscribe_cwd_observations();
+    let tool_finished = tokio::task::spawn_blocking(move || {
+        let mut finished = false;
+        engine.run_prompt(
+            0,
+            crate::engine::PromptRequest {
+                batch: Vec::new(),
+                images: Vec::new(),
+                message: "change cwd".into(),
+                source: "user".into(),
+                agent_message_id: None,
+                custom_message: None,
+            },
+            &|| false,
+            &mut |event| {
+                if let crate::engine::EngineEvent::ToolExecutionEnd {
+                    tool_call_id,
+                    result,
+                    ..
+                } = &event
+                {
+                    if tool_call_id == "cwd_cell" {
+                        finished = result.to_string().contains("cwd tool stayed intact");
+                    }
+                }
+                true
+            },
+        );
+        finished
+    })
+    .await
+    .unwrap();
+    assert!(
+        tool_finished,
+        "the public python_repl result must survive CWD observation"
+    );
+    let receipt = tokio::time::timeout(std::time::Duration::from_secs(10), changed_receipt.recv())
+        .await
+        .expect("changed observation must settle")
+        .expect("changed receipt channel closed");
+    assert_eq!(receipt.cwd, second);
+    assert!(receipt.changed);
+    let changed_frames = strict_cwd_events(&mut events);
+    assert_eq!(
+        changed_frames.len(),
+        1,
+        "changed cell must emit exactly one CWD frame"
+    );
+    assert_eq!(changed_frames[0]["activeSessionId"], "cwd-session");
+    assert_eq!(changed_frames[0]["event"]["cwd"], json!(second));
+
+    let mut unchanged_receipt = provisioner.subscribe_cwd_observations();
+    let engine = worker.agent_engine.as_ref().unwrap().clone();
+    let unchanged_tool_finished = tokio::task::spawn_blocking(move || {
+        let mut finished = false;
+        engine.run_prompt(
+            0,
+            crate::engine::PromptRequest {
+                batch: Vec::new(),
+                images: Vec::new(),
+                message: "same cwd".into(),
+                source: "user".into(),
+                agent_message_id: None,
+                custom_message: None,
+            },
+            &|| false,
+            &mut |event| {
+                if let crate::engine::EngineEvent::ToolExecutionEnd {
+                    tool_call_id,
+                    result,
+                    ..
+                } = &event
+                {
+                    if tool_call_id == "cwd_unchanged" {
+                        finished = result.to_string().contains("unchanged cell stayed intact");
+                    }
+                }
+                true
+            },
+        );
+        finished
+    })
+    .await
+    .unwrap();
+    assert!(
+        unchanged_tool_finished,
+        "unchanged public cell tool result must survive"
+    );
+    let receipt =
+        tokio::time::timeout(std::time::Duration::from_secs(10), unchanged_receipt.recv())
+            .await
+            .expect("unchanged observation must settle")
+            .expect("unchanged receipt channel closed");
+    assert_eq!(receipt.cwd, second);
+    assert!(!receipt.changed);
+    assert!(
+        strict_cwd_events(&mut events).is_empty(),
+        "unchanged public cell emitted CWD frame"
+    );
+    let state = worker.dispatch("get_connection_state", &json!({})).await;
+    assert_eq!(state.data.as_ref().unwrap()["kernelCwd"], json!(second));
+}

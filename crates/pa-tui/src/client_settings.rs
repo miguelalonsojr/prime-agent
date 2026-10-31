@@ -4,8 +4,13 @@
 //! settings manager. Setters persist the global scope.
 
 use anyhow::Result;
+use std::path::PathBuf;
 
 pub trait ClientSettings: Send + Sync {
+    /// Current configured shell for a local terminal handoff; unset uses environment/default.
+    fn shell_path(&self) -> Option<PathBuf> {
+        None
+    }
     /// Master harness refinement switch, enabled by default.
     fn harness_refinements(&self) -> bool {
         true

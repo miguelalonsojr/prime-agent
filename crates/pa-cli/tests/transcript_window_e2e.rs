@@ -380,11 +380,11 @@ async fn the_top_of_a_long_session_is_its_first_message_across_a_compaction() {
 async fn the_compaction_summary_renders_once_across_eviction_and_refetch() {
     let session = open_long_session().await;
     // Climb far enough above the compaction that its chunk is evicted, then descend
-    // past it again so it is refetched.
+    // past it again for refetch. Height 41 preserves the pre-footer 31-row viewport.
     let mut steps = attached();
     steps.extend(paced_keys(crossterm::event::KeyCode::PageUp, 140));
     steps.extend(paced_keys(crossterm::event::KeyCode::PageDown, 110));
-    let frames = run_plan(&session, steps, 40).await;
+    let frames = run_plan(&session, steps, 41).await;
     let highest = frames
         .iter()
         .enumerate()

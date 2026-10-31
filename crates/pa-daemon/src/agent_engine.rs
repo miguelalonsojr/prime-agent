@@ -117,6 +117,12 @@ pub struct AgentSessionEngine {
     pub(crate) published_goal: std::sync::Mutex<Option<pa_core::goals::GoalState>>,
     pub(crate) late_agent_message_sink:
         std::sync::Mutex<Option<pa_core::LateSentAgentMessageHandler>>,
+    /// Worker event emitter for changed effective kernel directories.
+    pub(crate) kernel_cwd_changed_sink:
+        std::sync::Mutex<Option<pa_core::kernel::provisioner::KernelCwdChangedCallback>>,
+    pub(crate) kernel_cwd_probe: std::sync::Mutex<
+        Option<std::sync::Weak<pa_core::kernel::provisioner::IpythonKernelProvisioner>>,
+    >,
     /// The session's goal driver and session-manager handles, mirrored from
     /// the core session at build time: the core session's own mutex is held
     /// across a turn's admission, so goal checks inside emit callbacks

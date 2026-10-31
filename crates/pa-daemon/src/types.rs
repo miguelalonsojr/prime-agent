@@ -211,6 +211,8 @@ pub struct AgentConnectionState {
     pub active_session_id: Option<String>,
     pub cwd: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kernel_cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<Value>,
     pub thinking_level: String,
     pub service_tier: String,

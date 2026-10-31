@@ -114,6 +114,7 @@ pub const KNOWN_COMMAND_TYPES: &[&str] = &[
     "heartbeat_set",
     "heartbeat_update",
     "set_model",
+    "set_kernel_cwd",
     "cycle_model",
     "set_scoped_models",
     "set_thinking_level",
@@ -351,6 +352,7 @@ pub fn default_server_capabilities() -> Vec<DaemonServerCapability> {
                 "session_input_pause",
                 "acp_mcp_servers",
                 "abort_and_send_queued",
+                "kernel_cwd_propagation",
                 "agent_roster",
                 "direct_peer_transport",
             ]
@@ -703,6 +705,9 @@ pub fn command_active_session_id(command: &DaemonCommand) -> Option<&str> {
         | DaemonCommand::GetConnectionState {
             active_session_id, ..
         }
+        | DaemonCommand::SetKernelCwd {
+            active_session_id, ..
+        }
         | DaemonCommand::GetMessages {
             active_session_id, ..
         }
@@ -1019,6 +1024,7 @@ pub fn command_type_name(command: &DaemonCommand) -> &'static str {
         DaemonCommand::HeartbeatSet { .. } => "heartbeat_set",
         DaemonCommand::HeartbeatUpdate { .. } => "heartbeat_update",
         DaemonCommand::SetModel { .. } => "set_model",
+        DaemonCommand::SetKernelCwd { .. } => "set_kernel_cwd",
         DaemonCommand::CycleModel { .. } => "cycle_model",
         DaemonCommand::SetScopedModels { .. } => "set_scoped_models",
         DaemonCommand::SetThinkingLevel { .. } => "set_thinking_level",

@@ -244,6 +244,7 @@ fn read_exact_timeout(stream: &mut UnixStream, buffer: &mut [u8], deadline: Inst
 struct WorkerIdentity {
     socket_path: PathBuf,
     worker_instance_id: String,
+    authentication_token: String,
 }
 
 fn load_worker_identity(agent_dir: &Path, socket: &Path, worker_id: &str) -> WorkerIdentity {
@@ -253,6 +254,10 @@ fn load_worker_identity(agent_dir: &Path, socket: &Path, worker_id: &str) -> Wor
     let value: Value = serde_json::from_str(&content).expect("descriptor json");
     WorkerIdentity {
         socket_path: PathBuf::from(value["socketPath"].as_str().expect("socket path")),
+        authentication_token: value["authenticationToken"]
+            .as_str()
+            .expect("worker token")
+            .to_string(),
         worker_instance_id: value["workerInstanceId"]
             .as_str()
             .expect("worker instance id")
@@ -599,4 +604,314 @@ fn unused_ticket_expires() {
     client.send_command("sd", &json!({ "type": "shutdown" }));
     let shutdown = client.read_response("sd");
     assert_eq!(shutdown["success"], true, "shutdown failed: {shutdown}");
+}
+
+#[test]
+fn a_ticket_from_a_replaced_supervisor_cannot_attach_or_replay() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let socket = dir.path().join("daemon.sock");
+    let agent_dir = dir.path().join("agent");
+    let sessions_dir = agent_dir.join("sessions");
+    std::fs::create_dir_all(&sessions_dir).expect("sessions dir");
+    let script_path = dir.path().join("script.json");
+    std::fs::write(
+        &script_path,
+        json!({ "responses": [{ "text": "reply" }] }).to_string(),
+    )
+    .expect("script");
+    let daemon = spawn_supervisor(&socket, &agent_dir);
+    wait_socket_ready(&socket);
+    let (mut client, _) = Client::connect(&socket);
+    client.send_command(
+        "create",
+        &json!({
+            "type": "create",
+            "config": {
+                "cwd": dir.path().to_string_lossy(),
+                "sessionDir": sessions_dir.to_string_lossy(),
+                "script": script_path.to_string_lossy(),
+            }
+        }),
+    );
+    let created = client.read_response("create");
+    assert_eq!(created["success"], true, "{created}");
+    let session_id = created["data"]["id"]
+        .as_str()
+        .or_else(|| created["data"]["sessionId"].as_str())
+        .expect("session id");
+    let identity = load_worker_identity(&agent_dir, &socket, session_id);
+    let ticket = get_ticket(&mut client, session_id);
+    client.send_command(
+        "create-source",
+        &json!({
+            "type": "create",
+            "config": {
+                "cwd": dir.path().to_string_lossy(),
+                "sessionDir": sessions_dir.to_string_lossy(),
+                "script": script_path.to_string_lossy(),
+            }
+        }),
+    );
+    let source = client.read_response("create-source");
+    assert_eq!(source["success"], true, "{source}");
+    let source_id = source["data"]["id"]
+        .as_str()
+        .or_else(|| source["data"]["sessionId"].as_str())
+        .expect("source session id");
+    let source_identity = load_worker_identity(&agent_dir, &socket, source_id);
+    client.send_command(
+        "worker-ticket",
+        &json!({
+            "type": "get_worker_peer_transport",
+            "workerToken": source_identity.authentication_token,
+            "targetActiveSessionId": session_id,
+        }),
+    );
+    let ticket_response = client.read_response("worker-ticket");
+    assert_eq!(ticket_response["success"], true, "{ticket_response}");
+    let worker_ticket = ticket_response["data"].clone();
+    assert_eq!(worker_ticket["purpose"], "worker");
+
+    // Successful worker_auth response confirms the replacement generation
+    // reached the worker before the old grant is presented.
+    let (mut replacement, _) = WorkerClient::connect(&identity.socket_path);
+    let replaced = replacement.request(
+        "worker_auth",
+        &json!({
+            "type": "worker_auth",
+            "token": identity.authentication_token,
+            "supervisorGeneration": "replacement-generation",
+            "supervisorPid": std::process::id(),
+            "supervisorSocketPath": socket.to_string_lossy(),
+            "workerInstanceId": identity.worker_instance_id,
+        }),
+    );
+    assert_eq!(replaced["success"], true, "replacement auth: {replaced}");
+    let (mut peer, _) = WorkerClient::connect(&identity.socket_path);
+    let denied = peer_auth(&mut peer, &ticket);
+    assert_eq!(
+        denied["success"], false,
+        "stale peer grant admitted: {denied}"
+    );
+    assert_eq!(denied["error"], "Peer authentication failed");
+    peer.stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("close bound");
+    let mut next = [0u8; 1];
+    assert_eq!(
+        peer.stream
+            .read(&mut next)
+            .expect("peer closed after denial"),
+        0
+    );
+    let (mut replay, _) = WorkerClient::connect(&identity.socket_path);
+    let replay_denied = peer_auth(&mut replay, &ticket);
+    assert_eq!(
+        replay_denied["success"], false,
+        "replayed grant admitted: {replay_denied}"
+    );
+    let (mut delivery_peer, _) = WorkerClient::connect(&identity.socket_path);
+    let denied_delivery = delivery_peer.request(
+        "peer_auth",
+        &json!({
+            "type": "peer_auth",
+            "grantId": worker_ticket["grantId"],
+            "token": worker_ticket["token"],
+            "workerInstanceId": worker_ticket["workerInstanceId"],
+            "purpose": "worker",
+        }),
+    );
+    assert_eq!(
+        denied_delivery["success"], false,
+        "stale worker grant admitted: {denied_delivery}"
+    );
+    assert_eq!(denied_delivery["error"], "Peer authentication failed");
+    delivery_peer
+        .stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("delivery close bound");
+    assert_eq!(
+        delivery_peer
+            .stream
+            .read(&mut next)
+            .expect("delivery socket closed"),
+        0
+    );
+    let (mut delivery_replay, _) = WorkerClient::connect(&identity.socket_path);
+    let replayed_delivery = delivery_replay.request(
+        "peer_auth",
+        &json!({
+            "type": "peer_auth",
+            "grantId": worker_ticket["grantId"],
+            "token": worker_ticket["token"],
+            "workerInstanceId": worker_ticket["workerInstanceId"],
+            "purpose": "worker",
+        }),
+    );
+    assert_eq!(
+        replayed_delivery["success"], false,
+        "worker replay admitted: {replayed_delivery}"
+    );
+    let _ = daemon;
+}
+
+/// A standalone real worker lets the test own every supervisor-role socket.
+fn spawn_claim_worker(dir: &Path) -> Daemon {
+    let socket = dir.join("worker.sock");
+    let agent_dir = dir.join("agent");
+    std::fs::create_dir_all(&agent_dir).expect("agent dir");
+    let child = Command::new(env!("CARGO_BIN_EXE_pa-daemon"))
+        .arg("worker")
+        .env(pa_daemon::worker::WORKER_ROLE_ENV, "1")
+        .env(pa_daemon::worker::WORKER_TOKEN_ENV, "claim-token")
+        .env(pa_daemon::worker::WORKER_INSTANCE_ID_ENV, "claim-instance")
+        .env(
+            pa_daemon::worker::WORKER_ACTIVE_SESSION_ID_ENV,
+            "claim-session",
+        )
+        .env(pa_daemon::worker::WORKER_SOCKET_ENV, &socket)
+        .env(
+            pa_daemon::worker::WORKER_RECOVERY_JOURNAL_ENV,
+            dir.join("recovery.jsonl"),
+        )
+        .env("PRIME_AGENT_CODING_AGENT_DIR", agent_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("standalone worker");
+    wait_socket_ready(&socket);
+    Daemon { child, socket }
+}
+
+fn claim_supervisor(socket: &Path) -> WorkerClient {
+    let (mut client, _) = WorkerClient::connect(socket);
+    let result = client.request(
+        "worker_auth",
+        &json!({
+            "type": "worker_auth",
+            "token": "claim-token",
+            "supervisorGeneration": "claim-generation",
+            "supervisorPid": std::process::id(),
+            "supervisorSocketPath": "/unused-claim-supervisor.sock",
+            "workerInstanceId": "claim-instance",
+        }),
+    );
+    assert_eq!(result["success"], true, "claim auth: {result}");
+    client
+}
+
+fn register_claim_grant(supervisor: &mut WorkerClient, id: &str, purpose: &str) -> Value {
+    let grant = json!({
+        "grantId": id,
+        "token": "claim-grant-token",
+        "expiresAt": pa_daemon::util::iso_from_unix_ms(pa_daemon::util::now_ms() + 10_000),
+        "purpose": purpose,
+        "workerInstanceId": "claim-instance",
+        "activeSessionId": "claim-session",
+        "issuerGeneration": "claim-generation",
+    });
+    let result = supervisor.request(
+        "worker_register_peer_transport",
+        &json!({
+            "type": "worker_register_peer_transport", "grant": grant,
+        }),
+    );
+    assert_eq!(result["success"], true, "grant registration: {result}");
+    grant
+}
+
+fn present_claim_grant(socket: &Path, grant: &Value) -> (WorkerClient, Value) {
+    let (mut peer, _) = WorkerClient::connect(socket);
+    let response = peer.request(
+        "peer_auth",
+        &json!({
+            "type": "peer_auth",
+            "grantId": grant["grantId"],
+            "token": grant["token"],
+            "workerInstanceId": grant["workerInstanceId"],
+            "purpose": grant["purpose"],
+        }),
+    );
+    (peer, response)
+}
+
+fn close_claim_and_wait_for_worker_eof(client: &mut WorkerClient) {
+    client
+        .stream
+        .shutdown(std::net::Shutdown::Write)
+        .expect("close supervisor write half");
+    let mut byte = [0];
+    client
+        .stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("close bound");
+    assert_eq!(
+        client.stream.read(&mut byte).expect("worker side closed"),
+        0
+    );
+}
+
+#[test]
+fn last_supervisor_claim_loss_burns_both_peer_purposes() {
+    for purpose in ["session_client", "worker"] {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let worker = spawn_claim_worker(dir.path());
+        let mut supervisor = claim_supervisor(&worker.socket);
+        let created = supervisor.request(
+            "create",
+            &json!({
+                "type": "create", "sessionPath": dir.path().join("session.jsonl").to_string_lossy(),
+            }),
+        );
+        assert_eq!(created["success"], true, "create: {created}");
+        let grant = register_claim_grant(&mut supervisor, "lost-claim", purpose);
+        close_claim_and_wait_for_worker_eof(&mut supervisor);
+        let (mut peer, denied) = present_claim_grant(&worker.socket, &grant);
+        assert_eq!(
+            denied["success"], false,
+            "{purpose} grant admitted without a claim: {denied}"
+        );
+        assert_eq!(denied["error"], "Peer authentication failed");
+        let mut byte = [0];
+        assert_eq!(peer.stream.read(&mut byte).expect("denied peer closed"), 0);
+        let (_, replay) = present_claim_grant(&worker.socket, &grant);
+        assert_eq!(
+            replay["success"], false,
+            "{purpose} grant replay admitted: {replay}"
+        );
+    }
+}
+
+#[test]
+fn same_generation_claim_survives_one_close_but_not_the_last() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let worker = spawn_claim_worker(dir.path());
+    let mut first = claim_supervisor(&worker.socket);
+    let created = first.request(
+        "create",
+        &json!({
+            "type": "create", "sessionPath": dir.path().join("session.jsonl").to_string_lossy(),
+        }),
+    );
+    assert_eq!(created["success"], true, "create: {created}");
+    let mut second = claim_supervisor(&worker.socket);
+    let good = register_claim_grant(&mut second, "still-live", "session_client");
+    close_claim_and_wait_for_worker_eof(&mut first);
+    let (_, accepted) = present_claim_grant(&worker.socket, &good);
+    assert_eq!(
+        accepted["success"], true,
+        "a same-generation socket remains: {accepted}"
+    );
+    let lost = register_claim_grant(&mut second, "last-lost", "session_client");
+    close_claim_and_wait_for_worker_eof(&mut second);
+    let (mut peer, denied) = present_claim_grant(&worker.socket, &lost);
+    assert_eq!(denied["success"], false, "last claim closed: {denied}");
+    let mut byte = [0];
+    assert_eq!(peer.stream.read(&mut byte).expect("denied peer closed"), 0);
+    let (_, replay) = present_claim_grant(&worker.socket, &lost);
+    assert_eq!(
+        replay["success"], false,
+        "failed grant was consumed: {replay}"
+    );
 }

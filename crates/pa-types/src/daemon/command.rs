@@ -654,6 +654,14 @@ pub enum DaemonCommand {
         #[serde(flatten)]
         rest: JsonMap,
     },
+    SetKernelCwd {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        dir: String,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
     GetMessages {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<String>,
@@ -1303,6 +1311,13 @@ pub enum ForkPosition {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kernel_cwd_command_roundtrip() {
+        rt::<DaemonCommand>(
+            r#"{"type":"set_kernel_cwd","activeSessionId":"s1","dir":"/tmp/next"}"#,
+        );
+    }
 
     #[test]
     fn prompt_family_roundtrip() {

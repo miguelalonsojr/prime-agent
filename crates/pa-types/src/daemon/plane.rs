@@ -45,6 +45,7 @@ pub fn command_plane(command_type: &str) -> DaemonCommandPlane {
         | "get_session_header"
         | "get_state"
         | "get_connection_state"
+        | "set_kernel_cwd"
         | "get_messages"
         | "get_rlm_children"
         | "get_session_stats"
@@ -178,6 +179,12 @@ mod tests {
     use super::*;
 
     /// The plane assignments the direct-attach path depends on.
+    #[test]
+    fn kernel_cwd_stays_mutating_on_the_session_plane() {
+        assert_eq!(command_plane("set_kernel_cwd"), DaemonCommandPlane::Session);
+        assert!(is_daemon_mutating_command("set_kernel_cwd"));
+    }
+
     #[test]
     fn planes_match_ts() {
         for session in [

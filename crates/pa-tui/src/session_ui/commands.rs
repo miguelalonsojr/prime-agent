@@ -784,6 +784,53 @@ impl SessionUi {
                 self.handle_rlm_max_depth_command(view, &resolved.args)
                     .await;
             }
+            "term" => {
+                if !resolved.args.is_empty() {
+                    self.error_row("Usage: /term", view);
+                    return Ok(());
+                }
+                if cfg!(windows) {
+                    self.note_as(
+                        "/term is unavailable on Windows.",
+                        StatusKind::Warning,
+                        view,
+                    );
+                    return Ok(());
+                }
+                if !cfg!(any(target_os = "linux", target_os = "macos")) {
+                    self.note_as(
+                        "/term is unavailable on this platform.",
+                        StatusKind::Warning,
+                        view,
+                    );
+                    return Ok(());
+                }
+                if self.turn_active
+                    || view.working.is_some()
+                    || self.work_in_flight()
+                    || view.compaction.is_some()
+                {
+                    self.note_as(
+                        "Wait for current work to finish before /term.",
+                        StatusKind::Warning,
+                        view,
+                    );
+                    return Ok(());
+                }
+                let shell = self
+                    .client_settings
+                    .as_ref()
+                    .and_then(|settings| settings.shell_path())
+                    .or_else(|| std::env::var_os("SHELL").map(std::path::PathBuf::from))
+                    .unwrap_or_else(|| std::path::PathBuf::from("/bin/sh"));
+                let cwd = if self.kernel_cwd.is_dir() {
+                    self.kernel_cwd.clone()
+                } else {
+                    self.cwd.clone()
+                };
+                self.note("/term", view);
+                self.shell_request = Some((shell, cwd));
+            }
             "speed" => {
                 let arg = resolved.args.trim().to_lowercase();
                 if !arg.is_empty() && arg != "on" && arg != "off" {

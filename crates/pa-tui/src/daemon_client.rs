@@ -532,6 +532,18 @@ impl DaemonClient {
             })
     }
 
+    /// The optional CWD command needs all three hello gates before any socket write.
+    #[must_use]
+    pub fn supports_kernel_cwd_propagation(&self) -> bool {
+        self.protocol.version == DAEMON_PROTOCOL_VERSION
+            && self
+                .hello
+                .get("schemaRevision")
+                .and_then(Value::as_u64)
+                .is_some_and(|revision| revision >= pa_types::daemon::DAEMON_SCHEMA_REVISION)
+            && self.supports_server_capability("kernel_cwd_propagation")
+    }
+
     #[must_use]
     pub fn hello(&self) -> &Value {
         &self.hello
