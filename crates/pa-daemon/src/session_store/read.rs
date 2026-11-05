@@ -161,9 +161,13 @@ impl SessionFile {
             trace_upload: None,
             anthropic_warning_shown: false,
             skipped_lines: 0,
+            clm_generation: uuid::Uuid::new_v4().to_string(),
+            clm_error: None,
         };
+        let mut has_clm = false;
         for line in lines {
             let line = line.with_context(read_context)?;
+            has_clm |= pa_core::session::clm::contains_clm_records(line.as_bytes());
             let trimmed = line.trim();
             if trimmed.is_empty() {
                 continue;
@@ -176,6 +180,11 @@ impl SessionFile {
                 Ok(entry) => file.push_index(entry),
                 Err(_) => file.skipped_lines += 1,
             }
+        }
+        if has_clm {
+            file.clm_error = pa_core::session::clm::parse_session_entries_checked(&fs::read(path)?)
+                .err()
+                .map(|error| error.to_string());
         }
         fold_child_usage_attributions(&mut file.entries);
         // The once-per-lifecycle gate rides the ACTIVE branch, exactly
@@ -222,6 +231,8 @@ impl SessionFile {
             trace_upload: None,
             anthropic_warning_shown,
             skipped_lines: 0,
+            clm_generation: uuid::Uuid::new_v4().to_string(),
+            clm_error: None,
         };
         // The raw rows are consumed in place: each line String drops as soon as its
         // parsed entry joins the store.
@@ -286,6 +297,10 @@ impl SessionFile {
             }
         }
         full.leaf_id.clone_from(&self.leaf_id);
+        full.clm_generation.clone_from(&self.clm_generation);
+        if self.clm_error.is_some() {
+            full.clm_error.clone_from(&self.clm_error);
+        }
         full.lease.clone_from(&self.lease);
         full.trace_upload.clone_from(&self.trace_upload);
         full.child_usage_recovery
@@ -323,6 +338,8 @@ impl SessionFile {
             trace_upload: None,
             anthropic_warning_shown: false,
             skipped_lines: 0,
+            clm_generation: uuid::Uuid::new_v4().to_string(),
+            clm_error: None,
         }
     }
 }

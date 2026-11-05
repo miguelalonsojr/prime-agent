@@ -1731,6 +1731,7 @@ class ReplTest(unittest.TestCase):
         while request.get("event") != "host_request":
             request = self.repl.read_event()
         self.assertEqual(request["data"], {"type": "demo", "value": 7})
+        self.assertEqual(request["cell_id"], "hr")
         envelope = {"status": "ok", "result": {"status": "weird", "answer": 42}}
         self.repl.send({"type": "host_reply", "id": request["id"], "data": envelope})
         events = self.repl.until_done("hr")

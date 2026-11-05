@@ -1114,6 +1114,162 @@ mod kernel_cwd_tests {
             .unwrap();
     }
 
+    #[tokio::test]
+    async fn real_runtime_host_request_attests_only_the_host_bound_tool() {
+        let runtime = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../prime-agent-runtime/src")
+            .canonicalize()
+            .unwrap();
+        let identity = crate::kernel::shared::ToolExecutionIdentity::new();
+        let expected_identity = identity.clone();
+        let mut host_handlers = crate::kernel::shared::HostRequestHandlers::new();
+        host_handlers.register(
+            "demo",
+            crate::kernel::shared::host_handler(move |payload| {
+                let expected_identity = expected_identity.clone();
+                async move {
+                    Ok(json!({
+                        "verified": payload.verified_tool_call_id,
+                        "identity_matches": payload.verified_tool_execution_identity.as_ref().is_some_and(|identity| identity.same_instance(&expected_identity)),
+                        "forged": payload.data["tool_call_id"],
+                    }))
+                }
+            }),
+        );
+        let manager = ReplKernelManager::new(KernelManagerOptions {
+            python: Some("python3".into()),
+            env: HashMap::from([("PYTHONPATH".into(), runtime.display().to_string())]),
+            host_handlers,
+            ..Default::default()
+        });
+        manager.start(KernelStartOptions::default()).await.unwrap();
+        let expected_runtime_file = runtime.join("rlm/repl.py");
+        let code = format!(
+            "from rlm.repl import host_request\nsource = host_request.__globals__['__file__']\nassert source == {expected:?}, source\nreply = await host_request({{'type': 'demo', 'tool_call_id': 'forged'}})\n(source, reply)",
+            expected = expected_runtime_file.display().to_string(),
+        );
+        let matched = manager
+            .execute(
+                &code,
+                ExecuteOptions {
+                    tool_call_id: Some("trusted-tool".into()),
+                    tool_execution_identity: Some(identity),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            matched.status,
+            ExecuteStatus::Ok,
+            "expected runtime {}, cell error {:?}, stderr {:?}",
+            expected_runtime_file.display(),
+            matched.error,
+            matched.stderr,
+        );
+        assert!(matched
+            .result
+            .as_deref()
+            .unwrap()
+            .contains(expected_runtime_file.to_string_lossy().as_ref()));
+        assert!(matched
+            .result
+            .as_deref()
+            .unwrap()
+            .contains("'verified': 'trusted-tool'"));
+        assert!(matched
+            .result
+            .as_deref()
+            .unwrap()
+            .contains("'identity_matches': True"));
+        assert!(matched
+            .result
+            .as_deref()
+            .unwrap()
+            .contains("'forged': 'forged'"));
+        let ordinary = manager
+            .execute(&code, ExecuteOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(ordinary.status, ExecuteStatus::Ok);
+        assert!(ordinary
+            .result
+            .as_deref()
+            .unwrap()
+            .contains("'verified': None"));
+        assert!(ordinary
+            .result
+            .as_deref()
+            .unwrap()
+            .contains("'identity_matches': False"));
+        manager
+            .shutdown(KernelShutdownOptions::default())
+            .await
+            .unwrap();
+    }
+
+    #[test]
+    fn trusted_origin_requires_live_public_healthy_matching_cell() {
+        let manager = ReplKernelManager::new(KernelManagerOptions::default());
+        let (tx, _rx) = oneshot::channel();
+        let execution = Arc::new(ActiveExecution {
+            request_id: "public-cell".into(),
+            started: Instant::now(),
+            max_chars: DEFAULT_MAX_OUTPUT_CHARS,
+            opts: ExecuteOptions {
+                tool_call_id: Some("tool-7".into()),
+                ..Default::default()
+            },
+            namespace_code: true,
+            restores_namespace: false,
+            buffers: Mutex::new(ExecBuffers {
+                status: ExecuteStatus::Ok,
+                ..Default::default()
+            }),
+            result_tx: Mutex::new(Some(tx)),
+            cell_started: Mutex::new(None),
+        });
+        assert_eq!(
+            manager.inner.verified_tool_call_id(Some("public-cell")),
+            None
+        );
+        lock(&manager.inner.guarded).active_execution = Some(Arc::clone(&execution));
+        assert_eq!(
+            manager.inner.verified_tool_call_id(Some("public-cell")),
+            Some("tool-7".into())
+        );
+        for origin in [None, Some("old-cell"), Some("tool-7")] {
+            assert_eq!(manager.inner.verified_tool_call_id(origin), None);
+        }
+        lock(&execution.buffers).status = ExecuteStatus::Aborted;
+        assert_eq!(
+            manager.inner.verified_tool_call_id(Some("public-cell")),
+            None
+        );
+        lock(&execution.buffers).status = ExecuteStatus::Ok;
+        lock(&execution.buffers).settled = true;
+        assert_eq!(
+            manager.inner.verified_tool_call_id(Some("public-cell")),
+            None
+        );
+        lock(&execution.buffers).settled = false;
+        let candidate = lock(&manager.inner.guarded)
+            .active_execution
+            .clone()
+            .unwrap();
+        manager
+            .inner
+            .reject_active_execution("rejected after candidate clone");
+        assert!(!lock(&candidate.buffers).settled);
+        assert!(
+            manager
+                .inner
+                .verified_execution_origin(&candidate, Some("public-cell"))
+                .is_none(),
+            "a rejected but unsettled candidate cannot attest origin"
+        );
+    }
+
     #[test]
     fn kernel_cwd_aborted_cell_waits_matching_done_without_blocking_tool_abort() {
         let manager = ReplKernelManager::new(KernelManagerOptions::default());
@@ -1164,5 +1320,39 @@ mod kernel_cwd_tests {
             fields: json!({"status":"ok"}),
         });
         assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn internal_or_cancelled_python_cell_never_grants_tool_origin_even_after_done() {
+        for (internal, signal) in [(true, None), (false, Some(AbortSignal::aborted()))] {
+            let manager = ReplKernelManager::new(KernelManagerOptions::default());
+            let (tx, _rx) = oneshot::channel();
+            let execution = Arc::new(ActiveExecution {
+                request_id: "cell".into(),
+                started: Instant::now(),
+                max_chars: DEFAULT_MAX_OUTPUT_CHARS,
+                opts: ExecuteOptions {
+                    internal,
+                    signal,
+                    tool_call_id: Some("cancelled-edit-skill".into()),
+                    ..Default::default()
+                },
+                namespace_code: true,
+                restores_namespace: false,
+                buffers: Mutex::new(ExecBuffers {
+                    status: ExecuteStatus::Ok,
+                    ..Default::default()
+                }),
+                result_tx: Mutex::new(Some(tx)),
+                cell_started: Mutex::new(None),
+            });
+            lock(&manager.inner.guarded).active_execution = Some(Arc::clone(&execution));
+            assert_eq!(manager.inner.verified_tool_call_id(Some("cell")), None);
+            manager.inner.handle_event(Event::Done {
+                id: "cell".into(),
+                fields: json!({"status":"ok"}),
+            });
+            assert_eq!(manager.inner.verified_tool_call_id(Some("cell")), None);
+        }
     }
 }

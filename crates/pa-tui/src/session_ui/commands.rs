@@ -38,7 +38,7 @@ impl SessionUi {
         match name.as_str() {
             "help" => {
                 self.note(
-                    "/help           this list\n/list           live sessions\n/switch <n|id>  switch to a session from /list\n/new            start a new session\n/exit           detach and exit",
+                    "/help           this list\n/list           live sessions\n/switch <n|id>  switch to a session from /list\n/new            start a new session\n/clm <action>   accepted model context (on|off|status|view|restore)\n/exit           detach and exit",
                     view,
                 );
                 return Ok(());
@@ -94,6 +94,74 @@ impl SessionUi {
             SlashCommandExecution::Client => {
                 self.dispatch_client_command(&resolved, text, view).await
             }
+        }
+    }
+
+    /// CLM requests remain optional. An unsupported daemon refuses before socket write.
+    async fn handle_clm_command(&mut self, args: &str, view: &mut AgentView) {
+        let command = match args {
+            "status" => DaemonCommand::GetClmStatus {
+                id: None,
+                active_session_id: self.active_session_id.clone(),
+                rest: Map::default(),
+            },
+            "view" => DaemonCommand::GetClmModelSnapshot {
+                id: None,
+                active_session_id: self.active_session_id.clone(),
+                rest: Map::default(),
+            },
+            "on" | "off" => DaemonCommand::SetClmMode {
+                id: None,
+                active_session_id: self.active_session_id.clone(),
+                enabled: args == "on",
+                rest: Map::default(),
+            },
+            _ => {
+                let Some((epoch, revision)) = parse_clm_restore(args) else {
+                    self.error_row(
+                        "Usage: /clm on|off|status|view|restore <epoch:revision>",
+                        view,
+                    );
+                    return;
+                };
+                DaemonCommand::RestoreClmRevision {
+                    id: None,
+                    active_session_id: self.active_session_id.clone(),
+                    epoch_id: epoch.into(),
+                    revision,
+                    rest: Map::default(),
+                }
+            }
+        };
+        match self
+            .bounded_request(Duration::from_millis(UI_REQUEST_TIMEOUT_MS), command)
+            .await
+        {
+            Ok(data) => {
+                let text = if args == "view" {
+                    format_clm_view(&data)
+                } else {
+                    format_clm_status(&data)
+                };
+                let rows = text
+                    .lines()
+                    .map(|line| {
+                        vec![info_commands::ClientSpan {
+                            text: line.to_string(),
+                            color: None,
+                        }]
+                    })
+                    .collect();
+                self.open_info_panel(
+                    view,
+                    Some("CLM accepted context".into()),
+                    InfoContent::Rows(rows),
+                );
+                if args == "on" {
+                    self.note("Older Prime Agent binaries can ignore CLM edits and replay the audit. Do not downgrade this session.", view);
+                }
+            }
+            Err(error) => self.error_row(&format!("CLM unavailable: {error:#}"), view),
         }
     }
 
@@ -629,6 +697,9 @@ impl SessionUi {
             // context utilization. The optional `all` argument is a deliberate TS delta (TS takes
             // none): past the row budget the default view collapses to the highest-usage agents;
             // `all` renders the whole tree.
+            "clm" => {
+                self.handle_clm_command(&resolved.args, view).await;
+            }
             "context" => {
                 let scope = match resolved.args.as_str() {
                     "" => info_commands::ContextTreeScope::Collapsed,
@@ -1020,5 +1091,366 @@ impl SessionUi {
                 None
             }
         }
+    }
+}
+
+fn parse_clm_restore(args: &str) -> Option<(&str, u64)> {
+    let mut parts = args.split_whitespace();
+    if parts.next()? != "restore" {
+        return None;
+    }
+    let (epoch, revision_text) = parts.next()?.split_once(':')?;
+    if parts.next().is_some()
+        || epoch.is_empty()
+        || revision_text.is_empty()
+        || !revision_text.bytes().all(|c| c.is_ascii_digit())
+    {
+        return None;
+    }
+    let revision = revision_text.parse::<u64>().ok()?;
+    (revision <= 9_007_199_254_740_991).then_some((epoch, revision))
+}
+
+fn safe_clm_text(value: &str) -> String {
+    value
+        .chars()
+        .filter(|c| !c.is_control() || *c == '\n')
+        .collect()
+}
+
+fn clm_field<'a>(data: &'a Value, key: &str) -> &'a str {
+    data.get(key).and_then(Value::as_str).unwrap_or("unknown")
+}
+
+fn clm_safe_integer(value: &Value) -> Option<u64> {
+    const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+    value
+        .as_u64()
+        .filter(|n| *n <= MAX_SAFE_INTEGER)
+        .or_else(|| {
+            let n = value.as_f64()?;
+            (n.is_finite() && n >= 0.0 && n <= MAX_SAFE_INTEGER as f64 && n.fract() == 0.0)
+                .then_some(n as u64)
+        })
+}
+
+fn format_clm_status(data: &Value) -> String {
+    let revision = match (
+        data.get("epochId").and_then(Value::as_str),
+        data.get("revision").and_then(Value::as_u64),
+    ) {
+        (Some(epoch), Some(revision)) => format!("{epoch}:{revision}"),
+        _ => "unknown".into(),
+    };
+    let recent = data
+        .get("recentRevisions")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    Some(format!(
+                        "{}:{}",
+                        item.get("epochId")?.as_str()?,
+                        item.get("revision")?.as_u64()?
+                    ))
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .filter(|items| !items.is_empty())
+        .unwrap_or_else(|| "none".into());
+    let occupancy = data.get("estimatedOccupancy").unwrap_or(&Value::Null);
+    let number = |key| {
+        occupancy
+            .get(key)
+            .and_then(clm_safe_integer)
+            .map_or_else(|| "unknown".into(), |n| n.to_string())
+    };
+    let usage = data.get("measuredUsage");
+    let observed = usage
+        .and_then(|u| {
+            Some(format!(
+                "{} input, {} output, {} cache read, {} cache write, ${}",
+                clm_safe_integer(u.get("input")?)?,
+                clm_safe_integer(u.get("output")?)?,
+                clm_safe_integer(u.get("cacheRead")?)?,
+                clm_safe_integer(u.get("cacheWrite")?)?,
+                u.get("cost")?
+                    .as_f64()
+                    .filter(|v| v.is_finite() && *v >= 0.0)?
+            ))
+        })
+        .unwrap_or_else(|| "unknown".into());
+    let mut lines = vec![
+        format!(
+            "CLM: {} (configured default: {}; source: {})",
+            clm_field(data, "mode"),
+            if data.get("configuredDefault").and_then(Value::as_bool) == Some(true) {
+                "on"
+            } else {
+                "off"
+            },
+            clm_field(data, "modeSource")
+        ),
+        format!("Accepted revision: {revision}"),
+        format!("Context file: {}", clm_field(data, "path")),
+        format!("Recent accepted revisions: {recent}"),
+        format!(
+            "Estimated occupancy: {} tokens",
+            number("estimatedInputTokens")
+        ),
+        format!(
+            "Estimated input budget: {} tokens",
+            number("maxInputTokens")
+        ),
+        format!(
+            "Estimated output reserve: {} tokens",
+            number("outputReserveTokens")
+        ),
+        format!("Observed billed usage (current revision): {observed}"),
+    ];
+    for (key, label) in [("warning", "Warning"), ("error", "Recovery error")] {
+        if let Some(value) = data.get(key).and_then(Value::as_str) {
+            lines.push(format!("{label}: {value}"));
+        }
+    }
+    safe_clm_text(&lines.join("\n"))
+}
+
+fn format_clm_view(data: &Value) -> String {
+    let mut lines = vec![format!(
+        "Accepted model context {}:{} (read-only)",
+        clm_field(data, "epochId"),
+        data.get("revision")
+            .and_then(Value::as_u64)
+            .map_or_else(|| "unknown".into(), |n| n.to_string())
+    )];
+    if let Some(messages) = data.get("messages").and_then(Value::as_array) {
+        for message in messages {
+            let content = match message.get("content") {
+                Some(Value::String(s)) => s.clone(),
+                Some(Value::Array(parts)) => parts
+                    .iter()
+                    .map(|part| match part.get("type").and_then(Value::as_str) {
+                        Some("text") => part
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
+                        Some("image") => format!("[image: {}]", clm_field(part, "mimeType")),
+                        _ => part.to_string(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                Some(other) => other.to_string(),
+                None => message.to_string(),
+            };
+            lines.push(format!("{}: {content}", clm_field(message, "role")));
+        }
+    }
+    safe_clm_text(&lines.join("\n\n"))
+}
+
+#[cfg(test)]
+mod clm_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn clm_restore_accepts_zero_and_rejects_invalid_targets() {
+        assert_eq!(parse_clm_restore("restore epoch:0"), Some(("epoch", 0)));
+        assert_eq!(parse_clm_restore("restore   epoch:000"), Some(("epoch", 0)));
+        for invalid in [
+            "restore :0",
+            "restore epoch:-1",
+            "restore epoch:1x",
+            "restore epoch:9007199254740992",
+            "restore epoch:1:2",
+        ] {
+            assert_eq!(parse_clm_restore(invalid), None, "{invalid}");
+        }
+    }
+
+    #[tokio::test]
+    async fn clm_renders_status_and_accepted_view_received_from_socket() {
+        use crate::daemon_client::DaemonClient;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::UnixListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("clm.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let measured_usage = pa_types::clm::ClmMeasuredUsage {
+            input: 2.0,
+            output: 3.0,
+            cache_read: 4.0,
+            cache_write: 5.0,
+            cost: 0.5,
+        };
+        let serialized_usage = serde_json::to_string(&measured_usage).unwrap();
+        assert!(
+            serialized_usage.contains("\"input\":2.0"),
+            "{serialized_usage}"
+        );
+        let status = json!({"configuredDefault":true,"mode":"on","modeSource":"configured-default",
+            "epochId":"accepted","revision":2,"path":"/tmp/synthetic/clm/context.txt",
+            "recentRevisions":[{"epochId":"accepted","revision":2}],
+            "estimatedOccupancy":{"estimatedInputTokens":10,"maxInputTokens":20,"outputReserveTokens":5},
+            "measuredUsage":measured_usage});
+        let snapshot = json!({"epochId":"accepted","revision":2,
+            "messages":[{"role":"user","content":"accepted\nline\u{1b}[31m"}],"estimatedTokens":10});
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = stream.into_split();
+            writer.write_all(format!("{}\n", json!({"type":"daemon_hello","protocol":{"name":"prime-agent.daemon","version":7},
+                "schemaRevision":32,"serverCapabilities":["clm_context_v1"]})).as_bytes()).await.unwrap();
+            let mut reader = BufReader::new(reader);
+            for (kind, data) in [
+                ("get_clm_status", status),
+                ("get_clm_model_snapshot", snapshot),
+            ] {
+                let mut line = String::new();
+                reader.read_line(&mut line).await.unwrap();
+                let envelope: Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(envelope["command"]["type"], kind);
+                writer
+                    .write_all(
+                        format!(
+                            "{}\n",
+                            json!({"type":"response","id":envelope["id"],
+                    "command":kind,"success":true,"data":data})
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+        let (client, _) = DaemonClient::connect(&socket).await.unwrap();
+        let status = client
+            .request_ok(DaemonCommand::GetClmStatus {
+                id: None,
+                active_session_id: "s1".into(),
+                rest: Map::default(),
+            })
+            .await
+            .unwrap();
+        let rendered_status = format_clm_status(&status);
+        assert!(rendered_status
+            .contains("CLM: on (configured default: on; source: configured-default)"));
+        assert!(rendered_status.contains("Accepted revision: accepted:2"));
+        assert!(rendered_status.contains("Estimated input budget: 20 tokens"));
+        assert!(rendered_status.contains("Observed billed usage (current revision): 2 input, 3 output, 4 cache read, 5 cache write, $0.5"), "{rendered_status}");
+        let view = client
+            .request_ok(DaemonCommand::GetClmModelSnapshot {
+                id: None,
+                active_session_id: "s1".into(),
+                rest: Map::default(),
+            })
+            .await
+            .unwrap();
+        let rendered_view = format_clm_view(&view);
+        assert!(rendered_view.contains("Accepted model context accepted:2 (read-only)"));
+        assert!(rendered_view.contains("user: accepted\nline"));
+        assert!(!rendered_view.contains('\u{1b}'));
+        server.await.unwrap();
+        client.close();
+    }
+
+    #[test]
+    fn clm_status_hides_unsafe_integer_estimates_and_billed_receipts() {
+        let maximum = 9_007_199_254_740_991_u64;
+        let valid = json!({"estimatedOccupancy":{"estimatedInputTokens":0,"maxInputTokens":maximum,"outputReserveTokens":0},
+            "measuredUsage":{"input":maximum,"output":0,"cacheRead":0,"cacheWrite":0,"cost":0.0}});
+        let text = format_clm_status(&valid);
+        assert!(text.contains(&format!("Estimated input budget: {maximum} tokens")));
+        assert!(text.contains("Estimated occupancy: 0 tokens"));
+        assert!(text.contains(&format!(
+            "Observed billed usage (current revision): {maximum} input"
+        )));
+        for field in [
+            "estimatedInputTokens",
+            "maxInputTokens",
+            "outputReserveTokens",
+        ] {
+            let mut invalid = valid.clone();
+            invalid["estimatedOccupancy"][field] = json!(maximum + 1);
+            assert!(
+                format_clm_status(&invalid).contains(&format!(
+                    "{}: unknown tokens",
+                    match field {
+                        "estimatedInputTokens" => "Estimated occupancy",
+                        "maxInputTokens" => "Estimated input budget",
+                        _ => "Estimated output reserve",
+                    }
+                )),
+                "{field}"
+            );
+        }
+        for field in ["input", "output", "cacheRead", "cacheWrite"] {
+            let mut invalid = valid.clone();
+            invalid["measuredUsage"][field] = json!(maximum + 1);
+            assert!(
+                format_clm_status(&invalid)
+                    .contains("Observed billed usage (current revision): unknown"),
+                "{field}"
+            );
+        }
+    }
+
+    #[test]
+    fn clm_status_accepts_integral_float_numbers_but_not_fractional_or_unsafe() {
+        let maximum = 9_007_199_254_740_991_u64;
+        for (number, expected) in [
+            (json!(0.0), "0".to_string()),
+            (json!(maximum as f64), maximum.to_string()),
+        ] {
+            let status = json!({"estimatedOccupancy":{"estimatedInputTokens":number},
+                "measuredUsage":{"input":number,"output":0.0,"cacheRead":0.0,"cacheWrite":0.0,"cost":0.0}});
+            let text = format_clm_status(&status);
+            assert!(
+                text.contains(&format!("Estimated occupancy: {expected} tokens")),
+                "{text}"
+            );
+            assert!(
+                text.contains(&format!(
+                    "Observed billed usage (current revision): {expected} input"
+                )),
+                "{text}"
+            );
+        }
+        for number in [json!(-1.0), json!(1.5), json!((maximum + 1) as f64)] {
+            let status = json!({"estimatedOccupancy":{"estimatedInputTokens":number},
+                "measuredUsage":{"input":number,"output":0.0,"cacheRead":0.0,"cacheWrite":0.0,"cost":0.0}});
+            let text = format_clm_status(&status);
+            assert!(
+                text.contains("Estimated occupancy: unknown tokens"),
+                "{text}"
+            );
+            assert!(
+                text.contains("Observed billed usage (current revision): unknown"),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn clm_status_and_view_render_accepted_context_without_terminal_controls() {
+        let status = json!({"mode":"on","configuredDefault":false,"modeSource":"session-override",
+            "epochId":"epoch","revision":2,"path":"/tmp/clm/context.txt",
+            "recentRevisions":[{"epochId":"epoch","revision":1}],
+            "estimatedOccupancy":{"estimatedInputTokens":100,"maxInputTokens":200,"outputReserveTokens":30},
+            "measuredUsage":{"input":11,"output":12,"cacheRead":13,"cacheWrite":14,"cost":0.5},
+            "warning":"warn\u{1b}[31m"});
+        let text = format_clm_status(&status);
+        assert!(text.contains("Accepted revision: epoch:2"));
+        assert!(text.contains("Observed billed usage (current revision): 11 input"));
+        assert!(!text.contains('\u{1b}'));
+        let view = json!({"epochId":"epoch","revision":2,"messages":[{"role":"user","content":"hello\u{1b}[31m"}]});
+        let text = format_clm_view(&view);
+        assert!(text.contains("Accepted model context epoch:2 (read-only)"));
+        assert!(text.contains("user: hello"));
+        assert!(!text.contains('\u{1b}'));
     }
 }

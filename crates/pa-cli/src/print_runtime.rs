@@ -505,6 +505,7 @@ pub(crate) struct ChildEngineOverrides {
     pub node: std::sync::Arc<crate::print_rlm::InlineSessionNode>,
     pub lane: ChildLane,
     pub thinking: pa_types::ai::ModelThinkingLevel,
+    pub inherited_clm_mode: bool,
     pub semantic_parent_session_id: Option<String>,
     pub spawned_by_request_id: Option<String>,
 }
@@ -527,6 +528,7 @@ pub(crate) struct HeadlessEmbeddingFields {
         Option<Arc<dyn pa_core::session_engine::rlm_host::RlmSubagentHost>>,
     pub(crate) extra_host_handlers: Option<pa_core::kernel::shared::HostRequestHandlers>,
     pub(crate) rlm_depth: Option<u32>,
+    pub(crate) inherited_clm_mode: Option<bool>,
     pub(crate) bash_wake: pa_core::session_engine::bash_notices::BashNoticeWake,
     /// The RPC mode's wake handle, carried onto the engine handle so the
     /// queue-pump listener parks on it; `None` outside the RPC embedding.
@@ -574,6 +576,10 @@ pub(crate) fn headless_embedding_fields(embedding: &HeadlessEmbedding) -> Headle
     HeadlessEmbeddingFields {
         rlm_subagent_host,
         extra_host_handlers,
+        inherited_clm_mode: match embedding {
+            HeadlessEmbedding::Child(overrides) => Some(overrides.inherited_clm_mode),
+            HeadlessEmbedding::Root { .. } | HeadlessEmbedding::Rpc => None,
+        },
         rlm_depth: match embedding {
             HeadlessEmbedding::Child(overrides) => Some(overrides.node.depth),
             HeadlessEmbedding::Root { .. } | HeadlessEmbedding::Rpc => None,
@@ -767,6 +773,7 @@ pub(crate) async fn build_headless_engine_with(
         rlm_subagent_host,
         extra_host_handlers,
         rlm_depth,
+        inherited_clm_mode,
         bash_wake,
         rpc_bash_wake,
         on_late_sent_agent_message,
@@ -804,6 +811,9 @@ pub(crate) async fn build_headless_engine_with(
     };
     let engine = pa_core::session_engine::engine::create_session(
         pa_core::session_engine::engine::SessionEngineConfig {
+            clm_journal: None,
+            clm_helper_receipt: None,
+            inherited_clm_mode,
             on_late_sent_agent_message,
             cron_store: None,
             semantic_edges,
@@ -1996,6 +2006,8 @@ mod tests {
         pa_core::mcp::McpManager::register_host_handlers(&manager, &mut handlers);
         let config = handlers.get("mcp.config").unwrap().clone();
         let result = config(pa_core::kernel::shared::HostRequestPayload {
+            verified_tool_call_id: None,
+            verified_tool_execution_identity: None,
             data: serde_json::json!({ "server": "fixture-echo" }),
         })
         .await
@@ -2029,6 +2041,8 @@ mod tests {
         .await
         .unwrap();
         let result = config(pa_core::kernel::shared::HostRequestPayload {
+            verified_tool_call_id: None,
+            verified_tool_execution_identity: None,
             data: serde_json::json!({ "server": "second-echo" }),
         })
         .await
@@ -2038,6 +2052,8 @@ mod tests {
             "the already-registered handler serves the live integrations"
         );
         let withdrawn = config(pa_core::kernel::shared::HostRequestPayload {
+            verified_tool_call_id: None,
+            verified_tool_execution_identity: None,
             data: serde_json::json!({ "server": "fixture-echo" }),
         })
         .await

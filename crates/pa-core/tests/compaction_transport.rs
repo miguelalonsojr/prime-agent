@@ -203,6 +203,7 @@ async fn branch_summary_respects_mandatory_thinking() {
     let result = generate_branch_summary(
         &entries,
         GenerateBranchSummaryOptions {
+            clm: None,
             model: &model,
             api_key: Some("synthetic-key".into()),
             custom_instructions: None,

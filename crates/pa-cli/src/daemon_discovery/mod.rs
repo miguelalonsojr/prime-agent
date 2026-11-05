@@ -748,7 +748,14 @@ mod tests {
             ..ProbeResult::default()
         };
         assert_eq!(classify_reachable(&current), DaemonStatus::Current);
-        for revision in [Some(32), Some(31), Some(30), None] {
+        let current_revision = pa_types::daemon::DAEMON_SCHEMA_REVISION;
+        let newer_revision = current_revision + 1;
+        for revision in [
+            Some(newer_revision),
+            Some(current_revision),
+            Some(current_revision - 1),
+            None,
+        ] {
             let probe = ProbeResult {
                 schema_id: Some("unknown-schema".to_string()),
                 schema_revision: revision,
@@ -760,7 +767,7 @@ mod tests {
             };
             assert_eq!(
                 classify_reachable(&probe),
-                if revision == Some(32) {
+                if revision == Some(newer_revision) {
                     DaemonStatus::Current
                 } else {
                     DaemonStatus::Stale
@@ -771,7 +778,7 @@ mod tests {
         assert_eq!(
             classify_reachable(&ProbeResult {
                 version: Some("other".to_string()),
-                schema_revision: Some(32),
+                schema_revision: Some(newer_revision),
                 ..ProbeResult {
                     protocol_version: current.protocol_version,
                     ..ProbeResult::default()
@@ -782,7 +789,7 @@ mod tests {
         assert_eq!(
             classify_reachable(&ProbeResult {
                 protocol_version: Some(6),
-                schema_revision: Some(32),
+                schema_revision: Some(newer_revision),
                 ..ProbeResult {
                     version: current.version,
                     ..ProbeResult::default()

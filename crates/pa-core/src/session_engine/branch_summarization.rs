@@ -292,6 +292,7 @@ pub fn finalize_branch_summary(
 
 /// Options for one branch-summary generation run.
 pub struct GenerateBranchSummaryOptions<'a> {
+    pub clm: Option<&'a std::sync::Arc<super::clm::ClmRuntime>>,
     pub model: &'a pa_types::ai::Model,
     pub api_key: Option<String>,
     pub custom_instructions: Option<&'a str>,
@@ -356,6 +357,7 @@ pub async fn generate_branch_summary(
     options: GenerateBranchSummaryOptions<'_>,
 ) -> BranchSummaryResult {
     let GenerateBranchSummaryOptions {
+        clm,
         model,
         api_key,
         custom_instructions,
@@ -470,6 +472,22 @@ pub async fn generate_branch_summary(
             ..Default::default()
         });
     stream_options.reasoning = pa_types::ai::minimum_reasoning(model);
+    let on_observed_response = match clm {
+        Some(runtime) => {
+            let mut target = model.clone();
+            target.max_tokens = BRANCH_SUMMARY_MAX_TOKENS;
+            match runtime.on_observed_response(&target, &context).await {
+                Ok(observed) => Some(observed),
+                Err(error) => {
+                    return BranchSummaryResult {
+                        error: Some(format!("{error:#}")),
+                        ..Default::default()
+                    }
+                }
+            }
+        }
+        None => None,
+    };
     let response = match pa_ai::complete_simple(model, &context, Some(stream_options)).await {
         Ok(response) => response,
         Err(error) => {
@@ -479,6 +497,14 @@ pub async fn generate_branch_summary(
             };
         }
     };
+    if let Some(observed) = on_observed_response {
+        if let Err(error) = observed(response.clone()).await {
+            return BranchSummaryResult {
+                error: Some(format!("{error:#}")),
+                ..Default::default()
+            };
+        }
+    }
     if response.stop_reason == pa_types::ai::StopReason::Aborted {
         return BranchSummaryResult {
             aborted: true,
@@ -729,6 +755,7 @@ mod tests {
         let result = generate_branch_summary(
             &entries,
             GenerateBranchSummaryOptions {
+                clm: None,
                 model: &model,
                 api_key: None,
                 custom_instructions: Some("focus on x"),
@@ -762,6 +789,7 @@ mod tests {
         let result = generate_branch_summary(
             &[],
             GenerateBranchSummaryOptions {
+                clm: None,
                 model: &model,
                 api_key: None,
                 custom_instructions: None,
@@ -833,6 +861,7 @@ mod tests {
             let result = generate_branch_summary(
                 &entries,
                 GenerateBranchSummaryOptions {
+                    clm: None,
                     model: &model,
                     api_key: None,
                     custom_instructions: None,

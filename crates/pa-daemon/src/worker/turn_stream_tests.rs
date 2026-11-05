@@ -18,6 +18,8 @@ mod queue;
 /// A minimal turn runner over a fresh session core: exactly what `run_turn` touches.
 fn burst_runner(engine: Arc<dyn SessionEngine>) -> TurnRunner {
     let core = Arc::new(Mutex::new(SessionCore {
+        clm_protected: std::collections::BTreeMap::default(),
+        clm_persistence_error: None,
         active_session_id: "burst-session".to_string(),
         generation: "gen".to_string(),
         last_event_sequence: 0,

@@ -112,6 +112,9 @@ impl SessionManager {
         }
         let mut manager = Self {
             session_id: String::new(),
+            clm_generation: uuid::Uuid::new_v4().to_string(),
+            clm_default_eligible: false,
+            clm_error: None,
             session_file: None,
             session_dir,
             cwd,
@@ -127,6 +130,7 @@ impl SessionManager {
             label_timestamps_by_id: HashMap::new(),
             leaf_id: None,
             admitted_user_rows: std::collections::VecDeque::new(),
+            authoritative_assistant_usage: HashMap::new(),
             persist_listeners: Vec::new(),
         };
         match session_file {
@@ -201,6 +205,12 @@ impl SessionManager {
         }
         // Read-only: repairing would REWRITE the source (dropping a torn row
         // mid-append); the copy skips a torn tail like TS `loadEntriesFromFile`.
+        if let Ok(bytes) = std::fs::read(source_path) {
+            if super::super::clm::contains_clm_records(&bytes) {
+                super::super::clm::parse_session_entries_checked(&bytes)
+                    .map_err(|e| e.to_string())?;
+            }
+        }
         let mut entries = load_entries_from_file(source_path, false);
         if entries.is_empty() {
             return Err(format!(
@@ -280,6 +290,8 @@ impl SessionManager {
     /// manager: rows go straight to disk, never deferred behind the
     /// bootstrap rule.
     pub fn adopt_window(&mut self, mut window: super::window::WindowedSessionStore) {
+        self.clm_default_eligible = false;
+        self.authoritative_assistant_usage.clear();
         self.admitted_user_rows.clear();
         // One-copy adoption: the parsed trees move in (no `to_vec` clone); the
         // window stays attached for its snapshot/settings/metadata state, and
@@ -310,7 +322,19 @@ impl SessionManager {
         session_file: PathBuf,
         preloaded_entries: Option<Vec<FileEntry>>,
     ) {
+        self.clm_default_eligible = false;
+        self.authoritative_assistant_usage.clear();
         self.window = None;
+        self.clm_generation = uuid::Uuid::new_v4().to_string();
+        self.clm_error = std::fs::read(&session_file).ok().and_then(|bytes| {
+            super::super::clm::contains_clm_records(&bytes)
+                .then(|| {
+                    super::super::clm::parse_session_entries_checked(&bytes)
+                        .err()
+                        .map(|e| e.to_string())
+                })
+                .flatten()
+        });
         self.session_file = Some(session_file);
         if self.session_file.as_ref().is_some_and(|path| path.exists()) {
             let path = self.session_file.clone().unwrap();
@@ -318,10 +342,11 @@ impl SessionManager {
                 preloaded_entries.unwrap_or_else(|| load_entries_from_file(&path, self.persist));
             self.refresh_has_assistant_entry(&entries);
 
-            if entries.is_empty() {
+            if entries.is_empty() && self.clm_error.is_none() {
                 let explicit_path = path;
                 self.new_session(&NewSessionOptions::default());
                 self.session_file = Some(explicit_path);
+                self.clm_default_eligible = false;
                 self.rewrite_file();
                 self.flushed = true;
                 return;
@@ -332,16 +357,21 @@ impl SessionManager {
             });
             self.session_id = header_id.unwrap_or_else(create_session_id);
 
-            let mut should_rewrite = migrate_to_current_version(&mut entries);
-            if let Some(FileEntry::Header { header }) = entries.first_mut() {
-                if header.parent_session.is_some() && !is_valid_rlm_depth(header.rlm_depth) {
-                    let depth = resolve_session_rlm_depth(header, &path);
-                    header.rlm_depth = Some(depth);
-                    should_rewrite = true;
+            // CLM headers and audit rows stay as recorded, including absent depth.
+            // Mutating only the in-memory header would also break journal comparison.
+            let mut should_rewrite = false;
+            if self.clm_error.is_none() && !entries.iter().any(super::super::clm::is_clm_entry) {
+                should_rewrite = migrate_to_current_version(&mut entries);
+                if let Some(FileEntry::Header { header }) = entries.first_mut() {
+                    if header.parent_session.is_some() && !is_valid_rlm_depth(header.rlm_depth) {
+                        let depth = resolve_session_rlm_depth(header, &path);
+                        header.rlm_depth = Some(depth);
+                        should_rewrite = true;
+                    }
                 }
             }
             self.file_entries = entries;
-            if should_rewrite {
+            if should_rewrite && self.clm_error.is_none() {
                 self.rewrite_file();
             }
             self.build_index();
@@ -383,6 +413,9 @@ impl SessionManager {
             }
         }
 
+        self.clm_generation = uuid::Uuid::new_v4().to_string();
+        self.clm_error = None;
+        self.clm_default_eligible = true;
         self.session_id = session_id;
         let timestamp = format_iso_now();
         let git = self
@@ -410,6 +443,7 @@ impl SessionManager {
             },
         };
         self.file_entries = vec![header];
+        self.authoritative_assistant_usage.clear();
         self.admitted_user_rows.clear();
         self.window = None;
         self.has_assistant_entry = false;
@@ -423,6 +457,21 @@ impl SessionManager {
         }
         session_file
     }
+    /// Defaults apply once to a new, unseeded session, never to loaded history.
+    pub fn consume_clm_default_eligibility(&mut self) -> bool {
+        let eligible = std::mem::replace(&mut self.clm_default_eligible, false);
+        eligible
+            && self.file_entries.iter().all(|entry| {
+                matches!(
+                    entry,
+                    FileEntry::Header { .. }
+                        | FileEntry::ModelChange { .. }
+                        | FileEntry::ThinkingLevelChange { .. }
+                        | FileEntry::ServiceTierChange { .. }
+                )
+            })
+    }
+
     /// Materialize an in-memory session into a persisted file.
     ///
     /// # Panics
@@ -471,6 +520,7 @@ impl SessionManager {
                 rest: pa_types::JsonMap::new(),
             },
         };
+        self.authoritative_assistant_usage.clear();
         let rest = std::mem::take(&mut self.file_entries);
         let has_assistant = rest.iter().any(|entry| {
             matches!(
@@ -492,6 +542,8 @@ impl SessionManager {
     /// replaces every entry with the given chain, and re-indexes so the leaf
     /// is the last adopted entry. In-memory only — the caller owns persistence.
     pub fn adopt_entries(&mut self, entries: Vec<FileEntry>) {
+        self.clm_default_eligible = false;
+        self.authoritative_assistant_usage.clear();
         self.admitted_user_rows.clear();
         // The caller supplies the complete selected branch after explicit navigation.
         self.window = None;

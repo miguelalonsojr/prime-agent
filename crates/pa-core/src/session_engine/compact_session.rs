@@ -8,9 +8,9 @@ use super::compaction::{estimate_context_tokens, find_cut_point, CutPointResult}
 use super::compaction_exec;
 use super::compaction_exec::{
     add_assistant_usage, build_summarization_request, build_turn_prefix_request,
-    compaction_entry_for, complete_summary_call, details_for, file_ops_block, split_summary,
-    summed_usage, CompactionDetails, CompactionResult, SummaryDeltaSink, SummarySlice,
-    NO_PRIOR_HISTORY,
+    compaction_entry_for, complete_summary_call_observed, details_for, file_ops_block,
+    split_summary, summed_usage, CompactionDetails, CompactionResult, SummaryDeltaSink,
+    SummarySlice, NO_PRIOR_HISTORY,
 };
 use super::compaction_utils;
 use crate::session::manager::SessionManager;
@@ -28,6 +28,7 @@ mod recent_state_anchor;
 
 // The re-exports keep every `compact_session::` path stable.
 mod prepare;
+pub(crate) use prepare::model_compaction_entries;
 pub use prepare::{compute_cut, prepare_compaction, CompactSkip, CompactionPreparation};
 
 #[cfg(test)]
@@ -36,6 +37,7 @@ use super::{compaction, harness_digest, messages, session_message_to_loop};
 mod tests;
 
 pub struct CompactOptions<'a> {
+    pub clm: Option<&'a std::sync::Arc<super::clm::ClmRuntime>>,
     pub model: pa_types::ai::Model,
     /// Resolved API key (None falls back to provider env resolution).
     pub api_key: Option<String>,
@@ -99,9 +101,12 @@ fn message_from_entry(entry: &FileEntry) -> Option<AgentMessage> {
 /// The pre-compaction context estimate recorded as `tokensBefore`: the last
 /// non-error/aborted assistant usage plus a chars/4 estimate of the messages
 /// that trail it — error and aborted usage is not a real measurement.
-fn context_tokens(entries: &[FileEntry], leaf_id: Option<&str>) -> u64 {
-    let context = crate::session::build_session_context(entries, leaf_id);
-    estimate_context_tokens(&context.messages).tokens
+fn context_tokens(
+    entries: &[FileEntry],
+    leaf_id: Option<&str>,
+) -> Result<u64, crate::clm::ClmError> {
+    let context = crate::session::clm::build_session_context_checked(entries, leaf_id)?;
+    Ok(estimate_context_tokens(&context.messages).tokens)
 }
 
 /// One completed compaction run: the result plus the entry to persist.
@@ -141,6 +146,38 @@ pub(crate) struct CompactionAttempt {
     semantic_compaction: Option<super::semantic_edges::SemanticCompaction>,
 }
 
+pub(crate) enum PrepareError {
+    Skipped(CompactSkip),
+    InvalidContext(crate::clm::ClmError),
+}
+
+pub(crate) fn prepare_session_compaction(
+    session: &SessionManager,
+    keep_recent_tokens: u64,
+) -> Result<(Vec<FileEntry>, CompactionPreparation), PrepareError> {
+    let entries = model_compaction_entries(session).map_err(PrepareError::InvalidContext)?;
+    let preparation =
+        prepare_compaction(&entries, keep_recent_tokens).map_err(PrepareError::Skipped)?;
+    let first_kept_entry = entries
+        .get(preparation.cut.first_kept_entry_index)
+        .and_then(FileEntry::id)
+        .unwrap_or_default();
+    if session
+        .retained_entries()
+        .iter()
+        .any(crate::session::clm::is_clm_entry)
+        && !session
+            .retained_entries()
+            .iter()
+            .any(|entry| entry.id() == Some(first_kept_entry))
+    {
+        return Err(PrepareError::InvalidContext(crate::clm::ClmError::Journal(
+            "CLM compaction requires a durable retained-tail entry; retain newer audit messages first".into(),
+        )));
+    }
+    Ok((entries, preparation))
+}
+
 pub(crate) struct PreparedCompaction {
     pub(crate) result: CompactionResult,
     pub(crate) entry: pa_types::session::CompactionEntry,
@@ -152,16 +189,14 @@ pub(crate) struct PreparedCompaction {
 pub(crate) fn prepare_attempt(
     session: &SessionManager,
     options: &CompactOptions<'_>,
-) -> Result<CompactionAttempt, CompactSkip> {
-    let entries = session.retained_entries().to_vec();
+) -> Result<CompactionAttempt, PrepareError> {
+    let context = session
+        .active_context_checked()
+        .map_err(PrepareError::InvalidContext)?;
+    let tokens_before = estimate_context_tokens(&context.messages).tokens;
+    let (entries, preparation) =
+        prepare_session_compaction(session, options.settings.keep_recent_tokens)?;
     let prefix_leaf = session.get_leaf_id().map(str::to_string);
-    let preparation = prepare_compaction(&entries, options.settings.keep_recent_tokens)?;
-    // TS `beginCompaction` after the preparation resolved: a skipped
-    // compaction makes no events (the begin comes after the skip throw).
-    let semantic_compaction = options
-        .semantic_edges
-        .as_ref()
-        .map(|recorder| recorder.begin_compaction(options.abort));
     let cut = preparation.cut;
     let previous_summary = preparation.previous_summary;
     let recent_state_anchor = preparation.recent_state_anchor;
@@ -170,6 +205,13 @@ pub(crate) fn prepare_attempt(
         .and_then(|entry| entry.id())
         .unwrap_or_default()
         .to_string();
+
+    // TS `beginCompaction` after the preparation resolved: a skipped
+    // compaction makes no events (the begin comes after the skip throw).
+    let semantic_compaction = options
+        .semantic_edges
+        .as_ref()
+        .map(|recorder| recorder.begin_compaction(options.abort));
 
     // The summarizer sees the conversation since the prior compaction's
     // retained boundary, plus the prefix of a split turn.
@@ -196,7 +238,6 @@ pub(crate) fn prepare_attempt(
             "turnPrefixMessages": turn_prefix_messages.len(),
         }),
     );
-    let tokens_before = context_tokens(&entries, session.get_leaf_id());
     super::compaction_trace::trace(
         "compact.tokens_before_computed",
         &serde_json::json!({ "tokensBefore": tokens_before }),
@@ -251,10 +292,11 @@ async fn summary_call_with_retry(
     mut request: Vec<AgentMessage>,
     on_delta: Option<SummaryDeltaSink>,
     failure: &'static str,
+    clm: Option<&std::sync::Arc<super::clm::ClmRuntime>>,
 ) -> anyhow::Result<SummarySlice> {
     let first =
         super::semantic_edges::summary_slice_call(compaction, summary_headers.clone(), |headers| {
-            complete_summary_call(
+            complete_summary_call_observed(
                 model,
                 session_id,
                 api_key.clone(),
@@ -263,6 +305,7 @@ async fn summary_call_with_retry(
                 request.clone(),
                 on_delta.clone(),
                 failure,
+                clm,
             )
         })
         .await?;
@@ -282,8 +325,8 @@ async fn summary_call_with_retry(
         }
     }
     let retry = super::semantic_edges::summary_slice_call(compaction, summary_headers, |headers| {
-        complete_summary_call(
-            model, session_id, api_key, headers, max_tokens, request, None, failure,
+        complete_summary_call_observed(
+            model, session_id, api_key, headers, max_tokens, request, None, failure, clm,
         )
     })
     .await?;
@@ -408,6 +451,7 @@ pub(crate) async fn summarize_attempt(
             request,
             options.summary_delta.clone(),
             "Summarization failed",
+            options.clm,
         )
         .await
     };
@@ -432,6 +476,7 @@ pub(crate) async fn summarize_attempt(
             request,
             None,
             "Turn prefix summarization failed",
+            options.clm,
         )
         .await?;
         Ok(Some(slice))
@@ -563,7 +608,28 @@ pub(crate) fn commit_attempt(
 
 /// Rebuild the live agent context after compaction. Keep session-only roles
 /// (especially the compaction boundary) until the provider conversion seam.
-#[must_use]
-pub fn rebuilt_context_after_compaction(session: &SessionManager) -> Vec<AgentMessage> {
-    session.active_context().messages
+/// # Errors
+/// Rejects invalid accepted context rather than falling back to audit rows.
+pub fn rebuilt_context_after_compaction(
+    session: &SessionManager,
+) -> Result<Vec<AgentMessage>, crate::clm::ClmError> {
+    Ok(session.active_context_checked()?.messages)
+}
+
+#[cfg(test)]
+#[test]
+fn clm_compaction_estimate_propagates_invalid_context_instead_of_panicking() {
+    let row: pa_types::session::FileEntry = serde_json::from_value(serde_json::json!({
+        "type":"clm_on","id":"bad","epochId":"e","revision":0,
+        "snapshot":{"blocks":[]},"auditWatermark":"missing"
+    }))
+    .unwrap();
+    let result = std::panic::catch_unwind(|| {
+        crate::session_engine::compact_session::context_tokens(&[row], Some("bad"))
+    });
+    assert!(
+        result.is_ok(),
+        "model-context errors must return to the caller"
+    );
+    assert!(result.unwrap().is_err());
 }

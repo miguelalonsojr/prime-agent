@@ -24,6 +24,13 @@ impl AgentSession {
     /// the live loop context over the model's context window against the
     /// effective threshold; usage before the latest compaction never re-triggers.
     pub async fn auto_compaction_due(&self, model: &pa_types::ai::Model) -> bool {
+        if self
+            .clm
+            .as_ref()
+            .is_some_and(|runtime| runtime.enabled() || runtime.check_failure().is_err())
+        {
+            return false;
+        }
         let state = self.agent.state().await;
         // The live loop context is the agent's message list (the same
         // JSON round-trip `compact` uses).
@@ -164,6 +171,9 @@ impl AgentSession {
         api_key: Option<String>,
         abort: Option<&pa_agent::abort::AbortSignal>,
     ) -> anyhow::Result<CompactOutcome> {
+        if let Some(runtime) = &self.clm {
+            runtime.assert_operation_allowed("compaction")?;
+        }
         compaction_trace::trace(
             "compact.enter",
             &serde_json::json!({
@@ -177,6 +187,7 @@ impl AgentSession {
             .expect("compaction summary sink lock")
             .clone();
         let options = crate::session_engine::compact_session::CompactOptions {
+            clm: self.clm.as_ref(),
             model: model.clone(),
             api_key,
             custom_instructions,
@@ -205,7 +216,7 @@ impl AgentSession {
         }
         let rebuilt = {
             let session = self.session.lock().await;
-            crate::session_engine::compact_session::rebuilt_context_after_compaction(&session)
+            crate::session_engine::compact_session::rebuilt_context_after_compaction(&session)?
         };
         let loop_messages: Vec<AgentMessage> = rebuilt_loop_messages(rebuilt);
         let rebuilt_message_count = loop_messages.len();
@@ -250,11 +261,24 @@ impl AgentSession {
         /// the compaction fails instead of re-summarizing forever.
         const MAX_COMPACTION_ATTEMPTS: usize = 3;
         for _ in 0..MAX_COMPACTION_ATTEMPTS {
+            if self.external_persistence {
+                if let Some(runtime) = &self.clm {
+                    // External ownership suppresses local event writes. Adopt the ACK
+                    // before PREPARE can skip on a stale mirror, without its lock held.
+                    runtime.check_failure()?;
+                    runtime.status(false).await?;
+                }
+            }
             let mut attempt = {
                 let session = self.session.lock().await;
                 match crate::session_engine::compact_session::prepare_attempt(&session, options) {
                     Ok(attempt) => attempt,
-                    Err(skip) => return Ok(CompactOutcome::Skipped(skip.user_message())),
+                    Err(super::compact_session::PrepareError::Skipped(skip)) => {
+                        return Ok(CompactOutcome::Skipped(skip.user_message()))
+                    }
+                    Err(super::compact_session::PrepareError::InvalidContext(error)) => {
+                        return Err(error.into())
+                    }
                 }
             };
             // The digest ranks the branch THIS attempt summarizes: a
@@ -270,6 +294,7 @@ impl AgentSession {
             let digest_inputs = self.harness_digest_inputs().await;
             compaction_trace::trace("compact.digest_captured", &serde_json::Value::Null);
             let attempt_options = crate::session_engine::compact_session::CompactOptions {
+                clm: options.clm,
                 model: options.model.clone(),
                 api_key: options.api_key.clone(),
                 custom_instructions: options.custom_instructions,
@@ -374,7 +399,7 @@ impl AgentSession {
         let rebuilt = {
             let mut session = self.session.lock().await;
             session.adopt_entries(branch_entries);
-            crate::session_engine::compact_session::rebuilt_context_after_compaction(&session)
+            crate::session_engine::compact_session::rebuilt_context_after_compaction(&session)?
         };
         self.agent
             .set_messages(rebuilt_loop_messages(rebuilt))
@@ -423,27 +448,15 @@ impl AgentSession {
         // not interleave with a replace (duplicating in the rebuilt view
         // or vanishing under it).
         let _flight = self.compaction_flight.lock().await;
-        // The transcript's consumed artifacts are extracted under this first
-        // lock straight from the retained rows: no second clone of the rows.
         let parts = self.session.lock().await.refine_transcript_parts();
         let crate::session::manager::RefineTranscriptParts {
-            messages,
-            refinement_history,
+            refinement_history, ..
         } = parts.await?;
-        let (result, context_row_ids) = {
-            let mut session = self.session.lock().await;
-            // The factory opt-in resolves at apply time, not here: the
-            // agent dir (the same settings.json the kernel-side factory
-            // gate reads) rides down to the refinement, which re-reads
-            // `factory.enabled` immediately before applying the plan, off
-            // the async worker (`spawn_blocking`). The arm performs no
-            // synchronous settings read while holding this session lock,
-            // and the long planning request can no longer leave the gate
-            // deciding on a snapshot the request made stale. A session
-            // without a wired agent dir keeps the fail-closed disabled
-            // default.
-            refine::execute_refinement_with_rows(
-                &mut session,
+        let messages = self.session.lock().await.active_context_checked()?.messages;
+        let planning = {
+            let session = self.session.lock().await;
+            refine::plan_session_refinement(
+                &session,
                 refine::RefinementTranscript {
                     messages: &messages,
                     refinement_history: &refinement_history,
@@ -451,8 +464,18 @@ impl AgentSession {
                 &global_harness_dir,
                 model,
                 options,
-                source,
                 refine_call,
+                self.agent_dir.as_deref(),
+            )
+        };
+        let planned = planning.await?;
+        let (result, context_row_ids) = {
+            let mut session = self.session.lock().await;
+            refine::apply_session_refinement(
+                &mut session,
+                planned,
+                &global_harness_dir,
+                source,
                 self.agent_dir.as_deref(),
             )
             .await?

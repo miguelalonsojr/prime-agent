@@ -737,6 +737,9 @@ impl RlmSubagentHost for InlineHost {
                 let thinking = pa_ai::models::clamp_thinking_level(&model, thinking);
                 (selector, ChildLane::Real(Box::new(model)), thinking)
             };
+            if let Some(admission) = &request.clm_admission {
+                admission.recheck().await?;
+            }
             // The child's session: its own directory under the parent's
             // artifacts tree; a persisted parent gives the child its own file
             // with the parent edge, a no-session parent keeps the child in
@@ -794,6 +797,10 @@ impl RlmSubagentHost for InlineHost {
                 node: Arc::clone(&child_node),
                 lane,
                 thinking,
+                inherited_clm_mode: request
+                    .clm_admission
+                    .as_ref()
+                    .is_some_and(pa_core::session_engine::clm::ClmChildAdmission::inherited_mode),
                 semantic_parent_session_id: Some(node.session_id.clone()),
                 spawned_by_request_id: request.spawned_by_request_id.clone(),
             };
@@ -832,6 +839,13 @@ impl RlmSubagentHost for InlineHost {
                 drop(children);
                 engine.dispose_kernel().await;
                 anyhow::bail!("Cannot spawn from a disposed inline session");
+            }
+            if let Some(admission) = &request.clm_admission {
+                if let Err(error) = admission.recheck().await {
+                    drop(children);
+                    engine.dispose_kernel().await;
+                    return Err(error);
+                }
             }
             children.push(Arc::clone(&child));
             drop(children);
@@ -1233,6 +1247,8 @@ impl AgentMessageController for InlineMessages {
 mod tests {
     use super::*;
 
+    static FAUX_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     fn run_options(directory: &std::path::Path) -> crate::mode::RunOptions {
         crate::mode::RunOptions {
             app_mode: crate::mode::AppMode::Print,
@@ -1253,6 +1269,183 @@ mod tests {
             agents_view_requested: false,
             attach_agent: None,
         }
+    }
+
+    #[tokio::test]
+    async fn clm_inline_children_keep_saved_mode_and_separate_artifacts() {
+        let _faux = FAUX_TEST_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let options = run_options(dir.path());
+        std::fs::create_dir_all(&options.config.agent_dir).unwrap();
+        std::fs::write(
+            options.config.agent_dir.join("settings.json"),
+            r#"{"clm":{"enabled":true},"compaction":{"enabled":false}}"#,
+        )
+        .unwrap();
+        let script = json!({"responses":["parent"],"children":{
+            "off":{"responses":["off child"]},"on":{"responses":["on child"]},"blocked":{"responses":["must not run"]}
+        }});
+        let manager = pa_core::session::manager::SessionManager::persisted(
+            dir.path(),
+            &dir.path().join("parent"),
+        );
+        let mut node = root_node(&options, &manager, Some(script.clone()));
+        Arc::get_mut(&mut node).unwrap().max_depth = 2;
+        let built = crate::print_runtime::build_engine(
+            &options,
+            Some(&script),
+            Some(manager),
+            "print",
+            &HeadlessEmbedding::Root { node: node.clone() },
+        )
+        .await
+        .unwrap();
+        let engine = Arc::new(built.engine);
+        adopt_built_engine(&node, &engine, &built.model).await;
+        let runtime = engine.session.clm.as_ref().unwrap();
+        runtime
+            .set_mode(false, pa_types::clm::ClmModeSource::SessionOverride)
+            .await
+            .unwrap();
+        let saved_off = runtime.admit_child(None, None).await.unwrap();
+        runtime
+            .set_mode(true, pa_types::clm::ClmModeSource::SessionOverride)
+            .await
+            .unwrap();
+        let request = |name: &str, admission| RlmSpawnRequest {
+            prompt: "child task".into(),
+            name: Some(name.into()),
+            model: None,
+            thinking: None,
+            spawned_by_request_id: None,
+            clm_admission: Some(admission),
+        };
+        InlineHost(node.clone())
+            .spawn(request("off", saved_off))
+            .await
+            .unwrap();
+        let saved_on = runtime.admit_child(None, None).await.unwrap();
+        InlineHost(node.clone())
+            .spawn(request("on", saved_on.clone()))
+            .await
+            .unwrap();
+        let children = node.children.lock().await.clone();
+        assert_eq!(children.len(), 2);
+        let off = children[0].engine.session.clm.as_ref().unwrap();
+        let on = children[1].engine.session.clm.as_ref().unwrap();
+        assert!(
+            !off.enabled(),
+            "child keeps the originally saved false despite later parent on"
+        );
+        assert!(on.enabled());
+        let parent_status = runtime.status(true).await.unwrap();
+        let child_status = on.status(true).await.unwrap();
+        assert_ne!(parent_status.epoch_id, child_status.epoch_id);
+        assert_ne!(parent_status.path, child_status.path);
+        assert!(std::path::Path::new(&child_status.path).exists());
+        assert_eq!(
+            child_status.mode_source,
+            pa_types::clm::ClmStatusSource::InheritedChild
+        );
+        runtime
+            .set_mode(false, pa_types::clm::ClmModeSource::SessionOverride)
+            .await
+            .unwrap();
+        assert!(on.enabled());
+        runtime.fail(&"parent invalidated before inline admission");
+        let rejected = InlineHost(node.clone())
+            .spawn(request("blocked", saved_on))
+            .await;
+        assert!(rejected.is_err());
+        assert_eq!(node.children.lock().await.len(), 2);
+        dispose_inline_subagents(&node).await;
+        engine.dispose_kernel().await;
+    }
+
+    #[tokio::test]
+    async fn clm_public_python_spawn_builds_isolated_on_child_artifacts() {
+        let _faux = FAUX_TEST_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let options = run_options(dir.path());
+        std::fs::create_dir_all(&options.config.agent_dir).unwrap();
+        std::fs::write(
+            options.config.agent_dir.join("settings.json"),
+            r#"{"clm":{"enabled":true},"compaction":{"enabled":false}}"#,
+        )
+        .unwrap();
+        let script = json!({"responses":[
+            {"content":[{"type":"toolCall","id":"public-spawn","name":"python_repl","arguments":{"code":"child = await rlm.spawn('Say child done', name='proof-child')\nprint(child)"}}]},
+            "parent done"
+        ],"children":{"proof-child":{"responses":["child done"]}}});
+        let manager = pa_core::session::manager::SessionManager::persisted(
+            dir.path(),
+            &dir.path().join("parent"),
+        );
+        let mut node = root_node(&options, &manager, Some(script.clone()));
+        Arc::get_mut(&mut node).unwrap().max_depth = 2;
+        let built = crate::print_runtime::build_engine(
+            &options,
+            Some(&script),
+            Some(manager),
+            "print",
+            &HeadlessEmbedding::Root { node: node.clone() },
+        )
+        .await
+        .unwrap();
+        let engine = Arc::new(built.engine);
+        adopt_built_engine(&node, &engine, &built.model).await;
+        engine
+            .prompt(
+                "Spawn the child using Python",
+                pa_core::session_engine::PromptOptions::default(),
+            )
+            .await
+            .unwrap();
+        let children = node.children.lock().await.clone();
+        assert_eq!(
+            children.len(),
+            1,
+            "public Python spawn must reach actual inline child construction: {:?}",
+            engine.session.entries().await
+        );
+        let child = &children[0];
+        let results = InlineHost(node.clone())
+            .collect(vec![child.rlm_child_id.clone()], 60_000)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].status, "done", "{results:?}");
+        let parent = engine
+            .session
+            .clm
+            .as_ref()
+            .unwrap()
+            .status(true)
+            .await
+            .unwrap();
+        let child_status = child
+            .engine
+            .session
+            .clm
+            .as_ref()
+            .unwrap()
+            .status(true)
+            .await
+            .unwrap();
+        assert_eq!(child_status.mode, pa_types::clm::ClmMode::On);
+        assert_eq!(
+            child_status.mode_source,
+            pa_types::clm::ClmStatusSource::InheritedChild
+        );
+        assert_ne!(parent.epoch_id, child_status.epoch_id);
+        assert_ne!(parent.path, child_status.path);
+        assert!(std::path::Path::new(&parent.path).is_file());
+        assert!(std::path::Path::new(&child_status.path).is_file());
+        assert!(child.engine.session.entries().await.iter().any(|row|matches!(row,
+            pa_types::session::FileEntry::Custom {payload,..} if payload.custom_type=="clm_usage_v1"
+        )));
+        dispose_inline_subagents(&node).await;
+        engine.dispose_kernel().await;
     }
 
     #[tokio::test]
@@ -1277,6 +1470,7 @@ mod tests {
             model: None,
             thinking: None,
             spawned_by_request_id: None,
+            clm_admission: None,
         });
         std::future::poll_fn(|context| {
             assert!(spawn.as_mut().poll(context).is_pending());
@@ -1451,6 +1645,7 @@ mod tests {
 
     #[tokio::test]
     async fn late_receipts_record_through_the_print_path_apply_on_landing() {
+        let _faux = FAUX_TEST_LOCK.lock().await;
         let directory = tempfile::tempdir().unwrap();
         let options = run_options(directory.path());
         std::fs::create_dir_all(&options.config.agent_dir).unwrap();
@@ -1533,6 +1728,7 @@ mod tests {
 
     #[tokio::test]
     async fn delivery_to_a_disposed_session_rejects_without_queuing() {
+        let _faux = FAUX_TEST_LOCK.lock().await;
         let directory = tempfile::tempdir().unwrap();
         let options = run_options(directory.path());
         std::fs::create_dir_all(&options.config.agent_dir).unwrap();

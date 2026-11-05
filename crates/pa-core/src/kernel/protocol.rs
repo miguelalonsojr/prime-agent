@@ -128,6 +128,7 @@ pub enum Event {
     },
     HostRequest {
         id: String,
+        cell_id: Option<String>,
         data: Value,
     },
     Error {
@@ -230,7 +231,11 @@ pub fn parse_event(line: &str) -> Result<Event, String> {
         "host_request" => {
             let rid =
                 id("id").ok_or_else(|| format!("host_request frame without id: {}", clip(line)))?;
-            Ok(Event::HostRequest { id: rid, data })
+            Ok(Event::HostRequest {
+                id: rid,
+                cell_id: id("cell_id"),
+                data,
+            })
         }
         "error" => Ok(Event::Error {
             id: id("id"),
@@ -296,6 +301,26 @@ mod tests {
     #[test]
     fn done_without_id_is_invalid() {
         assert!(parse_event(r#"{"event":"done","status":"ok"}"#).is_err());
+    }
+
+    #[test]
+    fn host_request_origin_comes_only_from_top_level_cell_id() {
+        let with_origin = parse_event(
+            r#"{"event":"host_request","id":"hr","cell_id":"cell","data":{"cell_id":"forged","tool_call_id":"fake"}}"#,
+        )
+        .unwrap();
+        let Event::HostRequest { cell_id, data, .. } = with_origin else {
+            panic!("unexpected protocol event");
+        };
+        assert_eq!(cell_id.as_deref(), Some("cell"));
+        assert_eq!(data["cell_id"], "forged");
+        let forged_only =
+            parse_event(r#"{"event":"host_request","id":"hr2","data":{"cell_id":"forged"}}"#)
+                .unwrap();
+        let Event::HostRequest { cell_id, .. } = forged_only else {
+            panic!("unexpected protocol event");
+        };
+        assert_eq!(cell_id, None);
     }
 
     #[test]
@@ -475,6 +500,7 @@ mod tests {
             parse_event(r#"{"event":"host_request","id":"hr1"}"#).unwrap(),
             Event::HostRequest {
                 id: "hr1".into(),
+                cell_id: None,
                 data: Value::Null
             }
         );
@@ -485,6 +511,7 @@ mod tests {
             .unwrap(),
             Event::HostRequest {
                 id: "hr1".into(),
+                cell_id: None,
                 data: json!({"reason": "agent_message.send"}),
             }
         );

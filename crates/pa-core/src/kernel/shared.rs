@@ -9,6 +9,38 @@ use serde_json::Value;
 
 use crate::kernel::bootstrap::KernelPythonSkill;
 
+/// Trusted correlation with one prepared tool action; not independent authority.
+#[derive(Clone, Debug)]
+pub struct ToolExecutionIdentity(Arc<()>);
+
+impl ToolExecutionIdentity {
+    pub(crate) fn new() -> Self {
+        Self(Arc::new(()))
+    }
+
+    pub(crate) fn same_instance(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+tokio::task_local! {
+    static TOOL_EXECUTION_IDENTITY: Option<ToolExecutionIdentity>;
+}
+
+pub(crate) fn current_tool_execution_identity() -> Option<ToolExecutionIdentity> {
+    TOOL_EXECUTION_IDENTITY
+        .try_with(Clone::clone)
+        .ok()
+        .flatten()
+}
+
+pub(crate) async fn with_tool_execution_identity<F: Future>(
+    identity: Option<ToolExecutionIdentity>,
+    future: F,
+) -> F::Output {
+    TOOL_EXECUTION_IDENTITY.scope(identity, future).await
+}
+
 /// Per-cell stdout/stderr cap. `HeadTailBuffer` splits it between head and
 /// tail, so a long failing run keeps its printed verdict.
 pub const DEFAULT_MAX_OUTPUT_CHARS: usize = 65_536;
@@ -227,6 +259,9 @@ pub struct ExecuteOptions {
     pub on_late_sent_agent_message: Option<LateSentAgentMessageCallback>,
     /// Called only after the public cell's matching Done clears its active slot.
     pub on_public_cell_done: Option<PublicCellDoneCallback>,
+    /// Bound to this execution by the host; never sourced from Python data.
+    pub tool_call_id: Option<String>,
+    pub tool_execution_identity: Option<ToolExecutionIdentity>,
     /// Cap stdout / stderr / result at this many characters. Default 65536.
     pub max_output_chars: Option<usize>,
     /// Synthetic host cell (snapshot/restore/list); excluded from lastCellCode attribution.
@@ -254,6 +289,9 @@ pub struct KernelBusyAfterInterruptError;
 pub struct HostRequestPayload {
     /// The request payload.
     pub data: Value,
+    /// Set only by the kernel manager after verifying a live public cell.
+    pub verified_tool_call_id: Option<String>,
+    pub verified_tool_execution_identity: Option<ToolExecutionIdentity>,
 }
 
 pub type HostHandlerFuture = Pin<Box<dyn Future<Output = anyhow::Result<Value>> + Send>>;
@@ -448,4 +486,57 @@ pub fn parse_sent_agent_message(payload: &Value) -> Option<KernelSentAgentMessag
                 .map(str::to_string),
         },
     })
+}
+
+#[cfg(test)]
+mod execution_identity_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn clm_tool_execution_identity_scope_isolated_and_restored() {
+        let first = ToolExecutionIdentity::new();
+        let second = ToolExecutionIdentity::new();
+        assert!(first.same_instance(&first.clone()));
+        assert!(!first.same_instance(&second));
+        assert!(current_tool_execution_identity().is_none());
+        with_tool_execution_identity(Some(first.clone()), async {
+            assert!(current_tool_execution_identity()
+                .unwrap()
+                .same_instance(&first));
+            with_tool_execution_identity(None, async {
+                assert!(current_tool_execution_identity().is_none());
+            })
+            .await;
+            assert!(tokio::spawn(async { current_tool_execution_identity() })
+                .await
+                .unwrap()
+                .is_none());
+            let error = with_tool_execution_identity(Some(second.clone()), async {
+                assert!(current_tool_execution_identity()
+                    .unwrap()
+                    .same_instance(&second));
+                Err::<(), _>("failed")
+            })
+            .await;
+            assert!(error.is_err());
+            assert!(current_tool_execution_identity()
+                .unwrap()
+                .same_instance(&first));
+            let (entered, ready) = tokio::sync::oneshot::channel();
+            let mut pending = Box::pin(with_tool_execution_identity(Some(second.clone()), async {
+                entered.send(()).unwrap();
+                std::future::pending::<()>().await;
+            }));
+            tokio::select! {
+                () = &mut pending => panic!("pending scope completed"),
+                result = ready => result.unwrap(),
+            }
+            drop(pending);
+            assert!(current_tool_execution_identity()
+                .unwrap()
+                .same_instance(&first));
+        })
+        .await;
+        assert!(current_tool_execution_identity().is_none());
+    }
 }

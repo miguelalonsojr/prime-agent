@@ -121,7 +121,13 @@ impl SessionManager {
             self.file_entries[index],
             FileEntry::SessionState { .. } | FileEntry::SessionInfo { .. }
         );
-        if !self.has_assistant_entry && !is_session_state_or_info {
+        if !self.has_assistant_entry
+            && !is_session_state_or_info
+            && !self
+                .file_entries
+                .iter()
+                .any(super::super::clm::is_clm_entry)
+        {
             self.flushed = false;
             return Ok(());
         }

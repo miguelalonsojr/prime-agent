@@ -100,6 +100,12 @@ pub enum AutonomousLimitSetting {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ClmSettings {
+    pub enabled: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CompactionSettings {
     pub enabled: Option<bool>,
     /// Percentage ceiling for automatic compaction; invalid values behave as unset.
@@ -280,6 +286,7 @@ pub struct Settings {
     pub follow_up_mode: Option<QueueModeSetting>,
     pub theme: Option<String>,
     pub compaction: Option<CompactionSettings>,
+    pub clm: Option<ClmSettings>,
     pub auto_refine: Option<AutoRefineSettings>,
     /// Master switch for harness creation and context loading; unset preserves enabled behavior.
     pub harness_refinements: Option<bool>,

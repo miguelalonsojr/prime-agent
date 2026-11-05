@@ -131,7 +131,7 @@ pub fn stream_once(
     api_key: Option<String>,
     service_tier: Option<pa_types::ai::ServiceTier>,
     headers: Option<std::collections::BTreeMap<String, String>>,
-    context: LlmContext,
+    mut context: LlmContext,
     options: StreamRequestOptions,
 ) -> anyhow::Result<Box<dyn ModelStream>> {
     let messages: Vec<pa_types::ai::Message> = context
@@ -140,6 +140,21 @@ pub fn stream_once(
         .filter_map(json_round_trip)
         .collect();
     let tools: Vec<pa_types::ai::Tool> = context.tools.iter().filter_map(json_round_trip).collect();
+    if let Ok(runtime) = super::clm::REQUEST_CLM.try_with(Arc::clone) {
+        if let Some(prompt) = runtime.record_inputs(
+            &crate::clm::controller::ClmRequestInputs {
+                system_prompt: context.system_prompt.clone().unwrap_or_default(),
+                tools: tools.clone(),
+                model: model.clone(),
+            },
+            &messages
+                .iter()
+                .map(serde_json::to_value)
+                .collect::<Result<Vec<_>, _>>()?,
+        )? {
+            context.system_prompt = Some(prompt);
+        }
+    }
     let ai_context = pa_types::ai::Context {
         system_prompt: context.system_prompt,
         messages,
@@ -186,11 +201,23 @@ pub fn stream_once(
     };
     let stream = pa_ai::stream_simple(model, &ai_context, Some(stream_options))
         .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+    let clm = super::clm::REQUEST_CLM.try_with(Arc::clone).ok();
     // Pump pa-ai events into the loop's event stream, verbatim.
     let (handle, consumer) = pa_agent::stream::event_stream();
     let forwarder = tokio::spawn(async move {
         let mut stream = stream;
         while let Some(event) = stream.next_event().await {
+            if let Some(runtime) = &clm {
+                match &event {
+                    pa_types::ai::AssistantMessageEvent::Done { message, .. } => {
+                        runtime.observe_provider_usage(&message.usage);
+                    }
+                    pa_types::ai::AssistantMessageEvent::Error { error, .. } => {
+                        runtime.observe_provider_usage(&error.usage);
+                    }
+                    _ => {}
+                }
+            }
             if let Some(converted) = convert_stream_event(&event) {
                 handle.push(converted);
             }

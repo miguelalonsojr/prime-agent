@@ -109,6 +109,10 @@ enum PromptContextBoundary {
 
 /// A [`SessionEngine`] running real agent turns.
 pub struct AgentSessionEngine {
+    pub(crate) clm_default_eligible: std::sync::atomic::AtomicBool,
+    pub(crate) clm_journal: std::sync::Mutex<Option<pa_core::clm::journal::ClmJournalFn>>,
+    pub(crate) clm_helper_receipt:
+        std::sync::Mutex<Option<pa_core::session_engine::clm::ClmHelperReceiptFn>>,
     pub(crate) runtime: crate::async_safe_runtime::AsyncSafeRuntime,
     pub(crate) config: AgentEngineConfig,
     /// The session-scoped ACP MCP store, shared with the core engine's prompt gating.
@@ -287,6 +291,7 @@ pub struct AgentSessionEngine {
     /// This session's RLM recursion depth (0 for top-level): gates the kernel `refine.*` host
     /// requests.
     rlm_depth: std::sync::atomic::AtomicU32,
+    inherited_clm_mode: std::sync::Mutex<Option<bool>>,
     /// The depth bound's source stamp (`default` | `env` | `global` |
     /// `inherited` | `chat`).
     rlm_max_depth_source: std::sync::Mutex<&'static str>,

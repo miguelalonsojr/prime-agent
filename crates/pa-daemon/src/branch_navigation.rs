@@ -166,6 +166,19 @@ impl TreeNavigation {
                 );
             };
             let old_leaf = store.leaf_id().map(str::to_string);
+            if summarize && old_leaf.as_deref() != Some(target_id) {
+                let state = store.branch_file_entries_checked().and_then(|branch| {
+                    pa_core::clm::validate_clm_branch(&branch).map_err(Into::into)
+                });
+                match state {
+                    Ok(state) if state.epoch_id.is_some() => return response_failure(
+                        None, "navigate_tree",
+                        "CLM accepted context cannot be mapped safely for historical branch preparation", None,
+                    ),
+                    Err(error) => return response_failure(None, "navigate_tree", &error.to_string(), None),
+                    Ok(_) => (),
+                }
+            }
             let entries = store.entries().to_vec();
             (target, old_leaf, entries, store.session_id().to_string())
         };

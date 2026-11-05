@@ -316,7 +316,7 @@ impl FactoryHost {
 /// overrides), so full resolution stays with the catalog and the spawn
 /// path (the #3184 `provider_adapter::agent_model_to_ai_model` field
 /// mapping).
-fn agent_model_to_ai_model(model: &pa_agent::types::Model) -> AiModel {
+pub(super) fn agent_model_to_ai_model(model: &pa_agent::types::Model) -> AiModel {
     AiModel {
         id: model.id.clone(),
         name: model.name.clone(),

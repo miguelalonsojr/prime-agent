@@ -279,7 +279,7 @@ fn write_ts_era_session(agent_dir: &Path, session_id: &str, name: &str, state: &
         json!({
             "type": "session_info",
             "id": "e2",
-            "parentId": "top",
+            "parentId": null,
             "timestamp": "2026-01-05T10:00:01.000Z",
             "name": name,
         }),

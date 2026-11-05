@@ -11,9 +11,9 @@ use crate::JsonMap;
 
 pub const DAEMON_PROTOCOL_NAME: &str = "prime-agent.daemon";
 pub const DAEMON_PROTOCOL_VERSION: u64 = 7;
-/// Revision 31 adds capability-gated kernel CWD propagation.
-pub const DAEMON_SCHEMA_REVISION: u64 = 31;
-pub const DAEMON_SCHEMA_ID: &str = "protocol-7-schema-31-08916d9bda37";
+/// Revision 32 adds optional CLM command vocabulary.
+pub const DAEMON_SCHEMA_REVISION: u64 = 32;
+pub const DAEMON_SCHEMA_ID: &str = "protocol-7-schema-32-afc3b314d363";
 
 pub type DaemonClientId = String;
 pub type DaemonCommandId = String;
@@ -172,8 +172,8 @@ mod tests {
     fn protocol_constants_match_ts() {
         assert_eq!(DAEMON_PROTOCOL_NAME, "prime-agent.daemon");
         assert_eq!(DAEMON_PROTOCOL_VERSION, 7);
-        assert_eq!(DAEMON_SCHEMA_REVISION, 31);
-        assert_eq!(DAEMON_SCHEMA_ID, "protocol-7-schema-31-08916d9bda37");
+        assert_eq!(DAEMON_SCHEMA_REVISION, 32);
+        assert_eq!(DAEMON_SCHEMA_ID, "protocol-7-schema-32-afc3b314d363");
         assert_eq!(DAEMON_UPDATE_RESTART_FORMAT_VERSION, 1);
     }
 }

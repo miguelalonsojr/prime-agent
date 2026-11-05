@@ -6,9 +6,25 @@ use super::{FileEntry, Path, RefineTranscriptParts, SessionHeader, SessionManage
 impl SessionManager {
     /// The active compacted context without hydrating old message bodies: an
     /// attached window contributes only its settings overlay.
+    /// # Panics
+    /// Panics on invalid CLM; model callers should use `active_context_checked`.
     #[must_use]
     pub fn active_context(&self) -> super::SessionContext {
-        let mut context = super::build_session_context(&self.file_entries, self.get_leaf_id());
+        self.active_context_checked()
+            .expect("CLM context unavailable; use active_context_checked")
+    }
+
+    /// Checked model-context read; normal windows retain their settings overlay.
+    /// # Errors
+    /// Damaged CLM logs and unhydrated CLM ancestry are never replayed as audit.
+    pub fn active_context_checked(&self) -> Result<super::SessionContext, crate::clm::ClmError> {
+        if let Some(error) = &self.clm_error {
+            return Err(crate::clm::ClmError::Journal(error.clone()));
+        }
+        let mut context = super::super::clm::build_session_context_checked(
+            &self.file_entries,
+            self.get_leaf_id(),
+        )?;
         if let Some(window) = &self.window {
             if !window.full_history() {
                 let settings = window.settings();
@@ -17,7 +33,7 @@ impl SessionManager {
                 context.model.clone_from(&settings.model);
             }
         }
-        context
+        Ok(context)
     }
     /// Capture a historical read request while locked; await it after
     /// releasing the session mutex. A full-history window under the sole
@@ -50,7 +66,8 @@ impl SessionManager {
                 return Ok(retained);
             };
             let mut entries = tokio::task::spawn_blocking(move || {
-                std::fs::read_to_string(path).map(|text| super::parse_session_entries(&text))
+                let bytes = std::fs::read(path)?;
+                Ok::<_, anyhow::Error>(super::super::clm::parse_session_entries_checked(&bytes)?)
             })
             .await??;
             let ids: std::collections::HashSet<String> = entries

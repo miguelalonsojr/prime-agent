@@ -129,12 +129,16 @@ pub(crate) async fn build_faux_engine_with(
         rlm_subagent_host,
         extra_host_handlers,
         rlm_depth,
+        inherited_clm_mode,
         bash_wake,
         rpc_bash_wake,
         on_late_sent_agent_message,
     } = super::headless_embedding_fields(embedding);
     let engine = pa_core::session_engine::engine::create_session(
         pa_core::session_engine::engine::SessionEngineConfig {
+            clm_journal: None,
+            clm_helper_receipt: None,
+            inherited_clm_mode,
             on_late_sent_agent_message,
             cron_store: None,
             // Faux verification harness: no product telemetry.

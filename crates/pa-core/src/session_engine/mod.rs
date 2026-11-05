@@ -8,6 +8,7 @@ pub mod auto_retry;
 pub mod auxiliary_model;
 pub mod bash_notices;
 pub mod branch_summarization;
+pub mod clm;
 pub mod compact_session;
 pub mod compaction;
 pub mod compaction_exec;
@@ -120,6 +121,8 @@ fn standard_message(message: &pa_agent::types::AgentMessage) -> Option<&pa_agent
 
 /// The session-bound agent: admission rules + persistence over the loop.
 pub struct AgentSession {
+    pub clm: Option<Arc<clm::ClmRuntime>>,
+    external_persistence: bool,
     agent: Arc<Agent>,
     session: Arc<tokio::sync::Mutex<SessionManager>>,
     prompt_templates: Vec<PromptTemplate>,
@@ -276,18 +279,50 @@ impl AgentSession {
         prompt_templates: Vec<PromptTemplate>,
         harness_digest: Option<harness_digest::HarnessDigestContext>,
     ) -> anyhow::Result<Self> {
+        Self::from_session_arc_with_clm(
+            agent,
+            session,
+            prompt_templates,
+            harness_digest,
+            None,
+            false,
+        )
+        .await
+    }
+
+    async fn from_session_arc_with_clm(
+        agent: Arc<Agent>,
+        session: Arc<tokio::sync::Mutex<SessionManager>>,
+        prompt_templates: Vec<PromptTemplate>,
+        harness_digest: Option<harness_digest::HarnessDigestContext>,
+        clm: Option<Arc<clm::ClmRuntime>>,
+        external_persistence: bool,
+    ) -> anyhow::Result<Self> {
         let persistence = session.clone();
+        let clm_persistence = clm.clone();
         agent
             .subscribe(move |event, _signal| {
                 let persistence = persistence.clone();
+                let clm = clm_persistence.clone();
                 Box::pin(async move {
-                    persist_event(&persistence, event).await?;
+                    if !external_persistence || clm.is_none() {
+                        match clm {
+                            Some(runtime) => {
+                                runtime
+                                    .persist_standalone_event(&persistence, event)
+                                    .await?;
+                            }
+                            None => persist_event(&persistence, event).await?,
+                        }
+                    }
                     Ok(())
                 })
             })
             .await;
         let kernel_cwd_fallback = session.lock().await.get_cwd().to_path_buf();
         let this = Self {
+            clm,
+            external_persistence,
             agent,
             session,
             prompt_templates,
@@ -340,14 +375,19 @@ impl AgentSession {
     }
 
     /// Restore a verified retained context without loading older transcript bodies.
+    /// # Errors
+    /// Rejects damaged accepted context while restoring the retained window.
     pub async fn restore_windowed_context(
         &self,
         window: crate::session::window::WindowedSessionStore,
-    ) {
+    ) -> anyhow::Result<()> {
+        if let Some(clm) = &self.clm {
+            clm.assert_operation_allowed("restoring windowed context")?;
+        }
         let messages = {
             let mut session = self.session.lock().await;
             session.adopt_window(window);
-            session.active_context().messages
+            session.active_context_checked()?.messages
         };
         self.agent
             .set_messages(
@@ -357,6 +397,7 @@ impl AgentSession {
                     .collect(),
             )
             .await;
+        Ok(())
     }
 
     /// Persisted entries (for UI resume and inspection).

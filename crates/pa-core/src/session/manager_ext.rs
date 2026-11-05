@@ -283,6 +283,9 @@ fn entry_type(entry: &FileEntry) -> &'static str {
         FileEntry::SessionInfo { .. } => "session_info",
         FileEntry::SessionState { .. } => "session_state",
         FileEntry::GitState { .. } => "git_state",
+        FileEntry::ClmOn { .. } => "clm_on",
+        FileEntry::ClmRevision { .. } => "clm_revision",
+        FileEntry::ClmOffBoundary { .. } => "clm_off_boundary",
         FileEntry::Unknown { .. } => "unknown",
     }
 }

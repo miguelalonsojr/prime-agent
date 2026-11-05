@@ -32,6 +32,10 @@ mod child_usage;
 #[cfg(test)]
 #[path = "session_store/child_usage_tests.rs"]
 mod child_usage_tests;
+#[path = "clm_journal.rs"]
+mod clm_journal;
+#[cfg(test)]
+mod clm_tests;
 mod index;
 
 use index::fold_child_usage_attributions;
@@ -128,6 +132,8 @@ pub struct MessageWindowScalars {
 #[derive(Debug, Clone)]
 pub struct SessionFile {
     pub path: PathBuf,
+    pub(crate) clm_generation: String,
+    pub(crate) clm_error: Option<String>,
     pub header: SessionHeader,
     pub(crate) entries: Vec<SessionEntry>,
     pub(crate) by_id: HashMap<String, usize>,

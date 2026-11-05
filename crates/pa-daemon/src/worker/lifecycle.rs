@@ -285,6 +285,7 @@ impl Worker {
             .engine
             .configure_rlm_identity(crate::engine::RlmSessionIdentity {
                 rlm_depth,
+                inherited_clm_mode: None,
                 rlm_max_depth: None,
                 cwd: Some(summary.cwd.clone()),
                 session_id: Some(summary.session_id.clone()),

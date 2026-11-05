@@ -186,7 +186,7 @@ async fn mid_summarize_writes_are_durable_now_and_ride_the_retained_tail() {
     let rebuilt_live = {
         let session = engine.shared_persistence();
         let session = session.lock().await;
-        crate::session_engine::compact_session::rebuilt_context_after_compaction(&session)
+        crate::session_engine::compact_session::rebuilt_context_after_compaction(&session).unwrap()
     };
     let reopened = SessionManager::open(tmp.path(), tmp.path(), &session_file);
     assert_eq!(

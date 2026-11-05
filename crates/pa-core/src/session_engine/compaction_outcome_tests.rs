@@ -344,7 +344,8 @@ async fn refine_test_session() -> (AgentSession, tempfile::TempDir) {
         let persistence = session.shared_persistence();
         let manager = persistence.lock().await;
         rebuilt_loop_messages(
-            crate::session_engine::compact_session::rebuilt_context_after_compaction(&manager),
+            crate::session_engine::compact_session::rebuilt_context_after_compaction(&manager)
+                .unwrap(),
         )
     };
     session.agent().set_messages(live).await;
@@ -357,7 +358,7 @@ async fn full_rebuild_reference(session: &AgentSession) -> Vec<AgentMessage> {
     let persistence = session.shared_persistence();
     let manager = persistence.lock().await;
     rebuilt_loop_messages(
-        crate::session_engine::compact_session::rebuilt_context_after_compaction(&manager),
+        crate::session_engine::compact_session::rebuilt_context_after_compaction(&manager).unwrap(),
     )
 }
 
@@ -557,7 +558,7 @@ async fn refine_keeps_the_retry_drop_instead_of_resurrecting_the_error_row() {
     let rebuilt = {
         let persistence = session.shared_persistence();
         let manager = persistence.lock().await;
-        crate::session_engine::compact_session::rebuilt_context_after_compaction(&manager)
+        crate::session_engine::compact_session::rebuilt_context_after_compaction(&manager).unwrap()
     };
     session
         .agent()

@@ -69,6 +69,219 @@ fn empty_prompt_input() -> pa_types::daemon::PromptInput {
 }
 
 #[tokio::test]
+async fn clm_old_daemon_refuses_locally_without_socket_write() {
+    for (version, revision, capabilities) in [
+        (7, 31, vec!["clm_context_v1"]),
+        (7, 32, vec![]),
+        (6, 32, vec!["clm_context_v1"]),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("d.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = stream.into_split();
+            let hello = json!({"type":"daemon_hello", "protocol":{"name":"prime-agent.daemon","version":version},
+                "schemaRevision":revision,"serverCapabilities":capabilities});
+            writer
+                .write_all(format!("{hello}\n").as_bytes())
+                .await
+                .unwrap();
+            let mut reader = BufReader::new(reader);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap() > 0 && line.trim().is_empty()
+        });
+        let (client, _) = DaemonClient::connect(&socket).await.unwrap();
+        for command in [
+            DaemonCommand::GetClmStatus {
+                id: None,
+                active_session_id: "s1".into(),
+                rest: Map::default(),
+            },
+            DaemonCommand::SetClmMode {
+                id: None,
+                active_session_id: "s1".into(),
+                enabled: true,
+                rest: Map::default(),
+            },
+            DaemonCommand::RestoreClmRevision {
+                id: None,
+                active_session_id: "s1".into(),
+                epoch_id: "e1".into(),
+                revision: 0,
+                rest: Map::default(),
+            },
+            DaemonCommand::GetClmModelSnapshot {
+                id: None,
+                active_session_id: "s1".into(),
+                rest: Map::default(),
+            },
+        ] {
+            let err = client.request_ok(command).await.unwrap_err();
+            assert!(err.to_string().contains("clm_context_v1"), "{err}");
+        }
+        client.close();
+        assert!(
+            server.await.unwrap(),
+            "an unsupported command reached the socket"
+        );
+    }
+}
+
+#[tokio::test]
+async fn clm_capable_daemon_receives_all_four_source_commands() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("d.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let expected_status = json!({"configuredDefault":false,"mode":"on","modeSource":"session-override","epochId":"e1","revision":0,
+            "path":"/tmp/synthetic/clm/context.txt","recentRevisions":[{"epochId":"e1","revision":0}],
+            "estimatedOccupancy":{"estimatedInputTokens":100,"maxInputTokens":200,"outputReserveTokens":30},
+            "measuredUsage":{"input":11,"output":12,"cacheRead":13,"cacheWrite":14,"cost":0.5}});
+    let expected_view = json!({"epochId":"e1","revision":0,"messages":[{"role":"user","content":"accepted\nline"}],"estimatedTokens":100});
+    let server_status = expected_status.clone();
+    let server_view = expected_view.clone();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let (reader, mut writer) = stream.into_split();
+        writer.write_all(b"{\"type\":\"daemon_hello\",\"protocol\":{\"name\":\"prime-agent.daemon\",\"version\":7},\"schemaRevision\":32,\"serverCapabilities\":[\"clm_context_v1\"]}\n").await.unwrap();
+        let mut reader = BufReader::new(reader);
+        let mut received = Vec::new();
+        for _ in 0..4 {
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            let envelope: Value = serde_json::from_str(&line).unwrap();
+            received.push(envelope["command"].clone());
+            let data = if envelope["command"]["type"] == "get_clm_model_snapshot" {
+                &server_view
+            } else {
+                &server_status
+            };
+            let response = json!({"type":"response","id":envelope["id"],"command":envelope["command"]["type"],"success":true,"data":data});
+            writer
+                .write_all(format!("{response}\n").as_bytes())
+                .await
+                .unwrap();
+        }
+        received
+    });
+    let (client, _) = DaemonClient::connect(&socket).await.unwrap();
+    assert!(client.supports_clm_context());
+    let commands = [
+        DaemonCommand::GetClmStatus {
+            id: None,
+            active_session_id: "s1".into(),
+            rest: Map::default(),
+        },
+        DaemonCommand::SetClmMode {
+            id: None,
+            active_session_id: "s1".into(),
+            enabled: true,
+            rest: Map::default(),
+        },
+        DaemonCommand::RestoreClmRevision {
+            id: None,
+            active_session_id: "s1".into(),
+            epoch_id: "e1".into(),
+            revision: 0,
+            rest: Map::default(),
+        },
+        DaemonCommand::GetClmModelSnapshot {
+            id: None,
+            active_session_id: "s1".into(),
+            rest: Map::default(),
+        },
+    ];
+    for (command, expected) in commands.into_iter().zip([
+        expected_status.clone(),
+        expected_status.clone(),
+        expected_status,
+        expected_view,
+    ]) {
+        assert_eq!(client.request_ok(command).await.unwrap(), expected);
+    }
+    let received = server.await.unwrap();
+    assert_eq!(
+        received,
+        vec![
+            json!({"type":"get_clm_status","activeSessionId":"s1"}),
+            json!({"type":"set_clm_mode","activeSessionId":"s1","enabled":true}),
+            json!({"type":"restore_clm_revision","activeSessionId":"s1","epochId":"e1","revision":0}),
+            json!({"type":"get_clm_model_snapshot","activeSessionId":"s1"}),
+        ]
+    );
+    client.close();
+}
+
+#[tokio::test]
+async fn clm_inspection_failure_does_not_break_attach() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("d.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let (reader, mut writer) = stream.into_split();
+        writer.write_all(b"{\"type\":\"daemon_hello\",\"protocol\":{\"name\":\"prime-agent.daemon\",\"version\":7},\"schemaRevision\":32,\"serverCapabilities\":[\"clm_context_v1\"]}\n").await.unwrap();
+        let mut reader = BufReader::new(reader);
+        for (expected, success) in [
+            ("get_clm_model_snapshot", false),
+            ("get_clm_status", false),
+            ("attach", true),
+        ] {
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            let envelope: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(envelope["command"]["type"], expected);
+            let response = json!({"type":"response","id":envelope["id"],"command":expected,"success":success,
+                "data": if success { Some(json!({"attached":true})) } else { None },
+                "error": if success { None } else { Some("CLM inspection unavailable") }});
+            writer
+                .write_all(format!("{response}\n").as_bytes())
+                .await
+                .unwrap();
+        }
+    });
+    let (client, _) = DaemonClient::connect(&socket).await.unwrap();
+    let error = client
+        .request_ok(DaemonCommand::GetClmModelSnapshot {
+            id: None,
+            active_session_id: "s1".into(),
+            rest: Map::default(),
+        })
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("CLM inspection unavailable"));
+    let status_error = client
+        .request_ok(DaemonCommand::GetClmStatus {
+            id: None,
+            active_session_id: "s1".into(),
+            rest: Map::default(),
+        })
+        .await
+        .unwrap_err();
+    assert!(status_error
+        .to_string()
+        .contains("CLM inspection unavailable"));
+    let attached = client
+        .request_ok(DaemonCommand::Attach {
+            id: None,
+            active_session_id: "s1".into(),
+            client_id: None,
+            capabilities: None,
+            resume_cursor: None,
+            telemetry_disabled: None,
+            recovery_config: None,
+            env: None,
+            launch_env: None,
+            rest: Map::default(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(attached["attached"], true);
+    server.await.unwrap();
+    client.close();
+}
+
+#[tokio::test]
 async fn kernel_cwd_capability_requires_all_three_hello_gates() {
     for (version, revision, capabilities, allowed) in [
         (7, 31, vec!["kernel_cwd_propagation"], true),

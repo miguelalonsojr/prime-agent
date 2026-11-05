@@ -208,6 +208,9 @@ impl Fixture {
         faux: &FauxSession,
     ) -> SessionEngineConfig {
         SessionEngineConfig {
+            clm_journal: None,
+            clm_helper_receipt: None,
+            inherited_clm_mode: None,
             steering_mode: None,
             follow_up_mode: None,
             cwd: self.cwd.clone(),

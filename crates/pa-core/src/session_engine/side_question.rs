@@ -113,7 +113,94 @@ pub async fn run_side_question(
     signal: &AbortSignal,
     sink: &SideQuestionSink,
 ) -> SideQuestionResult {
-    let parent_state = parent.state().await;
+    run_side_question_from_snapshot(
+        SideQuestionParent::capture(parent).await,
+        stream_fn,
+        question,
+        previous_turns,
+        retry_policy,
+        signal,
+        sink,
+    )
+    .await
+}
+
+struct SideQuestionParent {
+    state: pa_agent::agent::AgentStateSnapshot,
+    session_id: Option<String>,
+}
+
+impl SideQuestionParent {
+    async fn capture(parent: &Arc<Agent>) -> Self {
+        Self {
+            state: parent.state().await,
+            session_id: parent.session_id().map(str::to_owned),
+        }
+    }
+}
+
+impl super::AgentSession {
+    /// Answer from checked accepted context without changing the parent agent or journal.
+    pub async fn run_side_question(
+        &self,
+        question: &str,
+        previous_turns: &[SideQuestionTurn],
+        retry_policy: &ProviderRetryPolicy,
+        signal: &AbortSignal,
+        sink: &SideQuestionSink,
+    ) -> SideQuestionResult {
+        let Some(stream_fn) = self.side_question_stream_fn() else {
+            return SideQuestionResult::failed(
+                String::new(),
+                "Select a model before asking a side question".to_string(),
+            );
+        };
+        let mut parent = SideQuestionParent::capture(&self.agent).await;
+        let accepted = async {
+            if let Some(clm) = &self.clm {
+                clm.assert_operation_allowed("side question")?;
+                if clm.status(false).await?.epoch_id.is_some() {
+                    let messages = clm
+                        .view()
+                        .await?
+                        .messages
+                        .into_iter()
+                        .map(serde_json::from_value)
+                        .collect::<serde_json::Result<Vec<_>>>()?;
+                    return Ok::<_, anyhow::Error>(Some(messages));
+                }
+            }
+            Ok(None)
+        }
+        .await;
+        match accepted {
+            Ok(Some(messages)) => parent.state.messages = messages,
+            Ok(None) => (),
+            Err(error) => return SideQuestionResult::failed(String::new(), error.to_string()),
+        }
+        run_side_question_from_snapshot(
+            parent,
+            stream_fn,
+            question,
+            previous_turns,
+            retry_policy,
+            signal,
+            sink,
+        )
+        .await
+    }
+}
+
+async fn run_side_question_from_snapshot(
+    parent: SideQuestionParent,
+    stream_fn: pa_agent::stream::StreamFn,
+    question: &str,
+    previous_turns: &[SideQuestionTurn],
+    retry_policy: &ProviderRetryPolicy,
+    signal: &AbortSignal,
+    sink: &SideQuestionSink,
+) -> SideQuestionResult {
+    let parent_state = parent.state;
     if parent_state.model == pa_agent::types::Model::unknown() {
         return SideQuestionResult::failed(
             String::new(),
@@ -196,7 +283,7 @@ pub async fn run_side_question(
         // TS `side-question.ts`: the side call keeps the parent's identity so it reads the main
         // conversation's prompt cache, and rides SSE so it never takes the session's Codex
         // socket or its continuation.
-        session_id: parent.session_id().map(str::to_string),
+        session_id: parent.session_id,
         transport: Some(pa_agent::types::Transport::Sse),
         ..Default::default()
     }));

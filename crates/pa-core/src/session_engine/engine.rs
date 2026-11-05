@@ -25,6 +25,10 @@ const MCP_SETTLE_PER_SERVER_TIMEOUT_MS: u64 = 10_000;
 /// Everything needed to assemble a session.
 #[derive(Default)]
 pub struct SessionEngineConfig {
+    /// The daemon supplies its sole durable owner; standalone sessions use their manager.
+    pub clm_journal: Option<crate::clm::journal::ClmJournalFn>,
+    pub clm_helper_receipt: Option<super::clm::ClmHelperReceiptFn>,
+    pub inherited_clm_mode: Option<bool>,
     pub cwd: PathBuf,
     pub agent_dir: PathBuf,
     pub model: Option<Model>,
@@ -242,6 +246,7 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
     if let Some(traces) = traces {
         session_manager.on_persist(Box::new(move |path| traces.persisted(path)));
     }
+    let apply_clm_default = session_manager.consume_clm_default_eligibility();
     let wiring = super::runtime_wiring::wire_session_runtime(
         session_manager,
         &config.agent_dir,
@@ -255,6 +260,7 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
         config.cron_store.clone(),
     );
 
+    let clm_default = settings.get_clm_enabled();
     let refinement_settings = settings.reopen();
     let service_tier_preference = settings.get_default_service_tier();
     // Captured before `settings` moves into the resource loader: the
@@ -385,6 +391,110 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
                 .as_deref()
                 .and_then(super::harness_digest::session_artifact_dir_for_log)
         });
+    let external_persistence = config.clm_journal.is_some();
+    let standalone_protected = Arc::new(std::sync::Mutex::new(crate::clm::ProtectedActions::new()));
+    let clm = if let Some(artifacts) = session_artifact_dir.clone() {
+        let journal: crate::clm::journal::ClmJournalFn =
+            if let Some(owner) = config.clm_journal.take() {
+                let mirror = wiring.session.clone();
+                Arc::new(move |op| {
+                    let owner = owner.clone();
+                    let mirror = mirror.clone();
+                    Box::pin(async move {
+                        let reply = owner(op).await?;
+                        let view = match &reply {
+                            crate::clm::journal::ClmJournalReply::View(view)
+                            | crate::clm::journal::ClmJournalReply::Committed { view, .. } => view,
+                        };
+                        mirror.lock().await.adopt_entries(view.branch.clone());
+                        Ok(reply)
+                    })
+                })
+            } else {
+                let owner = wiring.session.clone();
+                let protected = standalone_protected.clone();
+                Arc::new(move |op| {
+                    let owner = owner.clone();
+                    let protected = protected.clone();
+                    Box::pin(async move {
+                        let mut owner = owner.lock().await;
+                        owner.ensure_full_history().await?;
+                        let protected = protected
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("CLM delivery lock poisoned"))?
+                            .clone();
+                        Ok(owner.clm_journal(op, protected)?)
+                    })
+                })
+            };
+        Some(
+            super::clm::ClmRuntime::new(
+                journal,
+                conversation_log.as_ref().map(PathBuf::from),
+                artifacts,
+                standalone_protected,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    if let Some(runtime) = &clm {
+        let _ = wiring.rlm.clm.set(Arc::downgrade(runtime));
+        if let Some(sink) = config.clm_helper_receipt.take() {
+            runtime.set_helper_receipt(sink);
+        } else if !external_persistence {
+            let owner = wiring.session.clone();
+            runtime.set_helper_receipt(Arc::new(move |expected, receipt| {
+                let owner = owner.clone();
+                Box::pin(async move {
+                    let mut owner = owner.lock().await;
+                    let crate::clm::journal::ClmJournalReply::View(current) = owner.clm_journal(
+                        crate::clm::journal::ClmJournalOp::ReadAfterEvents,
+                        crate::clm::ProtectedActions::new(),
+                    )?
+                    else {
+                        anyhow::bail!("CLM helper owner read returned a commit")
+                    };
+                    anyhow::ensure!(
+                        current.session_id == expected.session_id
+                            && current.generation == expected.generation,
+                        "CLM helper response belongs to a replaced session"
+                    );
+                    let kind = receipt["customType"]
+                        .as_str()
+                        .ok_or_else(|| anyhow::anyhow!("CLM helper receipt kind missing"))?;
+                    Ok(owner.append_custom_entry(kind, Some(receipt["data"].clone()))?)
+                })
+            }));
+        }
+    }
+    if config.inherited_clm_mode.is_some() {
+        if let Some(runtime) = &clm {
+            runtime.mark_inherited();
+        }
+    }
+    if config
+        .inherited_clm_mode
+        .unwrap_or(apply_clm_default && clm_default)
+    {
+        let runtime = clm
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("CLM requires persistent session artifacts"))?;
+        if runtime
+            .status(clm_default)
+            .await?
+            .recent_revisions
+            .is_empty()
+        {
+            let source = if config.inherited_clm_mode.is_some() {
+                pa_types::clm::ClmModeSource::InheritedChild
+            } else {
+                pa_types::clm::ClmModeSource::ConfiguredDefault
+            };
+            runtime.set_mode(true, source).await?;
+        }
+    }
     let local_harness_dir =
         crate::refinement::get_local_harness_state_dir(session_artifact_dir.as_deref());
     // The only sessions whose `refine.*` host requests register and the
@@ -512,13 +622,16 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
     );
     let mut tools = config.tools.clone();
     if !tools.iter().any(|tool| tool.name() == PYTHON_TOOL_NAME) {
-        let definition = crate::tools::ipython::create_ipython_tool_definition(
-            &cwd.to_string_lossy(),
-            super::runtime_wiring::ipython_tool_options(
-                provisioner.clone(),
-                config.on_late_sent_agent_message.clone(),
-            ),
+        let mut options = super::runtime_wiring::ipython_tool_options(
+            provisioner.clone(),
+            config.on_late_sent_agent_message.clone(),
         );
+        if let Some(clm) = clm.clone() {
+            options.on_public_result =
+                Some(Arc::new(move |id, result| clm.observe_python(id, result)));
+        }
+        let definition =
+            crate::tools::ipython::create_ipython_tool_definition(&cwd.to_string_lossy(), options);
         tools.push(Arc::new(
             crate::session_engine::tool_bridge::ToolDefinitionBridge::new(definition),
         ));
@@ -625,7 +738,7 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
     };
     let (existing_messages, has_thinking_entry, has_service_tier_entry) = {
         let session = wiring.session.lock().await;
-        let messages = super::compact_session::rebuilt_context_after_compaction(&session);
+        let messages = super::compact_session::rebuilt_context_after_compaction(&session)?;
         let messages = if super::refinement_gate::enabled(Some(&refinement_settings)) {
             messages
         } else {
@@ -682,11 +795,17 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
     // over the timing-instrumented fn (TS `sdk.ts` instruments first, the
     // `AgentSession` constructor wraps semantic edges over it). The side
     // question keeps the pre-semantic fn, so its calls carry no id.
+    let side_question_stream_fn = super::request_timing::instrument_stream_fn(
+        std::sync::Arc::clone(&request_timing_wiring),
+        std::sync::Arc::clone(&stream_fn),
+    );
     let timing_stream_fn = super::request_timing::instrument_stream_fn(
         std::sync::Arc::clone(&request_timing_wiring),
-        stream_fn,
+        match &clm {
+            Some(clm) => super::clm::wrap_stream(clm.clone(), stream_fn),
+            None => stream_fn,
+        },
     );
-    let side_question_stream_fn = std::sync::Arc::clone(&timing_stream_fn);
     let semantic_recorder = config.semantic_edges.take().map(|identity| {
         std::sync::Arc::new(super::semantic_edges::SemanticEdgeRecorder::open(identity))
     });
@@ -695,6 +814,10 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
             super::semantic_edges::wrap_stream_fn(std::sync::Arc::clone(recorder), timing_stream_fn)
         }
         None => timing_stream_fn,
+    };
+    let tools = match &clm {
+        Some(runtime) => super::clm::wrap_tools(runtime, tools),
+        None => tools,
     };
     let agent = Agent::new(AgentOptions {
         // Every request in the session carries this identity: providers key prompt caching
@@ -720,8 +843,13 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
         // wraps a pass-through that marks the turn's dispatch moment.
         transform_context: Some(super::request_timing::instrument_transform_context(
             std::sync::Arc::clone(&request_timing_wiring),
-            super::request_timing::pass_through_transform(),
+            clm.as_ref().map_or_else(
+                super::request_timing::pass_through_transform,
+                super::clm::ClmRuntime::transform,
+            ),
         )),
+        before_tool_call: clm.as_ref().map(super::clm::ClmRuntime::before_tool),
+        after_tool_call: clm.as_ref().map(super::clm::ClmRuntime::after_tool),
         should_stop_after_turn: {
             let steering = config.queued_steering_probe.take();
             let boundary = config.should_stop_after_turn.take();
@@ -746,6 +874,9 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
     });
 
     let agent = Arc::new(agent);
+    if let Some(runtime) = &clm {
+        runtime.bind_agent(&agent);
+    }
     // The in-process bash-notice sinks bind their agent late: their
     // handlers registered before the agent existed.
     *bash_notice_agent
@@ -765,12 +896,14 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
             });
     }
     let telemetry_agent = std::sync::Arc::clone(&agent);
-    let mut session = AgentSession::from_session_arc(
+    let mut session = AgentSession::from_session_arc_with_clm(
         agent.clone(),
         wiring.session.clone(),
         resources.prompts.clone(),
         super::refinement_gate::enabled(Some(&refinement_settings))
             .then_some(digest_context.clone()),
+        clm,
+        external_persistence,
     )
     .await?;
     // Receipts that landed after their cell's tool result persist as

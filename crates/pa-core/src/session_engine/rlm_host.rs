@@ -146,6 +146,7 @@ pub struct RlmSpawnRequest {
     /// The parent's in-flight turn request the spawn anchors to (TS
     /// `spawnedByRequestId`): `None` for a spawn outside an active run.
     pub spawned_by_request_id: Option<String>,
+    pub clm_admission: Option<super::clm::ClmChildAdmission>,
 }
 
 /// Validated `rlm.create_session` request handed to the host.
@@ -480,6 +481,7 @@ pub struct RlmHostBridge {
     /// The spawn anchor [`register_run`] reads the in-flight turn from
     /// (`None` until the engine built the session's agent).
     pub(crate) semantic_spawn: std::sync::OnceLock<SemanticSpawnAnchor>,
+    pub(crate) clm: std::sync::OnceLock<std::sync::Weak<super::clm::ClmRuntime>>,
 }
 
 impl RlmHostBridge {
@@ -499,6 +501,7 @@ impl RlmHostBridge {
             host,
             usage,
             semantic_spawn: std::sync::OnceLock::new(),
+            clm: std::sync::OnceLock::new(),
         }
     }
 }
@@ -610,6 +613,16 @@ fn register_run(handlers: &mut HostRequestHandlers, bridge: &Arc<RlmHostBridge>)
                     anyhow::bail!("rlm.spawn prompt must be a string");
                 };
                 let mut request = spawn_request_from_payload(prompt, data)?;
+                if let Some(runtime) = bridge.clm.get().and_then(std::sync::Weak::upgrade) {
+                    request.clm_admission = Some(
+                        runtime
+                            .admit_child(
+                                payload.verified_tool_call_id.as_deref(),
+                                payload.verified_tool_execution_identity.as_ref(),
+                            )
+                            .await?,
+                    );
+                }
                 // TS `_startRlmChildRun`: the spawning request is the turn
                 // whose tool call is executing now (the anchor is computed
                 // before the spawn admission's first await); a spawn
@@ -661,6 +674,7 @@ fn spawn_request_from_payload(prompt: &str, data: &Value) -> anyhow::Result<RlmS
         model,
         thinking,
         spawned_by_request_id: None,
+        clm_admission: None,
     })
 }
 
@@ -1092,7 +1106,11 @@ mod tests {
     }
 
     fn payload(data: Value) -> HostRequestPayload {
-        HostRequestPayload { data }
+        HostRequestPayload {
+            data,
+            verified_tool_call_id: None,
+            verified_tool_execution_identity: None,
+        }
     }
 
     async fn call(
@@ -1290,6 +1308,360 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(announced.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn clm_real_python_spawn_carries_one_parent_mode_snapshot() {
+        use crate::session_engine::engine::{create_session, SessionEngineConfig};
+        let dir = tempfile::tempdir().unwrap();
+        let provider = pa_ai::faux::register_faux_provider(
+            pa_ai::faux::RegisterFauxProviderOptions::default(),
+        );
+        let model = provider.models[0].clone();
+        let host = RecordingHost::new();
+        let requests = host.spawn_requests.clone();
+        let engine = create_session(SessionEngineConfig {
+            cwd: dir.path().to_path_buf(),
+            agent_dir: dir.path().join("agent"),
+            session_manager: Some(SessionManager::persisted(
+                dir.path(),
+                &dir.path().join("sessions"),
+            )),
+            model: Some(serde_json::from_value(serde_json::to_value(&model).unwrap()).unwrap()),
+            stream_fn: Some(crate::session_engine::provider_adapter::real_stream_fn(
+                None,
+                model.clone(),
+            )),
+            rlm_subagent_host: Some(host),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let runtime = engine.session.clm.as_ref().unwrap();
+        runtime
+            .set_mode(true, pa_types::clm::ClmModeSource::SessionOverride)
+            .await
+            .unwrap();
+        let tool = pa_ai::faux::FauxResponseStep::Message(pa_ai::faux::faux_assistant_message(
+            vec![pa_ai::faux::faux_tool_call(
+                "ipython",
+                &json!({"code":"await rlm.spawn('child', name='kid')"}),
+                Some("repeat"),
+            )],
+            pa_ai::faux::FauxAssistantMessageOptions {
+                stop_reason: Some(pa_types::ai::StopReason::ToolUse),
+                ..Default::default()
+            },
+        ));
+        let done =
+            pa_ai::faux::FauxResponseStep::Message(pa_ai::faux::faux_assistant_text_message(
+                "done",
+                pa_ai::faux::FauxAssistantMessageOptions::default(),
+            ));
+        provider.set_responses(vec![tool.clone(), done.clone(), tool, done]);
+        engine
+            .prompt("on", crate::session_engine::PromptOptions::default())
+            .await
+            .unwrap();
+        runtime
+            .set_mode(false, pa_types::clm::ClmModeSource::SessionOverride)
+            .await
+            .unwrap();
+        engine
+            .prompt("off", crate::session_engine::PromptOptions::default())
+            .await
+            .unwrap();
+        let requests = requests.lock().await;
+        assert_eq!(requests.len(), 2);
+        let first = requests[0].clm_admission.as_ref().expect("on admission");
+        let second = requests[1].clm_admission.as_ref().expect("off admission");
+        assert!(first.inherited_mode());
+        assert!(!second.inherited_mode());
+        first.recheck().await.unwrap();
+        assert!(first.inherited_mode());
+        provider.unregister();
+    }
+
+    #[tokio::test]
+    async fn clm_real_python_delayed_a_cannot_borrow_same_id_b_before_bridge_capture() {
+        use crate::session_engine::engine::{create_session, SessionEngineConfig};
+        let dir = tempfile::tempdir().unwrap();
+        let provider = pa_ai::faux::register_faux_provider(
+            pa_ai::faux::RegisterFauxProviderOptions::default(),
+        );
+        let model = provider.models[0].clone();
+        let host = RecordingHost::new();
+        let requests = host.spawn_requests.clone();
+        let wiring = wired(dir.path(), Some(host));
+        let run = wiring.handlers.get("rlm.run").unwrap().clone();
+        let frame_seen = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let rejected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut handlers = HostRequestHandlers::new();
+        handlers.register(
+            "rlm.run",
+            host_handler({
+                let frame_seen = frame_seen.clone();
+                let release = release.clone();
+                let rejected = rejected.clone();
+                move |payload| {
+                    let run = run.clone();
+                    let frame_seen = frame_seen.clone();
+                    let release = release.clone();
+                    let rejected = rejected.clone();
+                    async move {
+                        assert_eq!(payload.verified_tool_call_id.as_deref(), Some("repeat"));
+                        assert!(payload.verified_tool_execution_identity.is_some());
+                        let delayed = payload.data["prompt"] == "A";
+                        if delayed {
+                            frame_seen.notify_one();
+                            release.notified().await;
+                        }
+                        let result = run(payload).await;
+                        if delayed {
+                            rejected.store(result.is_err(), std::sync::atomic::Ordering::SeqCst);
+                        } else {
+                            assert!(
+                                result.is_ok(),
+                                "B must admit with its own identity: {result:?}"
+                            );
+                            release.notify_one();
+                        }
+                        result
+                    }
+                }
+            }),
+        );
+        handlers.register(
+            "frame_barrier",
+            host_handler(move |_| {
+                let frame_seen = frame_seen.clone();
+                async move {
+                    frame_seen.notified().await;
+                    Ok(json!({}))
+                }
+            }),
+        );
+        let engine = create_session(SessionEngineConfig {
+            cwd: dir.path().to_path_buf(),
+            agent_dir: dir.path().join("agent"),
+            session_manager: Some(SessionManager::persisted(
+                dir.path(),
+                &dir.path().join("sessions"),
+            )),
+            model: Some(serde_json::from_value(serde_json::to_value(&model).unwrap()).unwrap()),
+            stream_fn: Some(crate::session_engine::provider_adapter::real_stream_fn(
+                None,
+                model.clone(),
+            )),
+            extra_host_handlers: Some(handlers),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let runtime = engine.session.clm.as_ref().unwrap();
+        wiring.rlm.clm.set(Arc::downgrade(runtime)).unwrap();
+        runtime
+            .set_mode(true, pa_types::clm::ClmModeSource::SessionOverride)
+            .await
+            .unwrap();
+        let tool = |code: &str| {
+            pa_ai::faux::FauxResponseStep::Message(pa_ai::faux::faux_assistant_message(
+                vec![pa_ai::faux::faux_tool_call(
+                    "ipython",
+                    &json!({"code":code}),
+                    Some("repeat"),
+                )],
+                pa_ai::faux::FauxAssistantMessageOptions {
+                    stop_reason: Some(pa_types::ai::StopReason::ToolUse),
+                    ..Default::default()
+                },
+            ))
+        };
+        let done =
+            pa_ai::faux::FauxResponseStep::Message(pa_ai::faux::faux_assistant_text_message(
+                "done",
+                pa_ai::faux::FauxAssistantMessageOptions::default(),
+            ));
+        provider.set_responses(vec![
+            tool("import asyncio\nfrom rlm.repl import host_request\npending_a = asyncio.create_task(rlm.spawn('A', name='kid-a'))\nawait host_request({'type':'frame_barrier'})"),done.clone(),
+            tool("await rlm.spawn('B', name='kid-b')\ntry:\n    await pending_a\nexcept Exception as error:\n    print(str(error))"),done,
+        ]);
+        engine
+            .prompt("A", crate::session_engine::PromptOptions::default())
+            .await
+            .unwrap();
+        engine
+            .prompt("B", crate::session_engine::PromptOptions::default())
+            .await
+            .unwrap();
+        assert!(rejected.load(std::sync::atomic::Ordering::SeqCst));
+        let requests = requests.lock().await;
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].prompt, "B");
+        assert!(requests[0].clm_admission.as_ref().unwrap().inherited_mode());
+        provider.unregister();
+    }
+
+    #[tokio::test]
+    async fn clm_real_python_same_healthy_fence_admits_after_matching_done() {
+        use crate::session_engine::engine::{create_session, SessionEngineConfig};
+        struct DoneBarrierTool {
+            inner: Arc<dyn pa_agent::types::AgentTool>,
+            done: Arc<tokio::sync::Notify>,
+            admitted: Arc<tokio::sync::Notify>,
+        }
+        impl pa_agent::types::AgentTool for DoneBarrierTool {
+            fn name(&self) -> &str {
+                self.inner.name()
+            }
+            fn description(&self) -> &str {
+                self.inner.description()
+            }
+            fn parameters(&self) -> &Value {
+                self.inner.parameters()
+            }
+            fn label(&self) -> &str {
+                self.inner.label()
+            }
+            fn prepare_arguments(&self, args: &Value) -> Option<Value> {
+                self.inner.prepare_arguments(args)
+            }
+            fn accepts_alias(&self, name: &str) -> bool {
+                self.inner.accepts_alias(name)
+            }
+            fn execution_mode(&self) -> Option<pa_agent::types::ToolExecutionMode> {
+                self.inner.execution_mode()
+            }
+            fn execute(
+                self: Arc<Self>,
+                id: String,
+                args: Value,
+                signal: pa_agent::abort::AbortSignal,
+                update: pa_agent::types::AgentToolUpdateCallback,
+            ) -> pa_agent::BoxFut<'static, anyhow::Result<pa_agent::types::AgentToolResult>>
+            {
+                Box::pin(async move {
+                    let result = self.inner.clone().execute(id, args, signal, update).await?;
+                    assert_eq!(result.details["status"], "ok");
+                    self.done.notify_one();
+                    self.admitted.notified().await;
+                    Ok(result)
+                })
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let provider = pa_ai::faux::register_faux_provider(
+            pa_ai::faux::RegisterFauxProviderOptions::default(),
+        );
+        let model = provider.models[0].clone();
+        let host = RecordingHost::new();
+        let requests = host.spawn_requests.clone();
+        let wiring = wired(dir.path(), Some(host));
+        let run = wiring.handlers.get("rlm.run").unwrap().clone();
+        let frame_seen = Arc::new(tokio::sync::Notify::new());
+        let done = Arc::new(tokio::sync::Notify::new());
+        let admitted = Arc::new(tokio::sync::Notify::new());
+        let mut handlers = HostRequestHandlers::new();
+        handlers.register(
+            "rlm.run",
+            host_handler({
+                let frame_seen = frame_seen.clone();
+                let done = done.clone();
+                let admitted = admitted.clone();
+                move |payload| {
+                    let run = run.clone();
+                    let frame_seen = frame_seen.clone();
+                    let done = done.clone();
+                    let admitted = admitted.clone();
+                    async move {
+                        assert!(payload.verified_tool_execution_identity.is_some());
+                        frame_seen.notify_one();
+                        done.notified().await;
+                        let result = run(payload).await;
+                        admitted.notify_one();
+                        result
+                    }
+                }
+            }),
+        );
+        handlers.register(
+            "frame_barrier",
+            host_handler(move |_| {
+                let frame_seen = frame_seen.clone();
+                async move {
+                    frame_seen.notified().await;
+                    Ok(json!({}))
+                }
+            }),
+        );
+        let engine = create_session(SessionEngineConfig {
+            cwd: dir.path().to_path_buf(),
+            agent_dir: dir.path().join("agent"),
+            session_manager: Some(SessionManager::persisted(
+                dir.path(),
+                &dir.path().join("sessions"),
+            )),
+            model: Some(serde_json::from_value(serde_json::to_value(&model).unwrap()).unwrap()),
+            stream_fn: Some(crate::session_engine::provider_adapter::real_stream_fn(
+                None,
+                model.clone(),
+            )),
+            extra_host_handlers: Some(handlers),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let runtime = engine.session.clm.as_ref().unwrap();
+        wiring.rlm.clm.set(Arc::downgrade(runtime)).unwrap();
+        runtime
+            .set_mode(true, pa_types::clm::ClmModeSource::SessionOverride)
+            .await
+            .unwrap();
+        let mut wrapped = 0;
+        let tools = engine
+            .session
+            .agent
+            .state()
+            .await
+            .tools
+            .into_iter()
+            .map(|inner| {
+                if pa_types::ai::is_python_tool_name(inner.name()) {
+                    wrapped += 1;
+                }
+                if pa_types::ai::is_python_tool_name(inner.name()) {
+                    Arc::new(DoneBarrierTool {
+                        inner,
+                        done: done.clone(),
+                        admitted: admitted.clone(),
+                    }) as Arc<dyn pa_agent::types::AgentTool>
+                } else {
+                    inner
+                }
+            })
+            .collect();
+        assert_eq!(wrapped, 1, "the actual builtin Python tool must be wrapped");
+        engine.session.agent.set_tools(tools).await;
+        provider.set_responses(vec![pa_ai::faux::FauxResponseStep::Message(pa_ai::faux::faux_assistant_message(
+            vec![pa_ai::faux::faux_tool_call("ipython",&json!({"code":"import asyncio\nfrom rlm.repl import host_request\npending = asyncio.create_task(rlm.spawn('A', name='kid'))\nawait host_request({'type':'frame_barrier'})"}),Some("A"))],
+            pa_ai::faux::FauxAssistantMessageOptions {stop_reason:Some(pa_types::ai::StopReason::ToolUse),..Default::default()}
+        )),pa_ai::faux::FauxResponseStep::Message(pa_ai::faux::faux_assistant_text_message("done",pa_ai::faux::FauxAssistantMessageOptions::default()))]);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            engine.prompt("A", crate::session_engine::PromptOptions::default()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let requests = requests.lock().await;
+        assert_eq!(
+            requests.len(),
+            1,
+            "the same healthy A fence remains valid after physical Done"
+        );
+        assert!(requests[0].clm_admission.as_ref().unwrap().inherited_mode());
+        provider.unregister();
     }
 
     #[tokio::test]

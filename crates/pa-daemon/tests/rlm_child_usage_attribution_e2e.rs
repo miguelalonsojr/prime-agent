@@ -467,3 +467,153 @@ fn child_usage_attributed_row_reaches_the_parent_transcript() {
         "the reopened store folds the aggregate into the target row"
     );
 }
+
+#[test]
+fn clm_on_parent_spawns_on_child_through_supervisor() {
+    assert_child_inherits_parent_clm_mode(true);
+}
+
+#[test]
+fn clm_off_parent_spawns_off_child_despite_global_default() {
+    assert_child_inherits_parent_clm_mode(false);
+}
+
+fn assert_child_inherits_parent_clm_mode(enabled: bool) {
+    let Some(kernel_python) = kernel_python() else {
+        return;
+    };
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let agent_dir = dir.path().join("agent");
+    std::fs::create_dir_all(&agent_dir).expect("agent dir");
+    std::fs::write(
+        agent_dir.join("settings.json"),
+        json!({"clm": {"enabled": !enabled}, "compaction": {"enabled": false}}).to_string(),
+    )
+    .expect("contrasting global default");
+    let socket = dir.path().join("supervisor.sock");
+    let spawn_receipt = dir.path().join("spawn.json");
+    let spawn_error = dir.path().join("spawn.error");
+    let parent_script = dir.path().join("parent.json");
+    let child_script = dir.path().join("child.json");
+    std::fs::write(
+        &parent_script,
+        json!({
+            "engine": "faux",
+            "responses": [
+                {"text": "parent seed"},
+                {"content": [{"type": "toolCall", "name": "ipython", "arguments": {
+                    "code": spawn_cell(&spawn_receipt, &spawn_error)
+                }}]},
+                {"text": "spawn done"}
+            ]
+        })
+        .to_string(),
+    )
+    .expect("parent script");
+    std::fs::write(
+        &child_script,
+        json!({
+            "engine": "faux", "responses": [{"text": "child reply"}]
+        })
+        .to_string(),
+    )
+    .expect("child script");
+    let _daemon = spawn_supervisor(&socket, &agent_dir, &kernel_python);
+    wait_socket_ready(&socket);
+    let (mut client, hello) = Client::connect(&socket);
+    assert_eq!(hello["type"], "daemon_hello");
+    let parent = create_parent(&mut client, dir.path(), &parent_script, &child_script, "c1");
+    let parent_id = parent["activeSessionId"]
+        .as_str()
+        .or_else(|| parent["id"].as_str())
+        .expect("parent active id");
+    let parent_file = Path::new(parent["sessionFile"].as_str().expect("parent file"));
+    run_turn(&mut client, parent_id, "parent seed", "seed");
+    client.send_command(
+        "mode",
+        &json!({
+            "type": "set_clm_mode", "activeSessionId": parent_id, "enabled": enabled
+        }),
+    );
+    let parent_mode = client.read_response("mode");
+    assert_eq!(parent_mode["success"], true, "{parent_mode}");
+    let expected_mode = if enabled { "on" } else { "off" };
+    assert_eq!(parent_mode["data"]["mode"], expected_mode);
+    run_turn(&mut client, parent_id, "spawn the kid", "spawn");
+    let spawned: Value =
+        serde_json::from_str(&await_receipt(&spawn_receipt)).expect("spawn receipt");
+    assert!(
+        !spawn_error.exists(),
+        "{}",
+        std::fs::read_to_string(&spawn_error).unwrap_or_default()
+    );
+    client.send_command("list", &json!({"type": "list"}));
+    let listed = client.read_response("list");
+    assert_eq!(listed["success"], true, "{listed}");
+    let child = listed["data"]["sessions"]
+        .as_array()
+        .expect("sessions")
+        .iter()
+        .find(|row| row["sessionName"] == "kid" && row["runtimeKind"] == "subagent")
+        .expect("spawned child in supervisor roster");
+    let child_id = child["activeSessionId"]
+        .as_str()
+        .or_else(|| child["id"].as_str())
+        .expect("child active id");
+    let child_file = Path::new(child["sessionFile"].as_str().expect("child file"));
+    assert_eq!(
+        child_file.parent().unwrap().to_string_lossy(),
+        spawned["session_dir"].as_str().unwrap()
+    );
+    client.send_command(
+        "child-mode",
+        &json!({
+            "type": "get_clm_status", "activeSessionId": child_id
+        }),
+    );
+    let child_mode = client.read_response("child-mode");
+    assert_eq!(child_mode["success"], true, "{child_mode}");
+    assert_eq!(child_mode["data"]["mode"], expected_mode, "{child_mode}");
+    assert_eq!(
+        child_mode["data"]["modeSource"], "inherited-child",
+        "{child_mode}"
+    );
+    assert_eq!(child_mode["data"]["configuredDefault"], !enabled);
+    if enabled {
+        assert!(child_mode["data"]["epochId"].is_string());
+        assert_ne!(
+            child_mode["data"]["epochId"],
+            parent_mode["data"]["epochId"]
+        );
+    }
+    let deadline = Instant::now() + Duration::from_mins(2);
+    let attributed = loop {
+        if let Some(row) = transcript_rows(parent_file)
+            .into_iter()
+            .find(|row| row["type"] == "child_usage_attributed")
+        {
+            break row;
+        }
+        assert!(Instant::now() < deadline, "child usage was not attributed");
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    let child_usage = settled_child_usage(child_file);
+    assert!(child_usage["totalTokens"].as_u64().unwrap() > 0);
+    assert_eq!(attributed["childUsage"], child_usage);
+    let parent_rows = transcript_rows(parent_file);
+    let target = parent_rows
+        .iter()
+        .find(|row| row["id"] == attributed["targetId"])
+        .expect("attribution target in parent transcript");
+    assert_eq!(target["message"]["role"], "assistant");
+    assert_eq!(
+        numbers_as_f64(attributed["aggregateUsage"].clone()),
+        numbers_as_f64(add_usage(&target["message"]["usage"], &child_usage))
+    );
+    let child_rows = transcript_rows(child_file);
+    let receipt = child_rows
+        .iter()
+        .find(|row| row["customType"] == "clm_usage_v1")
+        .expect("observed child provider usage");
+    assert_eq!(receipt["data"]["pin"]["mode"], expected_mode);
+}

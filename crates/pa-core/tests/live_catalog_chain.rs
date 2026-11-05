@@ -556,6 +556,8 @@ async fn registered_find_models_shows_authenticated_manual_codex_model() {
         .get("rlm.find_models")
         .expect("registered handler");
     let result = handler(HostRequestPayload {
+        verified_tool_call_id: None,
+        verified_tool_execution_identity: None,
         data: json!({"query": "gpt-5.1-local-manual"}),
     })
     .await

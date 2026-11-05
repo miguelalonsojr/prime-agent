@@ -90,7 +90,10 @@ async fn spawn_gated_supervisor(
                             command_type,
                             Some(json!({ "text": "the child final answer" })),
                         ),
-                        "kill" => response_success(Some(&id), command_type, None),
+                        "kill" => {
+                            let _ = rename_seen_tx.send(command.clone());
+                            response_success(Some(&id), command_type, None)
+                        }
                         "rename" => {
                             let _ = rename_seen_tx.send(command.clone());
                             if let Some(gate) = &rename_verdict_rx {
@@ -161,6 +164,7 @@ fn spawn_request(name: &str, prompt: &str) -> RlmSpawnRequest {
         model: None,
         thinking: None,
         spawned_by_request_id: None,
+        clm_admission: None,
     }
 }
 
@@ -463,4 +467,71 @@ async fn concurrent_parent_renames_keep_the_last_applied_name() {
     );
     let rows = sessions.list_subagents().await.expect("roster");
     assert_eq!(rows[0].session_name, "second");
+}
+
+#[tokio::test]
+async fn clm_child_rechecks_after_provision_and_only_kills_the_provisional_child() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = Arc::new(std::sync::Mutex::new(
+        pa_core::session::manager::SessionManager::persisted(
+            dir.path(),
+            &dir.path().join("parent"),
+        ),
+    ));
+    let journal: pa_core::clm::journal::ClmJournalFn = Arc::new(move |operation| {
+        let result = manager
+            .lock()
+            .unwrap()
+            .clm_journal(operation, std::collections::BTreeMap::default());
+        Box::pin(async move { Ok(result?) })
+    });
+    let runtime = pa_core::session_engine::clm::ClmRuntime::new(
+        journal,
+        None,
+        dir.path().join("artifacts"),
+        std::sync::Arc::default(),
+    )
+    .await
+    .unwrap();
+    let admission = runtime.admit_child(None, None).await.unwrap();
+    runtime
+        .set_mode(true, pa_types::clm::ClmModeSource::SessionOverride)
+        .await
+        .unwrap();
+    let (create_seen_tx, mut create_seen_rx) = mpsc::unbounded_channel();
+    let (verdict_tx, verdict_rx) = mpsc::unbounded_channel();
+    let (cleanup_tx, mut cleanup_rx) = mpsc::unbounded_channel();
+    let sessions =
+        sessions_with_gated_supervisor(create_seen_tx, verdict_rx, cleanup_tx, None).await;
+    let mut request = spawn_request("provisional", "must not register");
+    request.clm_admission = Some(admission);
+    let spawned = tokio::spawn(sessions.spawn(request.clone()));
+    let created_command = create_seen_rx.recv().await.unwrap();
+    assert_eq!(
+        created_command["config"]["inheritedClmMode"], false,
+        "pass saved false, not the later parent mode"
+    );
+    runtime.fail(&"parent invalidated while child provisioned");
+    verdict_tx.send(true).unwrap();
+    let result = spawned.await.unwrap();
+    assert!(
+        result.is_err(),
+        "invalidated admission must fail before registration"
+    );
+    assert!(sessions.list_subagents().await.unwrap().is_empty());
+    let cleanup = tokio::time::timeout(Duration::from_secs(2), cleanup_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(cleanup["type"], "kill");
+    assert_eq!(cleanup["activeSessionId"], "child-live");
+    assert!(!sessions.spawn_name_reserved("provisional"));
+    let retry = tokio::time::timeout(Duration::from_secs(2), sessions.spawn(request))
+        .await
+        .unwrap();
+    assert!(retry.is_err());
+    assert!(
+        create_seen_rx.try_recv().is_err(),
+        "invalidated parent must fail before another create"
+    );
 }

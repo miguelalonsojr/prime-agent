@@ -469,7 +469,7 @@ impl super::AgentSession {
         {
             return Ok(None);
         }
-        Ok(self.fresh_digest().await.map(|render| {
+        Ok(self.fresh_digest().await?.map(|render| {
             harness_digest_prompt_row(
                 &render.digest,
                 super::now_millis(),
@@ -501,11 +501,11 @@ impl super::AgentSession {
     /// The digest to deliver at this boundary, when the newest in-context digest
     /// is stale against it: a fingerprint match is fresh regardless of the
     /// rendered text. The comparison is against the live loop context only.
-    async fn fresh_digest(&self) -> Option<HarnessDigestRender> {
-        let fresh = self
-            .harness_digest_inputs()
-            .await?
-            .render_with_fingerprint();
+    async fn fresh_digest(&self) -> anyhow::Result<Option<HarnessDigestRender>> {
+        let Some(inputs) = self.harness_digest_inputs().await else {
+            return Ok(None);
+        };
+        let fresh = inputs.render_with_fingerprint();
         let mut latest = latest_context_digest_details(&self.agent.state().await.messages);
         // Fingerprint recovery for converted rows (a rebuild drops the typed payload):
         // a fingerprint-less latest borrows the typed row's fingerprint when it is the same digest.
@@ -514,7 +514,9 @@ impl super::AgentSession {
             .is_some_and(|details| details.state_fingerprint.is_none())
         {
             let session = self.session.lock().await;
-            if let Some(typed) = latest_typed_digest_details(&session.active_context().messages) {
+            if let Some(typed) =
+                latest_typed_digest_details(&session.active_context_checked()?.messages)
+            {
                 if latest
                     .as_ref()
                     .is_some_and(|details| details.digest == typed.digest)
@@ -530,14 +532,14 @@ impl super::AgentSession {
             },
             None => false,
         };
-        (!fresh_matches).then_some(fresh)
+        Ok((!fresh_matches).then_some(fresh))
     }
 
     /// Deliver a stale digest onto an already-populated loop context: the row
     /// is pushed directly and persisted eagerly, without events. The fresh
     /// digest is authoritative, so the append replaces older in-context copies.
     async fn append_stale_harness_digest(&self) -> anyhow::Result<()> {
-        let Some(render) = self.fresh_digest().await else {
+        let Some(render) = self.fresh_digest().await? else {
             return Ok(());
         };
         // The newest in-context digest is the provenance marker: the converted

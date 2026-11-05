@@ -128,6 +128,8 @@ impl AgentSessionEngine {
         // unseeded (None keeps the TS default "one-at-a-time").
         let queue_modes = std::sync::Mutex::new((None, None));
         Ok(Self {
+            clm_journal: std::sync::Mutex::new(None),
+            clm_helper_receipt: std::sync::Mutex::new(None),
             runtime,
             config,
             mcp,
@@ -190,6 +192,8 @@ impl AgentSessionEngine {
             autonomous_queue_purge: std::sync::Mutex::new(None),
             cwd,
             rlm_depth: std::sync::atomic::AtomicU32::new(0),
+            inherited_clm_mode: std::sync::Mutex::new(None),
+            clm_default_eligible: std::sync::atomic::AtomicBool::new(true),
             rlm_max_depth_source: std::sync::Mutex::new("default"),
             pending_max_depth: std::sync::Mutex::new(None),
             reloaded_goal_update: std::sync::Mutex::new(None),
@@ -567,10 +571,10 @@ impl AgentSessionEngine {
                             "prompt context boundary {leaf} is absent from the retained transcript"
                         );
                         Some(
-                            pa_core::session::build_session_context(
+                            pa_core::session::clm::build_session_context_checked(
                                 entries.expect("a found boundary has entries"),
                                 Some(leaf),
-                            )
+                            )?
                             .messages,
                         )
                     }
@@ -668,7 +672,7 @@ impl AgentSessionEngine {
         }
         // Restore the retained context and certified metadata without loading discarded bodies.
         if let Some(window) = shared_window {
-            built.session.restore_windowed_context(window).await;
+            built.session.restore_windowed_context(window).await?;
             // This worker holds the runtime lease: exactly one writer per
             // lease certifies the window cache; the release flushes the
             // snapshot.
@@ -1109,6 +1113,13 @@ impl AgentSessionEngine {
                 ..Default::default()
             });
         }
+        // Runtime rebuilds mirror an existing owner; only fresh owner creation renews this flag.
+        if !self
+            .clm_default_eligible
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            session_manager.consume_clm_default_eligibility();
+        }
         if let Some(children) = &self.children {
             children.set_model(format!("{}/{}", model.provider, model.id));
         }
@@ -1179,7 +1190,20 @@ impl AgentSessionEngine {
             .lock()
             .expect("late agent message sink lock")
             .clone();
+        let clm_journal = self.clm_journal.lock().expect("CLM journal lock").clone();
+        let clm_helper_receipt = self
+            .clm_helper_receipt
+            .lock()
+            .expect("CLM helper receipt lock")
+            .clone();
+        let inherited_clm_mode = *self
+            .inherited_clm_mode
+            .lock()
+            .expect("inherited CLM mode lock");
         pa_core::session_engine::engine::create_session(SessionEngineConfig {
+            clm_journal,
+            clm_helper_receipt,
+            inherited_clm_mode,
             on_late_sent_agent_message,
             semantic_edges,
             telemetry,

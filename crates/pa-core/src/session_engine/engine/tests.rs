@@ -64,6 +64,9 @@ async fn engine_runs_tool_loop_and_persists() {
         inner_stream(model, context, options)
     });
     let engine = create_session(SessionEngineConfig {
+        clm_journal: None,
+        clm_helper_receipt: None,
+        inherited_clm_mode: None,
         on_late_sent_agent_message: None,
         semantic_edges: None,
         cron_store: None,
@@ -173,6 +176,9 @@ async fn spawned_child_prompt_stamps_its_depth() {
     let cwd = tmp.path().join("project");
     std::fs::create_dir_all(&cwd).unwrap();
     let engine = create_session(SessionEngineConfig {
+        clm_journal: None,
+        clm_helper_receipt: None,
+        inherited_clm_mode: None,
         on_late_sent_agent_message: None,
         semantic_edges: None,
         cron_store: None,
@@ -245,6 +251,9 @@ async fn oauth_creds_unlock_generic_mcp_gating_in_new_sessions() {
         stream_fn: pa_agent::stream::StreamFn,
     ) -> SessionEngineConfig {
         SessionEngineConfig {
+            clm_journal: None,
+            clm_helper_receipt: None,
+            inherited_clm_mode: None,
             on_late_sent_agent_message: None,
             semantic_edges: None,
             cron_store: None,
@@ -375,6 +384,9 @@ async fn create_session_registers_the_kernel_backed_tools_without_cron_wiring() 
     let agent_model = crate::session_engine::provider_adapter::json_round_trip(&model).unwrap();
     let stream_fn = crate::session_engine::provider_adapter::real_stream_fn(None, model.clone());
     let engine = create_session(SessionEngineConfig {
+        clm_journal: None,
+        clm_helper_receipt: None,
+        inherited_clm_mode: None,
         cron_store: None,
         cwd: dir.path().to_path_buf(),
         agent_dir: dir.path().to_path_buf(),
@@ -434,6 +446,9 @@ async fn create_session_appends_missing_resume_settings_rows() {
         ))
         .unwrap();
     let engine = create_session(SessionEngineConfig {
+        clm_journal: None,
+        clm_helper_receipt: None,
+        inherited_clm_mode: None,
         on_late_sent_agent_message: None,
         semantic_edges: None,
         cron_store: None,
@@ -545,6 +560,9 @@ async fn engine_over(
     let cwd = tmp.path().join("project");
     std::fs::create_dir_all(&cwd).unwrap();
     let engine = create_session(SessionEngineConfig {
+        clm_journal: None,
+        clm_helper_receipt: None,
+        inherited_clm_mode: None,
         cron_store,
         cwd: cwd.clone(),
         agent_dir: tmp.path().join("agent"),
@@ -714,6 +732,9 @@ async fn engine_build_restores_late_sent_agent_message_receipts() {
     };
     let provider = Arc::new(ScriptedProvider::new(model.clone()));
     let engine = create_session(SessionEngineConfig {
+        clm_journal: None,
+        clm_helper_receipt: None,
+        inherited_clm_mode: None,
         cwd: cwd.clone(),
         agent_dir: tmp.path().join("agent"),
         model: Some(model),
@@ -816,6 +837,9 @@ async fn late_receipts_recorded_before_the_row_lands_apply_on_landing() {
         }),
     };
     let engine = create_session(SessionEngineConfig {
+        clm_journal: None,
+        clm_helper_receipt: None,
+        inherited_clm_mode: None,
         on_late_sent_agent_message: None,
         semantic_edges: None,
         cron_store: None,
@@ -913,4 +937,136 @@ async fn late_receipts_recorded_before_the_row_lands_apply_on_landing() {
         )),
         "the receipt persists as a custom entry"
     );
+}
+
+#[tokio::test]
+async fn external_compaction_adopts_the_owner_tail_before_prepare() {
+    use crate::clm::journal::ClmJournalFn;
+    use crate::session::manager::SessionManager;
+    use pa_types::session::AgentMessage as SessionMessage;
+
+    let dir = tempfile::tempdir().unwrap();
+    let agent_dir = dir.path().join("agent");
+    std::fs::create_dir_all(&agent_dir).unwrap();
+    std::fs::write(
+        agent_dir.join("settings.json"),
+        r#"{"compaction":{"keepRecentTokens":10}}"#,
+    )
+    .unwrap();
+    let provider =
+        pa_ai::faux::register_faux_provider(pa_ai::faux::RegisterFauxProviderOptions::default());
+    let model = provider.models[0].clone();
+    let reply = || {
+        SessionMessage::Assistant(pa_ai::faux::faux_assistant_text_message(
+            "parity reply",
+            pa_ai::faux::FauxAssistantMessageOptions::default(),
+        ))
+    };
+    let sessions = dir.path().join("sessions");
+    let mut manager = SessionManager::persisted(dir.path(), &sessions);
+    manager
+        .append_message(
+            serde_json::from_value(serde_json::json!({
+                "role": "user", "content": "seed turn", "timestamp": 1
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    manager.append_message(reply()).unwrap();
+    let crossing_user = manager
+        .append_message(
+            serde_json::from_value(serde_json::json!({
+                "role": "user", "content": "crossing turn", "timestamp": 2
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    let owner = Arc::new(tokio::sync::Mutex::new(manager));
+    let journal: ClmJournalFn = Arc::new({
+        let owner = owner.clone();
+        move |op| {
+            let owner = owner.clone();
+            Box::pin(async move {
+                Ok(owner
+                    .lock()
+                    .await
+                    .clm_journal(op, crate::clm::ProtectedActions::new())?)
+            })
+        }
+    });
+    let receipt: crate::session_engine::clm::ClmHelperReceiptFn = Arc::new({
+        let owner = owner.clone();
+        move |_, receipt: serde_json::Value| {
+            let owner = owner.clone();
+            Box::pin(async move {
+                Ok(owner.lock().await.append_custom_entry(
+                    receipt["customType"].as_str().unwrap(),
+                    receipt.get("data").cloned(),
+                )?)
+            })
+        }
+    });
+    let conversation_log_path = owner
+        .lock()
+        .await
+        .get_session_file()
+        .map(std::path::Path::to_path_buf);
+    let engine = create_session(SessionEngineConfig {
+        cwd: dir.path().to_path_buf(),
+        agent_dir,
+        conversation_log_path,
+        session_manager: Some(SessionManager::in_memory_in_session_dir(
+            dir.path(),
+            &sessions,
+        )),
+        model: Some(serde_json::from_value(serde_json::to_value(&model).unwrap()).unwrap()),
+        clm_journal: Some(journal),
+        clm_helper_receipt: Some(receipt),
+        stream_fn: Some(crate::session_engine::provider_adapter::real_stream_fn(
+            None,
+            model.clone(),
+        )),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    assert!(engine.session.clm.is_some());
+    let crossing_assistant = owner.lock().await.append_message(reply()).unwrap();
+    assert!(engine
+        .session
+        .entries()
+        .await
+        .iter()
+        .any(|entry| entry.id() == Some(crossing_user.as_str())));
+    assert!(!engine
+        .session
+        .entries()
+        .await
+        .iter()
+        .any(|entry| entry.id() == Some(crossing_assistant.as_str())));
+    provider.set_responses(vec![pa_ai::faux::FauxResponseStep::Message(
+        pa_ai::faux::faux_assistant_text_message(
+            "one summary",
+            pa_ai::faux::FauxAssistantMessageOptions::default(),
+        ),
+    )]);
+
+    let outcome = engine.session.compact(None, &model, None, None).await;
+    provider.unregister();
+    assert!(
+        matches!(
+            outcome,
+            Ok(crate::session_engine::compact_session::CompactOutcome::Ran(
+                _
+            ))
+        ),
+        "{outcome:?}"
+    );
+    assert_eq!(provider.call_count(), 1);
+    assert!(engine
+        .session
+        .entries()
+        .await
+        .iter()
+        .any(|entry| entry.id() == Some(crossing_assistant.as_str())));
 }

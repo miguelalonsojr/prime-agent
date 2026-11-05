@@ -14,6 +14,7 @@ async fn execute_compaction_persists_and_rebuilds() {
     let result = execute_compaction(
         &mut session,
         CompactOptions {
+            clm: None,
             model,
             api_key: None,
             custom_instructions: Some("focus on the goal"),
@@ -46,7 +47,7 @@ async fn execute_compaction_persists_and_rebuilds() {
         .any(|entry| matches!(entry, FileEntry::Compaction { .. })));
     // The live context keeps the summary role; provider conversion
     // still formats it as a user turn.
-    let rebuilt = rebuilt_context_after_compaction(&session);
+    let rebuilt = rebuilt_context_after_compaction(&session).unwrap();
     assert!(!rebuilt.is_empty());
     assert!(matches!(&rebuilt[0], AgentMessage::CompactionSummary(_)));
     let provider_messages = super::super::messages::convert_to_llm(&rebuilt);
@@ -106,6 +107,7 @@ async fn rebuilt_live_context_prevents_repeat_auto_compaction_until_new_usage() 
     let outcome = execute_compaction(
         &mut session,
         CompactOptions {
+            clm: None,
             model,
             api_key: None,
             custom_instructions: None,
@@ -120,7 +122,7 @@ async fn rebuilt_live_context_prevents_repeat_auto_compaction_until_new_usage() 
     .await
     .unwrap();
     assert!(matches!(outcome, CompactOutcome::Ran(_)));
-    let mut live = rebuilt_context_after_compaction(&session);
+    let mut live = rebuilt_context_after_compaction(&session).unwrap();
     let summary_timestamp = match &live[0] {
         AgentMessage::CompactionSummary(summary) => summary.timestamp,
         other => panic!("expected live compaction boundary, got {other:?}"),
@@ -188,6 +190,7 @@ async fn execute_compaction_streams_summary_deltas_to_the_sink() {
     let outcome = execute_compaction(
         &mut session,
         CompactOptions {
+            clm: None,
             model,
             api_key: None,
             custom_instructions: None,
@@ -269,7 +272,7 @@ async fn split_turn_compaction_streams_in_final_order_and_converges() {
     session.append_message(reply("reply three")).unwrap();
     // The tiny keep-recent budget lands the cut on the big turn's
     // assistant reply — a mid-turn (split) cut.
-    let (cut, _) = compute_cut(&session, 10);
+    let (cut, _) = compute_cut(&session, 10).unwrap();
     assert!(cut.is_split_turn);
 
     // Two scripted summaries (the factories answer in issue order,
@@ -292,6 +295,7 @@ async fn split_turn_compaction_streams_in_final_order_and_converges() {
     let outcome = execute_compaction(
         &mut session,
         CompactOptions {
+            clm: None,
             model,
             api_key: None,
             custom_instructions: None,
@@ -400,6 +404,7 @@ async fn execute_compaction_attaches_harness_digest_snapshot() {
     let result = execute_compaction(
         &mut session,
         CompactOptions {
+            clm: None,
             model,
             api_key: None,
             custom_instructions: None,
@@ -471,7 +476,7 @@ async fn execute_compaction_attaches_harness_digest_snapshot() {
     crate::refinement::save_harness_state(&local_dir, &state).unwrap();
     let changed = inputs.render_with_fingerprint();
     assert_ne!(changed.state_fingerprint, fingerprint);
-    let rebuilt = rebuilt_context_after_compaction(&session);
+    let rebuilt = rebuilt_context_after_compaction(&session).unwrap();
     assert!(matches!(&rebuilt[0], AgentMessage::CompactionSummary(_)));
     let provider_messages = super::super::messages::convert_to_llm(&rebuilt);
     let AgentMessage::User(user) = &provider_messages[0] else {
@@ -510,6 +515,7 @@ async fn execute_compaction_fails_on_an_error_summarizer_response() {
     let error = execute_compaction(
         &mut session,
         CompactOptions {
+            clm: None,
             model,
             api_key: None,
             custom_instructions: None,
@@ -556,6 +562,7 @@ async fn execute_compaction_fails_on_an_empty_summarizer_response() {
     let error = execute_compaction(
         &mut session,
         CompactOptions {
+            clm: None,
             model,
             api_key: None,
             custom_instructions: None,
@@ -604,6 +611,7 @@ async fn execute_compaction_retries_a_length_capped_summarizer_response() {
     let outcome = execute_compaction(
         &mut session,
         CompactOptions {
+            clm: None,
             model,
             api_key: None,
             custom_instructions: None,
@@ -651,6 +659,7 @@ async fn execute_compaction_accepts_a_twice_capped_summary_behind_the_marker() {
     let outcome = execute_compaction(
         &mut session,
         CompactOptions {
+            clm: None,
             model,
             api_key: None,
             custom_instructions: None,
@@ -694,10 +703,11 @@ async fn durable_compaction_row_carries_the_ts_record() {
     let model = registration.get_model();
     let tmp = tempfile::tempdir().unwrap();
     let mut session = session_with_turns(tmp.path(), 3);
-    let before = context_tokens(session.get_all_entries(), session.get_leaf_id());
+    let before = context_tokens(session.get_all_entries(), session.get_leaf_id()).unwrap();
     let outcome = execute_compaction(
         &mut session,
         CompactOptions {
+            clm: None,
             model,
             api_key: None,
             custom_instructions: None,

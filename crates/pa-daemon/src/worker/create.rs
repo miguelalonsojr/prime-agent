@@ -390,6 +390,9 @@ impl Worker {
             self.engine.set_session_file(store.path.clone());
         }
 
+        self.engine
+            .configure_clm_default_eligibility(!opened_existing_session);
+
         // The `models` patterns (else settings `enabledModels`) resolve once into
         // the scoped list, AFTER the store open (the saved-model restore's wait
         // already covered the catalog fetch): resolving earlier stores an empty scope.
@@ -590,6 +593,7 @@ impl Worker {
         // persistence ids, the children's default thinking level.
         if let Err(error) = self.engine.configure_rlm_identity(RlmSessionIdentity {
             rlm_depth,
+            inherited_clm_mode: payload.get("inheritedClmMode").and_then(Value::as_bool),
             rlm_max_depth,
             cwd: Some(summary.cwd.clone()),
             session_id: Some(summary.session_id.clone()),

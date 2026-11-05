@@ -72,6 +72,7 @@ impl SupervisorChildSessionsInner {
         // metadata (`None` for a depth-0 resident session).
         prompt: Option<&str>,
         depth: u32,
+        inherited_clm_mode: Option<bool>,
         model: &str,
         thinking: Option<&str>,
         cwd: &str,
@@ -90,6 +91,9 @@ impl SupervisorChildSessionsInner {
             "rlmDepth": depth,
             "rlmMaxDepth": identity.rlm_max_depth,
         });
+        if let Some(inherited) = inherited_clm_mode {
+            config["inheritedClmMode"] = json!(inherited);
+        }
         if let Some((provider, id)) = model.split_once('/') {
             config["provider"] = json!(provider);
             config["model"] = json!(id);
@@ -179,6 +183,7 @@ impl SupervisorChildSessionsInner {
                 name,
                 None,
                 depth,
+                None,
                 model,
                 thinking,
                 cwd,
@@ -1008,6 +1013,9 @@ pub(super) fn final_turn_error_from_file(session_file: &str) -> Option<String> {
             }
             FileEntry::Message { .. } => return None,
             FileEntry::Header { .. }
+            | FileEntry::ClmOn { .. }
+            | FileEntry::ClmRevision { .. }
+            | FileEntry::ClmOffBoundary { .. }
             | FileEntry::ToolStarted { .. }
             | FileEntry::ToolProgress { .. }
             | FileEntry::ThinkingLevelChange { .. }

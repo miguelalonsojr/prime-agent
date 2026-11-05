@@ -242,6 +242,9 @@ pub trait SessionEngine: Send + Sync {
         let _ = path;
     }
 
+    /// Configure one-shot default eligibility from the owner creation path.
+    fn configure_clm_default_eligibility(&self, _eligible: bool) {}
+
     /// Capture the worker-owned durable leaf before the current prompt rows
     /// persist. Lazy engines restore model context only through this boundary;
     /// admission supplies the current rows once. This must not build a session.

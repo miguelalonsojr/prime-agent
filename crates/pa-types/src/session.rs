@@ -9,6 +9,7 @@ use serde_json::Value;
 use crate::ai::{
     AssistantMessage, ServiceTier, ToolResultMessage, Usage, UserContent, UserMessage,
 };
+use crate::clm::{ClmOffBoundaryEntry, ClmOnEntry, ClmRevisionEntry};
 use crate::JsonMap;
 
 /// Git repository identity captured alongside session headers and `git_state` entries.
@@ -338,9 +339,8 @@ pub struct CustomMessageEntry {
 /// One line of a session JSONL file: the header on line one, then tree entries sharing `id`,
 /// `parentId` (null at the root), and an ISO-8601 `timestamp`; the `type` tag selects the payload.
 ///
-/// Deserialization is catch-all like the TS loader: an unknown `type`, or a known kind whose
-/// payload fails validation, degrades verbatim to [`FileEntry::Unknown`] instead of failing the
-/// whole session load.
+/// Unknown types and malformed non-CLM entries round-trip as [`FileEntry::Unknown`].
+/// Malformed recognized CLM rows fail closed; they cannot replay as ordinary audit history.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(
     tag = "type",
@@ -358,6 +358,25 @@ pub enum FileEntry {
         #[serde(flatten)]
         base: EntryBase,
     },
+    ClmOn {
+        #[serde(flatten)]
+        payload: ClmOnEntry,
+        #[serde(flatten)]
+        base: EntryBase,
+    },
+    ClmRevision {
+        #[serde(flatten)]
+        payload: ClmRevisionEntry,
+        #[serde(flatten)]
+        base: EntryBase,
+    },
+    ClmOffBoundary {
+        #[serde(flatten)]
+        payload: ClmOffBoundaryEntry,
+        #[serde(flatten)]
+        base: EntryBase,
+    },
+
     ToolStarted {
         #[serde(flatten)]
         payload: ToolStartedEntry,
@@ -469,6 +488,25 @@ enum KnownFileEntry {
         #[serde(flatten)]
         base: EntryBase,
     },
+    ClmOn {
+        #[serde(flatten)]
+        payload: ClmOnEntry,
+        #[serde(flatten)]
+        base: EntryBase,
+    },
+    ClmRevision {
+        #[serde(flatten)]
+        payload: ClmRevisionEntry,
+        #[serde(flatten)]
+        base: EntryBase,
+    },
+    ClmOffBoundary {
+        #[serde(flatten)]
+        payload: ClmOffBoundaryEntry,
+        #[serde(flatten)]
+        base: EntryBase,
+    },
+
     ToolStarted {
         #[serde(flatten)]
         payload: ToolStartedEntry,
@@ -560,6 +598,11 @@ impl From<KnownFileEntry> for FileEntry {
         match entry {
             KnownFileEntry::Header { header } => Self::Header { header },
             KnownFileEntry::Message { message, base } => Self::Message { message, base },
+            KnownFileEntry::ClmOn { payload, base } => Self::ClmOn { payload, base },
+            KnownFileEntry::ClmRevision { payload, base } => Self::ClmRevision { payload, base },
+            KnownFileEntry::ClmOffBoundary { payload, base } => {
+                Self::ClmOffBoundary { payload, base }
+            }
             KnownFileEntry::ToolStarted { payload, base } => Self::ToolStarted { payload, base },
             KnownFileEntry::ToolProgress { payload, base } => Self::ToolProgress { payload, base },
             KnownFileEntry::ThinkingLevelChange { payload, base } => {
@@ -593,6 +636,16 @@ impl<'de> Deserialize<'de> for FileEntry {
         let value = Value::deserialize(deserializer)?;
         match KnownFileEntry::deserialize(&value) {
             Ok(entry) => Ok(FileEntry::from(entry)),
+            Err(_)
+                if matches!(
+                    value.get("type").and_then(Value::as_str),
+                    Some("clm_on" | "clm_revision" | "clm_off_boundary")
+                ) =>
+            {
+                Err(<D::Error as serde::de::Error>::custom(
+                    "malformed known CLM entry",
+                ))
+            }
             Err(_) => match value {
                 Value::Object(rest) => Ok(FileEntry::Unknown { rest }),
                 other => Err(<D::Error as serde::de::Error>::custom(format!(
@@ -611,7 +664,10 @@ impl FileEntry {
             FileEntry::Unknown { rest } => {
                 return rest.get("id").and_then(|v| v.as_str());
             }
-            FileEntry::Message { base, .. }
+            FileEntry::ClmOn { base, .. }
+            | FileEntry::ClmRevision { base, .. }
+            | FileEntry::ClmOffBoundary { base, .. }
+            | FileEntry::Message { base, .. }
             | FileEntry::ToolStarted { base, .. }
             | FileEntry::ToolProgress { base, .. }
             | FileEntry::ThinkingLevelChange { base, .. }
@@ -638,7 +694,10 @@ impl FileEntry {
             FileEntry::Unknown { rest } => {
                 return rest.get("parentId").and_then(|v| v.as_str());
             }
-            FileEntry::Message { base, .. }
+            FileEntry::ClmOn { base, .. }
+            | FileEntry::ClmRevision { base, .. }
+            | FileEntry::ClmOffBoundary { base, .. }
+            | FileEntry::Message { base, .. }
             | FileEntry::ToolStarted { base, .. }
             | FileEntry::ToolProgress { base, .. }
             | FileEntry::ThinkingLevelChange { base, .. }
@@ -668,7 +727,10 @@ impl FileEntry {
                     .and_then(|value| value.as_str())
                     .unwrap_or_default();
             }
-            FileEntry::Message { base, .. }
+            FileEntry::ClmOn { base, .. }
+            | FileEntry::ClmRevision { base, .. }
+            | FileEntry::ClmOffBoundary { base, .. }
+            | FileEntry::Message { base, .. }
             | FileEntry::ToolStarted { base, .. }
             | FileEntry::ToolProgress { base, .. }
             | FileEntry::ThinkingLevelChange { base, .. }

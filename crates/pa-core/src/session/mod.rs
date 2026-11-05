@@ -1,4 +1,8 @@
 //! Session entry parsing, migration, context reconstruction, and tree.
+#[cfg(test)]
+mod clm_tests;
+
+pub mod clm;
 pub mod discovery;
 pub mod manager;
 pub mod manager_ext;
@@ -238,6 +242,9 @@ fn entry_base_mut(entry: &mut FileEntry) -> Option<&mut EntryBase> {
         | FileEntry::SessionInfo { base, .. }
         | FileEntry::SessionState { base, .. }
         | FileEntry::GitState { base, .. }
+        | FileEntry::ClmOn { base, .. }
+        | FileEntry::ClmRevision { base, .. }
+        | FileEntry::ClmOffBoundary { base, .. }
         | FileEntry::CustomMessage { base, .. } => Some(base),
     }
 }
@@ -298,7 +305,23 @@ pub struct SessionContext {
 
 /// Walk the parent chain from the leaf, reconstructing the model context
 /// (summary-first when a compaction is on the path).
+/// # Panics
+/// Panics on invalid CLM; model callers should use the checked entry point.
+#[must_use]
 pub fn build_session_context(entries: &[FileEntry], leaf_id: Option<&str>) -> SessionContext {
+    clm::build_session_context_checked(entries, leaf_id).expect(
+        "CLM context unavailable; use build_session_context_checked to handle safety errors",
+    )
+}
+
+fn build_normal_session_context(entries: &[FileEntry], leaf_id: Option<&str>) -> SessionContext {
+    build_normal_session_context_with_ids(entries, leaf_id).0
+}
+
+fn build_normal_session_context_with_ids(
+    entries: &[FileEntry],
+    leaf_id: Option<&str>,
+) -> (SessionContext, Vec<String>) {
     let by_id: HashMap<String, usize> = entries
         .iter()
         .enumerate()
@@ -310,7 +333,7 @@ pub fn build_session_context(entries: &[FileEntry], leaf_id: Option<&str>) -> Se
         Some(id) => by_id.get(id).copied(),
     };
     let Some(leaf_index) = leaf_index else {
-        return empty_context();
+        return (empty_context(), Vec::new());
     };
 
     // Path from root to leaf. A corrupt file can hold a parent cycle;
@@ -409,38 +432,45 @@ pub fn build_session_context(entries: &[FileEntry], leaf_id: Option<&str>) -> Se
         compaction_path_idx.is_some_and(|compaction_idx| digest_idx > compaction_idx)
     });
 
-    let mut messages: Vec<AgentMessage> = Vec::new();
-    let append_message =
-        |entry: &FileEntry, target: &mut Vec<AgentMessage>, keep_digest_entry_id: Option<&str>| {
-            match entry {
-                FileEntry::Message { message, .. } => target.push(message.clone()),
-                FileEntry::CustomMessage { payload, .. } => {
-                    if payload.custom_type
-                        == crate::session_engine::headless::HARNESS_DIGEST_CUSTOM_TYPE
-                        && entry.id() != keep_digest_entry_id
-                    {
-                        return;
-                    }
-                    if payload.custom_type
-                        == crate::session_engine::ipython_state::IPYTHON_STATE_CUSTOM_TYPE
-                        && entry.id() != newest_kernel_notice_entry_id
-                    {
-                        return;
-                    }
-                    target.push(AgentMessage::Custom(create_custom_message(payload, entry)));
-                }
-                FileEntry::BranchSummary { payload, .. } if !payload.summary.is_empty() => {
-                    target.push(AgentMessage::BranchSummary(
-                        pa_types::session::BranchSummaryMessage {
-                            summary: payload.summary.clone(),
-                            from_id: payload.from_id.clone(),
-                            timestamp: timestamp_to_millis(entry.timestamp()),
-                        },
-                    ));
-                }
-                _ => {}
+    let mut messages: Vec<(String, AgentMessage)> = Vec::new();
+    let append_message = |entry: &FileEntry,
+                          target: &mut Vec<(String, AgentMessage)>,
+                          keep_digest_entry_id: Option<&str>| {
+        match entry {
+            FileEntry::Message { message, .. } => {
+                target.push((entry.id().unwrap_or_default().to_owned(), message.clone()));
             }
-        };
+            FileEntry::CustomMessage { payload, .. } => {
+                if payload.custom_type
+                    == crate::session_engine::headless::HARNESS_DIGEST_CUSTOM_TYPE
+                    && entry.id() != keep_digest_entry_id
+                {
+                    return;
+                }
+                if payload.custom_type
+                    == crate::session_engine::ipython_state::IPYTHON_STATE_CUSTOM_TYPE
+                    && entry.id() != newest_kernel_notice_entry_id
+                {
+                    return;
+                }
+                target.push((
+                    entry.id().unwrap_or_default().to_owned(),
+                    AgentMessage::Custom(create_custom_message(payload, entry)),
+                ));
+            }
+            FileEntry::BranchSummary { payload, .. } if !payload.summary.is_empty() => {
+                target.push((
+                    entry.id().unwrap_or_default().to_owned(),
+                    AgentMessage::BranchSummary(pa_types::session::BranchSummaryMessage {
+                        summary: payload.summary.clone(),
+                        from_id: payload.from_id.clone(),
+                        timestamp: timestamp_to_millis(entry.timestamp()),
+                    }),
+                ));
+            }
+            _ => {}
+        }
+    };
 
     if let Some(compaction_index) = compaction {
         let payload = match &entries[compaction_index] {
@@ -448,7 +478,7 @@ pub fn build_session_context(entries: &[FileEntry], leaf_id: Option<&str>) -> Se
             _ => unreachable!("compaction index checked above"),
         };
         let first_kept_id = payload.first_kept_entry_id.clone();
-        let mut retained: Vec<AgentMessage> = Vec::new();
+        let mut retained: Vec<(String, AgentMessage)> = Vec::new();
         let mut found_first_kept = false;
         for &index in &path[..path.partition_point(|&i| i < compaction_index)] {
             if Some(entries[index].id().unwrap_or_default().to_string())
@@ -470,15 +500,21 @@ pub fn build_session_context(entries: &[FileEntry], leaf_id: Option<&str>) -> Se
         } else {
             payload.harness_state_fingerprint
         };
-        messages.push(AgentMessage::CompactionSummary(CompactionSummaryMessage {
-            summary: payload.summary,
-            tokens_before: payload.tokens_before,
-            retained_message_count: Some(retained.len() as u64),
-            custom_instructions: payload.custom_instructions,
-            harness_digest: summary_harness_digest,
-            harness_state_fingerprint: summary_harness_state_fingerprint,
-            timestamp: timestamp_to_millis(entries[compaction_index].timestamp()),
-        }));
+        messages.push((
+            entries[compaction_index]
+                .id()
+                .unwrap_or_default()
+                .to_owned(),
+            AgentMessage::CompactionSummary(CompactionSummaryMessage {
+                summary: payload.summary,
+                tokens_before: payload.tokens_before,
+                retained_message_count: Some(retained.len() as u64),
+                custom_instructions: payload.custom_instructions,
+                harness_digest: summary_harness_digest,
+                harness_state_fingerprint: summary_harness_state_fingerprint,
+                timestamp: timestamp_to_millis(entries[compaction_index].timestamp()),
+            }),
+        ));
         messages.extend(retained);
         for &index in &path[path.partition_point(|&i| i <= compaction_index)..] {
             append_message(&entries[index], &mut messages, keep_digest_entry_id);
@@ -489,12 +525,16 @@ pub fn build_session_context(entries: &[FileEntry], leaf_id: Option<&str>) -> Se
         }
     }
 
-    SessionContext {
-        messages,
-        thinking_level,
-        service_tier,
-        model,
-    }
+    let (message_ids, messages) = messages.into_iter().unzip();
+    (
+        SessionContext {
+            messages,
+            thinking_level,
+            service_tier,
+            model,
+        },
+        message_ids,
+    )
 }
 
 pub(crate) fn create_custom_message(

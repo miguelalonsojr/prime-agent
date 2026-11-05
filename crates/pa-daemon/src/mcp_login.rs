@@ -281,6 +281,8 @@ mod tests {
 
         let login = tokio::spawn(async move {
             begin_login(HostRequestPayload {
+                verified_tool_call_id: None,
+                verified_tool_execution_identity: None,
                 data: json!({ "server": "fixture" }),
             })
             .await
@@ -407,6 +409,8 @@ mod tests {
         McpManager::register_host_handlers(&manager, &mut handlers);
         let begin_login = handlers.get("mcp.begin_login").expect("wired").clone();
         let error = begin_login(HostRequestPayload {
+            verified_tool_call_id: None,
+            verified_tool_execution_identity: None,
             data: json!({ "server": "nope" }),
         })
         .await

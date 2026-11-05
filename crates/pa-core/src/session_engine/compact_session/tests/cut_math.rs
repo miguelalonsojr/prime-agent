@@ -8,7 +8,7 @@ use pa_types::session::EntryBase;
 fn cut_and_tokens_computed_from_entries() {
     let tmp = tempfile::tempdir().unwrap();
     let session = session_with_turns(tmp.path(), 3);
-    let (cut, tokens) = compute_cut(&session, 10_000);
+    let (cut, tokens) = compute_cut(&session, 10_000).unwrap();
     assert_eq!(cut.first_kept_entry_index, 1); // after the header
     assert_eq!(tokens, 120);
 }
@@ -123,7 +123,7 @@ fn tokens_before_anchors_on_last_valid_usage_plus_trailing() {
         .unwrap();
     // TS: 110 (last valid usage) + ceil(415/4) (the probe turn) = 214.
     assert_eq!(
-        context_tokens(session.get_all_entries(), session.get_leaf_id()),
+        context_tokens(session.get_all_entries(), session.get_leaf_id()).unwrap(),
         214
     );
 }

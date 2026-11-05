@@ -1150,6 +1150,37 @@ pub enum DaemonCommand {
         #[serde(flatten)]
         rest: JsonMap,
     },
+    GetClmStatus {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    SetClmMode {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        enabled: bool,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    RestoreClmRevision {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        epoch_id: String,
+        revision: u64,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    GetClmModelSnapshot {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
     GetSessionContext {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<String>,
@@ -1311,6 +1342,18 @@ pub enum ForkPosition {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clm_commands_roundtrip_source_shapes() {
+        for wire in [
+            r#"{"type":"get_clm_status","activeSessionId":"s1"}"#,
+            r#"{"type":"set_clm_mode","activeSessionId":"s1","enabled":true}"#,
+            r#"{"type":"restore_clm_revision","activeSessionId":"s1","epochId":"e1","revision":3}"#,
+            r#"{"type":"get_clm_model_snapshot","activeSessionId":"s1"}"#,
+        ] {
+            rt::<DaemonCommand>(wire);
+        }
+    }
 
     #[test]
     fn kernel_cwd_command_roundtrip() {

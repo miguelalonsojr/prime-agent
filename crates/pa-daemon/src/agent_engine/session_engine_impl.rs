@@ -277,7 +277,13 @@ impl SessionEngine for AgentSessionEngine {
         Some((model.provider.clone(), model.id))
     }
 
+    fn configure_clm_default_eligibility(&self, eligible: bool) {
+        self.clm_default_eligible
+            .store(eligible, std::sync::atomic::Ordering::SeqCst);
+    }
+
     fn set_session_file(&self, path: std::path::PathBuf) {
+        self.configure_clm_default_eligibility(false);
         *self
             .session_file
             .lock()
@@ -745,6 +751,16 @@ impl SessionEngine for AgentSessionEngine {
                 }
             }
         };
+        if let Err(error) = self.ensure_core_session(&model) {
+            return BranchSummaryOutcome::Failed {
+                error: format!("{error:#}"),
+            };
+        }
+        let clm = self
+            .session
+            .blocking_lock()
+            .as_ref()
+            .and_then(|built| built.session.clm.clone());
         let api_key = self.resolve_request_api_key(&model);
         let settings =
             pa_core::settings::SettingsManager::create(self.cwd(), &self.config.agent_dir);
@@ -771,6 +787,7 @@ impl SessionEngine for AgentSessionEngine {
             pa_core::session_engine::branch_summarization::generate_branch_summary(
                 &entries,
                 pa_core::session_engine::branch_summarization::GenerateBranchSummaryOptions {
+                    clm: clm.as_ref(),
                     model: &model,
                     api_key,
                     custom_instructions: custom_instructions.as_deref(),
@@ -891,6 +908,10 @@ impl SessionEngine for AgentSessionEngine {
         &self,
         identity: crate::engine::RlmSessionIdentity,
     ) -> anyhow::Result<()> {
+        *self
+            .inherited_clm_mode
+            .lock()
+            .expect("inherited CLM mode lock") = identity.inherited_clm_mode;
         // This session's own depth gates the kernel `refine.*` host requests (depth-0 only).
         self.rlm_depth
             .store(identity.rlm_depth, std::sync::atomic::Ordering::Relaxed);
@@ -1018,46 +1039,29 @@ impl SessionEngine for AgentSessionEngine {
                 }
             }
         };
-        let agent = match self.session_agent(&model) {
-            Ok(agent) => agent,
-            Err(error) => {
-                return SideQuestionOutcome::Failed {
-                    answer: String::new(),
-                    error: error.to_string(),
-                }
-            }
-        };
+        if let Err(error) = self.session_agent(&model) {
+            return SideQuestionOutcome::Failed {
+                answer: String::new(),
+                error: error.to_string(),
+            };
+        }
         let question = request.question.clone();
         let previous_turns = request.previous_turns;
         let retry_policy = pa_core::session_engine::provider_retry::DEFAULT_PROVIDER_RETRY_POLICY;
-        // TS `unwrapSemanticEdgeStreamFn`: the side call runs on the
-        // session's pre-semantic stream fn, so it carries no request id
-        // and the ledger records nothing. The engine build always wires
-        // it; no fallback to the agent's own fn, which would leak the
-        // id-carrying wrapper into the side call.
-        let side_stream_fn = {
-            let guard = self.session.blocking_lock();
-            guard
-                .as_deref()
-                .and_then(|engine| engine.session.side_question_stream_fn())
-        };
-        let Some(side_stream_fn) = side_stream_fn else {
+        let engine = self.session.blocking_lock().clone();
+        let Some(engine) = engine else {
             return SideQuestionOutcome::Failed {
                 answer: String::new(),
                 error: "Select a model before asking a side question".to_string(),
             };
         };
-        let result =
-            self.runtime
-                .block_on(pa_core::session_engine::side_question::run_side_question(
-                    &agent,
-                    side_stream_fn,
-                    &question,
-                    &previous_turns,
-                    &retry_policy,
-                    signal,
-                    sink,
-                ));
+        let result = self.runtime.block_on(engine.session.run_side_question(
+            &question,
+            &previous_turns,
+            &retry_policy,
+            signal,
+            sink,
+        ));
         match result.status {
             pa_core::session_engine::side_question::SideQuestionStatus::Complete => {
                 SideQuestionOutcome::Complete {

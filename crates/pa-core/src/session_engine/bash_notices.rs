@@ -266,7 +266,12 @@ mod tests {
     }
 
     async fn dispatch(handler: &HostHandlerFn, data: Value) -> anyhow::Result<Value> {
-        handler(HostRequestPayload { data }).await
+        handler(HostRequestPayload {
+            data,
+            verified_tool_call_id: None,
+            verified_tool_execution_identity: None,
+        })
+        .await
     }
 
     fn wired_agent() -> (

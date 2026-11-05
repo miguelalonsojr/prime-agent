@@ -1247,6 +1247,8 @@ mod tests {
         McpManager::register_host_handlers(&manager, &mut handlers);
         let config = handlers.get("mcp.config").unwrap().clone();
         let result = config(crate::kernel::shared::HostRequestPayload {
+            verified_tool_call_id: None,
+            verified_tool_execution_identity: None,
             data: json!({ "server": "fixture-echo" }),
         })
         .await
@@ -1264,6 +1266,8 @@ mod tests {
         McpManager::register_host_handlers(&manager, &mut handlers);
         let config = handlers.get("mcp.config").unwrap().clone();
         let result = config(crate::kernel::shared::HostRequestPayload {
+            verified_tool_call_id: None,
+            verified_tool_execution_identity: None,
             data: json!({ "server": "nope" }),
         })
         .await
@@ -1286,15 +1290,21 @@ mod tests {
         McpManager::register_host_handlers(&manager, &mut handlers);
         let config = handlers.get("mcp.config").unwrap().clone();
         let result = config(crate::kernel::shared::HostRequestPayload {
+            verified_tool_call_id: None,
+            verified_tool_execution_identity: None,
             data: json!({ "server": "session-tool" }),
         })
         .await
         .unwrap();
         assert_eq!(result["type"], "stdio");
         assert_eq!(result["credentialSource"], "acp");
-        let error = config(crate::kernel::shared::HostRequestPayload { data: json!({}) })
-            .await
-            .unwrap_err();
+        let error = config(crate::kernel::shared::HostRequestPayload {
+            data: json!({}),
+            verified_tool_call_id: None,
+            verified_tool_execution_identity: None,
+        })
+        .await
+        .unwrap_err();
         assert_eq!(error.to_string(), "mcp.config requires a server");
         assert!(handlers.get("mcp.begin_login").is_none());
     }
@@ -1306,9 +1316,13 @@ mod tests {
         McpManager::register_host_handlers(&manager, &mut handlers);
         let list_plugins = handlers.get("mcp.list_plugins").expect("wired").clone();
         // Default page: the first 50 plugin cards, and the real catalog is present.
-        let page = list_plugins(crate::kernel::shared::HostRequestPayload { data: json!({}) })
-            .await
-            .unwrap();
+        let page = list_plugins(crate::kernel::shared::HostRequestPayload {
+            data: json!({}),
+            verified_tool_call_id: None,
+            verified_tool_execution_identity: None,
+        })
+        .await
+        .unwrap();
         assert!(page["plugins"].as_array().expect("plugins").len() > 1);
         assert!(
             page["plugins"]
@@ -1319,6 +1333,8 @@ mod tests {
             "the compiled builtin catalog services page"
         );
         let filtered = list_plugins(crate::kernel::shared::HostRequestPayload {
+            verified_tool_call_id: None,
+            verified_tool_execution_identity: None,
             data: json!({ "connectionStatus": "connected" }),
         })
         .await
@@ -1332,6 +1348,8 @@ mod tests {
             "every filtered row carries the requested status"
         );
         let error = list_plugins(crate::kernel::shared::HostRequestPayload {
+            verified_tool_call_id: None,
+            verified_tool_execution_identity: None,
             data: json!({ "connectionStatus": "maybe" }),
         })
         .await
@@ -1341,6 +1359,8 @@ mod tests {
             "mcp.list_plugins received an unknown connectionStatus: maybe"
         );
         let error = list_plugins(crate::kernel::shared::HostRequestPayload {
+            verified_tool_call_id: None,
+            verified_tool_execution_identity: None,
             data: json!({ "connectionStatus": 7 }),
         })
         .await
@@ -1350,6 +1370,8 @@ mod tests {
             "mcp.list_plugins connectionStatus must be a string"
         );
         let error = list_plugins(crate::kernel::shared::HostRequestPayload {
+            verified_tool_call_id: None,
+            verified_tool_execution_identity: None,
             data: json!({ "cursor": "not-digits" }),
         })
         .await
@@ -1359,6 +1381,8 @@ mod tests {
             "mcp.list_plugins received an invalid cursor"
         );
         let error = list_plugins(crate::kernel::shared::HostRequestPayload {
+            verified_tool_call_id: None,
+            verified_tool_execution_identity: None,
             data: json!({ "limit": 0 }),
         })
         .await
@@ -1368,6 +1392,8 @@ mod tests {
             "mcp host request limit must be a positive integer"
         );
         let clamped = list_plugins(crate::kernel::shared::HostRequestPayload {
+            verified_tool_call_id: None,
+            verified_tool_execution_identity: None,
             data: json!({ "limit": 1000 }),
         })
         .await
@@ -1380,6 +1406,8 @@ mod tests {
         let total = page["plugins"].as_array().unwrap().len();
         if total > 2 {
             let first = list_plugins(crate::kernel::shared::HostRequestPayload {
+                verified_tool_call_id: None,
+                verified_tool_execution_identity: None,
                 data: json!({ "limit": 2 }),
             })
             .await
@@ -1389,6 +1417,8 @@ mod tests {
                 .expect("a cursor when more exist");
             assert_eq!(next_cursor, "2");
             let second = list_plugins(crate::kernel::shared::HostRequestPayload {
+                verified_tool_call_id: None,
+                verified_tool_execution_identity: None,
                 data: json!({ "limit": 2, "cursor": next_cursor }),
             })
             .await
@@ -1407,6 +1437,8 @@ mod tests {
         McpManager::register_host_handlers(&manager, &mut handlers);
         let search = handlers.get("mcp.search_plugins").expect("wired").clone();
         let result = search(crate::kernel::shared::HostRequestPayload {
+            verified_tool_call_id: None,
+            verified_tool_execution_identity: None,
             data: json!({ "query": "linear" }),
         })
         .await
@@ -1417,15 +1449,21 @@ mod tests {
             .any(|entry| entry["serviceId"] == json!("linear")));
         assert_eq!(result["nextCursor"], serde_json::Value::Null);
         for bad in [json!(["query", ""]), json!({}), json!({ "query": "   " })] {
-            let error = search(crate::kernel::shared::HostRequestPayload { data: bad })
-                .await
-                .unwrap_err();
+            let error = search(crate::kernel::shared::HostRequestPayload {
+                data: bad,
+                verified_tool_call_id: None,
+                verified_tool_execution_identity: None,
+            })
+            .await
+            .unwrap_err();
             assert_eq!(
                 error.to_string(),
                 "mcp.search_plugins requires a non-empty query"
             );
         }
         let error = search(crate::kernel::shared::HostRequestPayload {
+            verified_tool_call_id: None,
+            verified_tool_execution_identity: None,
             data: json!({ "query": "linear", "limit": -3 }),
         })
         .await
@@ -1471,10 +1509,13 @@ mod tests {
         let mut handlers = HostRequestHandlers::default();
         McpManager::register_host_handlers(&manager, &mut handlers);
         let list_connections = handlers.get("mcp.list_connections").expect("wired").clone();
-        let result =
-            list_connections(crate::kernel::shared::HostRequestPayload { data: json!({}) })
-                .await
-                .unwrap();
+        let result = list_connections(crate::kernel::shared::HostRequestPayload {
+            data: json!({}),
+            verified_tool_call_id: None,
+            verified_tool_execution_identity: None,
+        })
+        .await
+        .unwrap();
         let connections = result["connections"].as_array().expect("connections");
         let mut ids = Vec::new();
         for entry in connections {

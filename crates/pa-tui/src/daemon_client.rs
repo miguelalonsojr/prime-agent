@@ -540,8 +540,34 @@ impl DaemonClient {
                 .hello
                 .get("schemaRevision")
                 .and_then(Value::as_u64)
-                .is_some_and(|revision| revision >= pa_types::daemon::DAEMON_SCHEMA_REVISION)
+                .is_some_and(|revision| revision >= 31)
             && self.supports_server_capability("kernel_cwd_propagation")
+    }
+
+    /// CLM is optional and unavailable on old daemons, including same-version older schemas.
+    #[must_use]
+    pub fn supports_clm_context(&self) -> bool {
+        self.protocol.version == DAEMON_PROTOCOL_VERSION
+            && self
+                .hello
+                .get("schemaRevision")
+                .and_then(Value::as_u64)
+                .is_some_and(|revision| revision >= 32)
+            && self.supports_server_capability("clm_context_v1")
+    }
+
+    fn ensure_clm_supported(&self, command: &DaemonCommand) -> Result<()> {
+        if matches!(
+            command,
+            DaemonCommand::GetClmStatus { .. }
+                | DaemonCommand::SetClmMode { .. }
+                | DaemonCommand::RestoreClmRevision { .. }
+                | DaemonCommand::GetClmModelSnapshot { .. }
+        ) && !self.supports_clm_context()
+        {
+            anyhow::bail!("The daemon does not support clm_context_v1; restart the daemon to use CLM commands.");
+        }
+        Ok(())
     }
 
     #[must_use]
@@ -580,6 +606,7 @@ impl DaemonClient {
         command: DaemonCommand,
         timeout_ms: u64,
     ) -> Result<DaemonResponse> {
+        self.ensure_clm_supported(&command)?;
         if let Some(link) = self.direct_link_for(&command) {
             let id = format!(
                 "direct_{}",
@@ -607,6 +634,7 @@ impl DaemonClient {
     ///
     /// Returns `Err` when the request fails or times out, or carries `success: false`.
     pub async fn request_ok_via_supervisor(&self, command: DaemonCommand) -> Result<Value> {
+        self.ensure_clm_supported(&command)?;
         let name = command_type_debug(&command);
         let response = self
             .request_supervisor(command, DEFAULT_REQUEST_TIMEOUT_MS)

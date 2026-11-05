@@ -174,7 +174,7 @@ pub async fn execute_session_command(
     // own work sees it in the session branch.
     let echo = session_command_echo_row(command);
     execution.push_message(echo.clone());
-    if let Err(error) = persist_rows(engine, std::iter::once(&echo)).await {
+    if let Err(error) = record_command_echo(engine, command, &echo).await {
         execution.error = Some(error);
         return execution;
     }
@@ -200,18 +200,20 @@ pub async fn execute_session_command(
     if let Err(error) = persist_rows(engine, execution.messages.iter().skip(1)).await {
         execution.error = Some(error);
     }
-    sync_live_context(engine).await;
+    if let Err(error) = sync_live_context(engine).await {
+        execution.error = Some(error.to_string());
+    }
     execution
 }
 
 /// The live agent context mirrors the durable rows (so the next admitted
 /// turn's request carries them); the rebuild is idempotent — the compaction
 /// path rebuilds mid-execution, the refinement path pushes rows mid-execution.
-async fn sync_live_context(engine: &SessionEngine) {
+async fn sync_live_context(engine: &SessionEngine) -> anyhow::Result<()> {
     let session = engine.session.session_handle().clone();
     let rebuilt = {
         let session = session.lock().await;
-        session.active_context().messages
+        session.active_context_checked()?.messages
     };
     // The raw session messages (not the LLM view): custom rows keep their
     // wire identity in the live context, like TS's state push.
@@ -220,6 +222,7 @@ async fn sync_live_context(engine: &SessionEngine) {
         .filter_map(super::session_message_to_loop)
         .collect();
     engine.session.agent().set_messages(loop_messages).await;
+    Ok(())
 }
 
 /// `/compact`: summarize and cut, or skip silently (TS `CompactionSkippedError`).
@@ -427,6 +430,26 @@ fn execute_autonomous(
 
 /// The rows are durable in the session's own entry chain: the live context
 /// rebuild and a later `/compact` see the same rows the host runtime persists.
+async fn record_command_echo(
+    engine: &SessionEngine,
+    command: &SessionSlashCommand,
+    echo: &CustomMessage,
+) -> Result<(), String> {
+    if command.name == "compact" && engine.session.external_persistence {
+        if let Some(runtime) = &engine.session.clm {
+            // The worker already persisted the echo. Adopt its ACK before PREPARE
+            // so a helper owner read cannot remove a private prefix identity.
+            runtime.check_failure().map_err(|error| error.to_string())?;
+            runtime
+                .status(false)
+                .await
+                .map_err(|error| error.to_string())?;
+            return Ok(());
+        }
+    }
+    persist_rows(engine, std::iter::once(echo)).await
+}
+
 async fn persist_rows<'a>(
     engine: &SessionEngine,
     messages: impl Iterator<Item = &'a CustomMessage>,
@@ -468,6 +491,265 @@ mod tests {
 
     fn message_text(message: &CustomMessage) -> String {
         message.content.text()
+    }
+
+    #[tokio::test]
+    async fn external_compaction_uses_the_owner_echo_through_helper_adoption() {
+        use crate::clm::journal::ClmJournalFn;
+        use crate::session::manager::SessionManager;
+        use crate::session_engine::engine::{create_session, SessionEngineConfig};
+        use pa_types::session::{AgentMessage, FileEntry};
+        fn echo_ids(manager: &SessionManager) -> Vec<String> {
+            manager
+                .get_entries()
+                .iter()
+                .filter_map(|entry| match entry {
+                    FileEntry::CustomMessage { payload, .. }
+                        if payload.custom_type == SESSION_SLASH_COMMAND_CUSTOM_TYPE =>
+                    {
+                        entry.id().map(str::to_owned)
+                    }
+                    _ => None,
+                })
+                .collect()
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let agent_dir = dir.path().join("agent");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(
+            agent_dir.join("settings.json"),
+            r#"{"compaction":{"keepRecentTokens":10}}"#,
+        )
+        .unwrap();
+        let provider = pa_ai::faux::register_faux_provider(
+            pa_ai::faux::RegisterFauxProviderOptions::default(),
+        );
+        let model = provider.models[0].clone();
+        let sessions = dir.path().join("sessions");
+        let mut manager = SessionManager::persisted(dir.path(), &sessions);
+        for (user, answer) in [
+            ("first", "history ".repeat(150)),
+            (
+                "second, and please keep this second parity turn short and intact",
+                "second turn done, kept intact".to_owned(),
+            ),
+        ] {
+            manager
+                .append_message(
+                    serde_json::from_value(serde_json::json!({
+                        "role":"user","content":user,"timestamp":1
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+            manager
+                .append_message(AgentMessage::Assistant(
+                    pa_ai::faux::faux_assistant_text_message(
+                        &answer,
+                        pa_ai::faux::FauxAssistantMessageOptions::default(),
+                    ),
+                ))
+                .unwrap();
+        }
+        let owner = Arc::new(tokio::sync::Mutex::new(manager));
+        let mirror_slot = Arc::new(std::sync::Mutex::new(
+            None::<Arc<tokio::sync::Mutex<SessionManager>>>,
+        ));
+        let observations = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let journal: ClmJournalFn = Arc::new({
+            let owner = owner.clone();
+            let mirror_slot = mirror_slot.clone();
+            let observations = observations.clone();
+            move |op| {
+                let owner = owner.clone();
+                let mirror = mirror_slot.lock().unwrap().clone();
+                let observations = observations.clone();
+                Box::pin(async move {
+                    if let Some(mirror) = mirror {
+                        let mirror = mirror.lock().await;
+                        observations.lock().unwrap().push((
+                            "before_owner_adoption",
+                            mirror.get_leaf_id().map(str::to_owned),
+                            echo_ids(&mirror),
+                        ));
+                    }
+                    Ok(owner
+                        .lock()
+                        .await
+                        .clm_journal(op, crate::clm::ProtectedActions::new())?)
+                })
+            }
+        });
+        let sink: super::super::clm::ClmHelperReceiptFn = Arc::new({
+            let owner = owner.clone();
+            move |_, receipt| {
+                let owner = owner.clone();
+                Box::pin(async move {
+                    Ok(owner.lock().await.append_custom_entry(
+                        receipt["customType"].as_str().unwrap(),
+                        receipt.get("data").cloned(),
+                    )?)
+                })
+            }
+        });
+        let conversation_log_path = owner
+            .lock()
+            .await
+            .get_session_file()
+            .map(std::path::Path::to_path_buf);
+        let engine = create_session(SessionEngineConfig {
+            cwd: dir.path().to_path_buf(),
+            agent_dir,
+            conversation_log_path,
+            session_manager: Some(SessionManager::in_memory_in_session_dir(
+                dir.path(),
+                &sessions,
+            )),
+            model: Some(serde_json::from_value(serde_json::to_value(&model).unwrap()).unwrap()),
+            clm_journal: Some(journal),
+            clm_helper_receipt: Some(sink),
+            stream_fn: Some(super::super::provider_adapter::real_stream_fn(
+                None,
+                model.clone(),
+            )),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let mirror = engine.session.session_handle().clone();
+        *mirror_slot.lock().unwrap() = Some(mirror.clone());
+        let command = command("compact", "focus");
+        let echo = session_command_echo_row(&command);
+        let owner_echo = owner
+            .lock()
+            .await
+            .append_custom_message(&echo.custom_type, echo.content, echo.display, echo.details)
+            .unwrap();
+        engine
+            .session
+            .clm
+            .as_ref()
+            .unwrap()
+            .status(false)
+            .await
+            .unwrap();
+        observations.lock().unwrap().clear();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        provider.set_responses(vec![pa_ai::faux::FauxResponseStep::Factory(Arc::new({
+            let observations = observations.clone();
+            let calls = calls.clone();
+            move |_, _, _, _| {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mirror = mirror.try_lock().unwrap();
+                observations.lock().unwrap().push((
+                    "summarizer_after_adoption",
+                    mirror.get_leaf_id().map(str::to_owned),
+                    echo_ids(&mirror),
+                ));
+                Ok(pa_ai::faux::faux_assistant_text_message(
+                    "one summary",
+                    pa_ai::faux::FauxAssistantMessageOptions::default(),
+                ))
+            }
+        }))]);
+        let mut autonomous = crate::autonomous::create_autonomous_runtime_state(None, None);
+        let execution = execute_session_command(
+            &engine,
+            &mut SessionCommandParams {
+                model: &model,
+                api_key: None,
+                global_harness_dir: dir.path().join("global"),
+                autonomous: &mut autonomous,
+            },
+            &command,
+            &[],
+        )
+        .await;
+        provider.unregister();
+        assert!(
+            execution.compaction.is_some(),
+            "error={:?}; owner_echo={owner_echo}; observations={:?}",
+            execution.error,
+            observations.lock().unwrap()
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(echo_ids(&*owner.lock().await), vec![owner_echo.clone()]);
+        for (_, _, echoes) in observations.lock().unwrap().iter() {
+            assert_eq!(echoes, std::slice::from_ref(&owner_echo));
+        }
+        assert_eq!(
+            engine
+                .session
+                .entries()
+                .await
+                .iter()
+                .filter(|entry| matches!(entry, FileEntry::Compaction { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_preserves_standalone_and_no_runtime_echo_persistence() {
+        use crate::session::manager::SessionManager;
+        use crate::session_engine::engine::{create_session, SessionEngineConfig};
+        let provider = pa_ai::faux::register_faux_provider(
+            pa_ai::faux::RegisterFauxProviderOptions::default(),
+        );
+        let model = provider.models[0].clone();
+        for external_without_runtime in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let manager = if external_without_runtime {
+                SessionManager::in_memory(dir.path())
+            } else {
+                SessionManager::persisted(dir.path(), &dir.path().join("sessions"))
+            };
+            let journal: crate::clm::journal::ClmJournalFn =
+                Arc::new(|_| Box::pin(async { anyhow::bail!("no-session journal must not run") }));
+            let engine = create_session(SessionEngineConfig {
+                cwd: dir.path().to_path_buf(),
+                agent_dir: dir.path().join("agent"),
+                session_manager: Some(manager),
+                clm_journal: external_without_runtime.then_some(journal),
+                model: Some(serde_json::from_value(serde_json::to_value(&model).unwrap()).unwrap()),
+                stream_fn: Some(super::super::provider_adapter::real_stream_fn(
+                    None,
+                    model.clone(),
+                )),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+            assert_eq!(engine.session.clm.is_none(), external_without_runtime);
+            let mut autonomous = crate::autonomous::create_autonomous_runtime_state(None, None);
+            let execution = execute_session_command(
+                &engine,
+                &mut SessionCommandParams {
+                    model: &model,
+                    api_key: None,
+                    global_harness_dir: dir.path().join("global"),
+                    autonomous: &mut autonomous,
+                },
+                &command("compact", ""),
+                &[],
+            )
+            .await;
+            assert!(execution.error.is_none(), "{:?}", execution.error);
+            assert_eq!(
+                engine
+                    .session
+                    .entries()
+                    .await
+                    .iter()
+                    .filter(|entry| matches!(entry,
+                        pa_types::session::FileEntry::CustomMessage { payload, .. }
+                            if payload.custom_type == SESSION_SLASH_COMMAND_CUSTOM_TYPE
+                    ))
+                    .count(),
+                1
+            );
+        }
+        provider.unregister();
     }
 
     #[test]

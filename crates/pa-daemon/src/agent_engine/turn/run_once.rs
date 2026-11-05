@@ -8,6 +8,67 @@ use super::{
     Value,
 };
 
+fn forward(item: Forwarded, emit: &mut dyn FnMut(EngineEvent) -> bool) -> bool {
+    match item {
+        Forwarded::Receipt(receipt, ack) => {
+            let accepted = emit(EngineEvent::ClmUsage(receipt));
+            let _ = ack.send(accepted);
+            accepted
+        }
+        Forwarded::Event(event) => emit(event),
+        Forwarded::Message(event, ack) => {
+            let acknowledged = std::sync::Arc::new(std::sync::OnceLock::new());
+            let accepted = emit(EngineEvent::ClmMessageAck {
+                event: Box::new(event),
+                acknowledged: acknowledged.clone(),
+            });
+            let block = if accepted {
+                acknowledged.get().cloned()
+            } else {
+                None
+            };
+            let _ = ack.send(block);
+            accepted
+        }
+    }
+}
+
+async fn forward_durable_message(
+    tx: &tokio::sync::mpsc::UnboundedSender<Forwarded>,
+    event: EngineEvent,
+    clm: Option<&std::sync::Arc<pa_core::session_engine::clm::ClmRuntime>>,
+) -> anyhow::Result<Option<pa_types::clm::ClmBlock>> {
+    let Some(runtime) = clm else {
+        tx.send(Forwarded::Event(event))
+            .map_err(|_| anyhow::anyhow!("worker forwarding closed"))?;
+        return Ok(None);
+    };
+    let result = async {
+        let (ack, accepted) = tokio::sync::oneshot::channel();
+        tx.send(Forwarded::Message(event, ack))
+            .map_err(|_| anyhow::anyhow!("worker forwarding closed"))?;
+        accepted
+            .await
+            .ok()
+            .flatten()
+            .ok_or_else(|| anyhow::anyhow!("worker rejected durable message"))
+    }
+    .await;
+    if let Err(error) = &result {
+        runtime.fail(error);
+    }
+    result.map(Some)
+}
+
+enum Forwarded {
+    Receipt(Value, tokio::sync::oneshot::Sender<bool>),
+    Event(EngineEvent),
+    Message(
+        EngineEvent,
+        tokio::sync::oneshot::Sender<Option<pa_types::clm::ClmBlock>>,
+    ),
+}
+
 impl AgentSessionEngine {
     pub(super) fn retry_policy(
         &self,
@@ -78,7 +139,7 @@ impl AgentSessionEngine {
         aborted: &dyn Fn() -> bool,
         emit: &mut dyn FnMut(EngineEvent) -> bool,
     ) -> anyhow::Result<TurnOnce> {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<EngineEvent>();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Forwarded>();
         // Goal usage accounting at the message_end hook: each settled non-error
         // assistant message records its token delta, from the engine mirror.
         let goal_runtime = self.goal_runtime.lock().expect("goal runtime lock").clone();
@@ -87,6 +148,16 @@ impl AgentSessionEngine {
         // item's first run; this subscription forwards them only once a
         // boundary frame already passed.
         let boundary_passed = std::sync::Arc::clone(boundary_passed);
+        let external_owner = self.clm_journal.lock().expect("CLM journal lock").is_some();
+        let clm = if external_owner {
+            self.session
+                .lock()
+                .await
+                .as_ref()
+                .and_then(|built| built.session.clm.clone())
+        } else {
+            None
+        };
         let subscription = {
             let tx = tx.clone();
             let pending_model_changes = pending_model_changes.clone();
@@ -100,6 +171,7 @@ impl AgentSessionEngine {
             );
             agent
                 .subscribe(move |event, _signal| {
+                    let clm = clm.clone();
                     let tx = tx.clone();
                     let pending_model_changes = pending_model_changes.clone();
                     let boundary_passed = std::sync::Arc::clone(&boundary_passed);
@@ -171,10 +243,10 @@ impl AgentSessionEngine {
                                     )
                                 ) {
                                     if let Some(value) = session_wire_value(agent_message) {
-                                        let _ = tx.send(EngineEvent::AssistantUpdate {
+                                        let _ = tx.send(Forwarded::Event(EngineEvent::AssistantUpdate {
                                             message: AssistantSnapshot::Wire(value),
                                             stream_event: Some(json!({ "type": "start" })),
-                                        });
+                                        }));
                                     }
                                 }
                             }
@@ -188,12 +260,12 @@ impl AgentSessionEngine {
                                         pa_agent::types::Message::Assistant(_)
                                     )
                                 ) {
-                                    let _ = tx.send(EngineEvent::AssistantUpdate {
+                                    let _ = tx.send(Forwarded::Event(EngineEvent::AssistantUpdate {
                                         message: AssistantSnapshot::Loop(std::sync::Arc::clone(
                                             agent_message,
                                         )),
                                         stream_event: stream_event_value(stream_event),
-                                    });
+                                    }));
                                 }
                             }
                             AgentEvent::MessageEnd {
@@ -218,11 +290,25 @@ impl AgentSessionEngine {
                                             } else {
                                                 EngineEvent::AssistantMessage(value)
                                             };
-                                            let _ = tx.send(event);
+                                            let assistant = matches!(&event, EngineEvent::AssistantMessage(_));
+                                            if let (Some(runtime), EngineEvent::AssistantMessage(message)) = (&clm, &event) { runtime.before_assistant_append(message); }
+                                            let block = forward_durable_message(&tx,event,clm.as_ref()).await?;
+                                            if let (Some(runtime),Some(block)) = (clm.as_ref().filter(|_|assistant),block.as_ref()) {
+                                                if let Some(receipt) = runtime.take_usage_receipt(block)? {
+                                                    let (ack, accepted) = tokio::sync::oneshot::channel();
+                                                    tx.send(Forwarded::Receipt(receipt, ack)).map_err(|_| anyhow::anyhow!("worker forwarding closed"))?;
+                                                    if !accepted.await.unwrap_or(false) {
+                                                        let error = anyhow::anyhow!("CLM usage persistence failed");
+                                                        runtime.fail(&error);
+                                                        return Err(error);
+                                                    }
+                                                }
+                                                runtime.after_assistant_append(block).await?;
+                                            }
                                             for change in pending_model_changes.lock()
                                                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                                                 .drain(..) {
-                                                let _ = tx.send(EngineEvent::ModelChange(change));
+                                                let _ = tx.send(Forwarded::Event(EngineEvent::ModelChange(change)));
                                             }
                                         }
                                     }
@@ -236,7 +322,7 @@ impl AgentSessionEngine {
                                         .load(std::sync::atomic::Ordering::SeqCst) =>
                                     {
                                         if let Some(value) = session_wire_value(agent_message) {
-                                            let _ = tx.send(EngineEvent::UserMessage(value));
+                                            forward_durable_message(&tx,EngineEvent::UserMessage(value),clm.as_ref()).await?;
                                         }
                                     }
                                     _ => {}
@@ -247,12 +333,12 @@ impl AgentSessionEngine {
                             // the terminal message plus tool results, `agent_end` the whole set.
                             AgentEvent::TurnStart => {
                                 if boundary_passed.load(std::sync::atomic::Ordering::SeqCst) {
-                                    let _ = tx.send(EngineEvent::TurnStart);
+                                    let _ = tx.send(Forwarded::Event(EngineEvent::TurnStart));
                                 }
                             }
                             AgentEvent::AgentStart => {
                                 if boundary_passed.load(std::sync::atomic::Ordering::SeqCst) {
-                                    let _ = tx.send(EngineEvent::AgentStart);
+                                    let _ = tx.send(Forwarded::Event(EngineEvent::AgentStart));
                                 }
                             }
                             AgentEvent::AgentEnd { messages } => {
@@ -261,7 +347,7 @@ impl AgentSessionEngine {
                                     .filter_map(session_wire_value)
                                     .collect::<Vec<Value>>();
                                 boundary_passed.store(true, std::sync::atomic::Ordering::SeqCst);
-                                let _ = tx.send(EngineEvent::AgentEnd { messages });
+                                let _ = tx.send(Forwarded::Event(EngineEvent::AgentEnd { messages }));
                             }
                             AgentEvent::TurnEnd {
                                 message,
@@ -278,10 +364,10 @@ impl AgentSessionEngine {
                                         .collect::<Vec<Value>>();
                                     boundary_passed
                                         .store(true, std::sync::atomic::Ordering::SeqCst);
-                                    let _ = tx.send(EngineEvent::TurnEnd {
+                                    let _ = tx.send(Forwarded::Event(EngineEvent::TurnEnd {
                                         message,
                                         tool_results,
-                                    });
+                                    }));
                                 }
                             }
                             AgentEvent::ToolExecutionStart {
@@ -289,11 +375,11 @@ impl AgentSessionEngine {
                                 tool_name,
                                 args,
                             } => {
-                                let _ = tx.send(EngineEvent::ToolExecutionStart {
+                                let _ = tx.send(Forwarded::Event(EngineEvent::ToolExecutionStart {
                                     tool_call_id: tool_call_id.clone(),
                                     tool_name: tool_name.clone(),
                                     args: args.clone(),
-                                });
+                                }));
                             }
                             AgentEvent::ToolExecutionProgress { .. } => {}
                             AgentEvent::ToolExecutionUpdate {
@@ -301,10 +387,10 @@ impl AgentSessionEngine {
                                 partial_result,
                                 ..
                             } => {
-                                let _ = tx.send(EngineEvent::ToolExecutionUpdate {
+                                let _ = tx.send(Forwarded::Event(EngineEvent::ToolExecutionUpdate {
                                     tool_call_id: tool_call_id.clone(),
                                     partial_result: tool_result_wire_value(partial_result),
-                                });
+                                }));
                             }
                             AgentEvent::ToolExecutionEnd {
                                 tool_call_id,
@@ -312,11 +398,11 @@ impl AgentSessionEngine {
                                 is_error,
                                 ..
                             } => {
-                                let _ = tx.send(EngineEvent::ToolExecutionEnd {
+                                let _ = tx.send(Forwarded::Event(EngineEvent::ToolExecutionEnd {
                                     tool_call_id: tool_call_id.clone(),
                                     result: tool_result_wire_value(result),
                                     is_error: *is_error,
-                                });
+                                }));
                             }
                         }
                         Ok(())
@@ -399,7 +485,7 @@ impl AgentSessionEngine {
                 event = rx.recv() => {
                     match event {
                         Some(event) => {
-                            if !emit(event) {
+                            if !forward(event, emit) {
                                 aborted = true;
                             }
                         }
@@ -413,7 +499,7 @@ impl AgentSessionEngine {
                         Err(error) => admission_error = Some(error),
                     }
                     while let Ok(event) = rx.try_recv() {
-                        if !emit(event) {
+                        if !forward(event, emit) {
                             aborted = true;
                             break;
                         }
@@ -434,7 +520,7 @@ impl AgentSessionEngine {
         // The settled run's tail still holds the aborted assistant row: drain
         // every queued event.
         while let Ok(event) = rx.try_recv() {
-            let _ = emit(event);
+            let _ = forward(event, emit);
         }
         let () = subscription.unsubscribe().await;
         if aborted {

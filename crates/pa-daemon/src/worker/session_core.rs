@@ -11,6 +11,8 @@ use crate::types::SessionActionSnapshot;
 /// The live session: store, queue, sequencing; shared by the connection
 /// tasks, the runner, and the compaction manager via the core mutex.
 pub(crate) struct SessionCore {
+    pub(crate) clm_protected: pa_core::clm::ProtectedActions,
+    pub(crate) clm_persistence_error: Option<String>,
     pub(crate) active_session_id: String,
     pub(crate) generation: String,
     pub(crate) last_event_sequence: u64,
@@ -109,6 +111,8 @@ impl SessionCore {
     #[cfg(test)]
     pub(crate) fn test_core(store: Option<SessionFile>, cwd: String) -> Self {
         SessionCore {
+            clm_protected: std::collections::BTreeMap::default(),
+            clm_persistence_error: None,
             active_session_id: store.as_ref().map_or_else(
                 || "test-session".to_string(),
                 |store| store.session_id().to_string(),

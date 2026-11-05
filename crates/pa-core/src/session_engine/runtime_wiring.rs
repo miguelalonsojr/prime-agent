@@ -392,6 +392,8 @@ impl KernelExecutor for KernelManagerExecutor {
         let code = code.to_string();
         let signal = options.signal;
         let on_late_sent_agent_message = options.on_late_sent_agent_message;
+        let tool_call_id = options.tool_call_id;
+        let tool_execution_identity = options.tool_execution_identity;
         let cell_timeout_ms = self.cell_timeout_ms;
         Box::pin(async move {
             let result = manager
@@ -400,6 +402,8 @@ impl KernelExecutor for KernelManagerExecutor {
                     crate::kernel::shared::ExecuteOptions {
                         signal: signal.map(crate::kernel::cancellation::AbortSignal::from_token),
                         on_late_sent_agent_message,
+                        tool_call_id,
+                        tool_execution_identity,
                         on_public_cell_done: Some(provisioner.public_cell_done_callback(&manager)),
                         cell_timeout_ms,
                         ..Default::default()
@@ -475,6 +479,7 @@ pub fn ipython_tool_options(
         provisioner,
         ui: None,
         on_late_sent_agent_message,
+        on_public_result: None,
     }
 }
 

@@ -295,6 +295,7 @@ async fn a_settled_child_passivates_stays_listable_and_revives_by_agent_message(
             model: None,
             thinking: None,
             spawned_by_request_id: None,
+            clm_admission: None,
         })
         .await
         .expect("spawn the child");
@@ -438,6 +439,8 @@ async fn a_settled_child_passivates_stays_listable_and_revives_by_agent_message(
     register_agent_message_host_handlers(Arc::clone(&controller) as Arc<_>, &mut handlers);
     let send = handlers.get("agent_message.send").expect("send handler");
     let revived = send(HostRequestPayload {
+        verified_tool_call_id: None,
+        verified_tool_execution_identity: None,
         data: json!({
             "message": revive_prompt,
             "receiver_role": "child",
@@ -612,6 +615,7 @@ async fn a_parent_rename_after_a_revival_and_second_passivation_reaches_the_chil
             model: None,
             thinking: None,
             spawned_by_request_id: None,
+            clm_admission: None,
         })
         .await
         .expect("spawn the child");

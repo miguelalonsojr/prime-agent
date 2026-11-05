@@ -3,6 +3,7 @@
 //! validated BEFORE the teardown (a failed prepare leaves the old session
 //! untouched); tree moves are NOT replacements — the kernel stays warm.
 
+use std::io::Write;
 use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
@@ -37,7 +38,11 @@ impl SessionNavigation {
     /// Swap the live session onto `file` (store, engine session file, rebuilt
     /// context). The caller retires the previous runtime and rebinds the cwd
     /// first, so the context park lands on the fresh session.
-    async fn replace_session(&self, target: PreparedReplacement) -> Result<(), String> {
+    async fn replace_session(
+        &self,
+        target: PreparedReplacement,
+        clm_default_eligible: bool,
+    ) -> Result<(), String> {
         let PreparedReplacement {
             mut file,
             trace_persisted,
@@ -74,6 +79,8 @@ impl SessionNavigation {
         // and the runtime.
         let _ = tokio::task::spawn_blocking(move || drop(previous)).await;
         self.engine.set_session_file(new_path.clone());
+        self.engine
+            .configure_clm_default_eligibility(clm_default_eligible);
         // The replacement session resolves to the model its own file pins,
         // not the previous session's (an explicit flag still wins).
         self.engine.restore_session_model(&new_path, None).await;
@@ -211,6 +218,122 @@ impl SessionNavigation {
                 .as_ref()
                 .and_then(|store| store.path.parent().map(std::path::Path::to_path_buf))
         };
+        let source_bytes = std::fs::read(resolved)
+            .map_err(|error| response_failure(None, "import_jsonl", &error.to_string(), None))?;
+        if pa_core::session::clm::contains_clm_records(&source_bytes) {
+            let prepare = || -> anyhow::Result<PreparedReplacement> {
+                let validated = pa_core::clm::validate_clm_import(&source_bytes)?
+                    .ok_or_else(|| anyhow::anyhow!("CLM import has no accepted boundary"))?;
+                // Validate every selected path, including suffixes after a boundary.
+                for entry in validated
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.id().is_some())
+                {
+                    let branch =
+                        pa_core::session::clm::selected_branch(&validated.entries, entry.id())?;
+                    pa_core::clm::validate_clm_branch(&branch)?;
+                }
+                let dir = destination
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("Session is still initializing"))?;
+                let mut entries = validated.entries;
+                let Some(pa_types::session::FileEntry::Header { header }) = entries.first_mut()
+                else {
+                    anyhow::bail!("CLM import has no header");
+                };
+                let cwd = cwd_override.clone().unwrap_or_else(|| header.cwd.clone());
+                anyhow::ensure!(
+                    std::path::Path::new(&cwd).is_dir(),
+                    "Stored session working directory does not exist: {cwd}"
+                );
+                let id = uuid::Uuid::new_v4().to_string();
+                header.id.clone_from(&id);
+                header.cwd.clone_from(&cwd);
+                header.parent_session = Some(resolved.to_string_lossy().into_owned());
+                let target = dir.join(session_file_name(&id));
+                let artifact = dir
+                    .parent()
+                    .ok_or_else(|| anyhow::anyhow!("session root missing"))?
+                    .join("session-artifacts")
+                    .join(&id);
+                anyhow::ensure!(!artifact.exists(), "CLM import artifact collision");
+                // Reserve with create_new: never replace source or another destination.
+                let reserved = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&target)?;
+                drop(reserved);
+                let mut created_artifact = false;
+                let result = (|| -> anyhow::Result<PreparedReplacement> {
+                    let lease = self.target_lease(&target)?;
+                    let first_end = source_bytes
+                        .iter()
+                        .position(|byte| *byte == b'\n')
+                        .ok_or_else(|| anyhow::anyhow!("CLM source header is unterminated"))?;
+                    let mut copied = serde_json::to_vec(&entries[0])?;
+                    copied.push(b'\n');
+                    copied.extend_from_slice(&source_bytes[first_end + 1..]);
+                    pa_core::clm::validate_clm_import(&copied)?;
+                    let mut output = std::fs::OpenOptions::new().write(true).open(&target)?;
+                    output.write_all(&copied)?;
+                    output.sync_all()?;
+                    std::fs::File::open(dir)?.sync_all()?;
+                    anyhow::ensure!(
+                        std::fs::read(&target)? == copied,
+                        "CLM import bytes could not be verified"
+                    );
+                    let mut file = SessionFile::open(&target)?;
+                    file.lease = lease;
+                    let branch = file.branch_file_entries_checked()?;
+                    let Some(projection) = pa_core::clm::project_clm_branch(&branch)? else {
+                        return Ok(PreparedReplacement {
+                            file,
+                            cwd: Some(cwd),
+                            trace_persisted: true,
+                        });
+                    };
+                    let snapshot = pa_types::clm::ClmSnapshot::from_blocks(projection.blocks);
+                    let text = pa_core::clm::render_context_document(
+                        &snapshot,
+                        &std::collections::HashSet::new(),
+                    )?;
+                    std::fs::create_dir_all(
+                        artifact
+                            .parent()
+                            .ok_or_else(|| anyhow::anyhow!("artifact root missing"))?,
+                    )?;
+                    #[cfg(test)]
+                    clm_import_tests::inject_artifact_collision(&artifact);
+                    std::fs::create_dir(&artifact)?;
+                    created_artifact = true;
+                    let mirror_dir = artifact.join("clm");
+                    std::fs::create_dir(&mirror_dir)?;
+                    let mut mirror = std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(mirror_dir.join("context.txt"))?;
+                    mirror.write_all(text.as_bytes())?;
+                    mirror.sync_all()?;
+                    std::fs::File::open(&mirror_dir)?.sync_all()?;
+                    std::fs::File::open(&artifact)?.sync_all()?;
+                    Ok(PreparedReplacement {
+                        file,
+                        cwd: Some(cwd),
+                        trace_persisted: true,
+                    })
+                })();
+                if result.is_err() {
+                    let _ = std::fs::remove_file(&target);
+                    if created_artifact {
+                        let _ = std::fs::remove_dir_all(&artifact);
+                    }
+                }
+                result
+            };
+            return prepare()
+                .map_err(|error| response_failure(None, "import_jsonl", &error.to_string(), None));
+        }
         let target = match destination {
             Some(dir) => dir.join(resolved.file_name().map_or_else(
                 || session_file_name("imported"),
@@ -343,7 +466,11 @@ impl Worker {
         if let Some(cwd) = target.cwd.as_deref() {
             self.rebind_worker_cwd(cwd);
         }
-        match self.navigation.replace_session(target).await {
+        match self
+            .navigation
+            .replace_session(target, command == "new_session")
+            .await
+        {
             Ok(()) => {
                 self.refresh_replaced_session_state().await;
                 self.reseed_service_tier_for_replacement();
@@ -943,5 +1070,464 @@ mod trace_replacement_tests {
             .rebind(dir.path(), &dir.path().join("probe.jsonl"))
             .is_some());
         assert!(!agent_dir.join("agent-traces-outbox").exists());
+    }
+}
+
+#[cfg(test)]
+mod clm_import_tests {
+    thread_local! { static ARTIFACT_COLLISION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+    pub(super) fn inject_artifact_collision(path: &std::path::Path) {
+        if ARTIFACT_COLLISION.replace(false) {
+            std::fs::create_dir(path).unwrap();
+            std::fs::write(path.join("foreign-owner"), "keep").unwrap();
+        }
+    }
+    #[test]
+    fn import_jsonl_does_not_clean_up_an_artifact_created_by_another_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let (navigation, sessions) = fixture(dir.path());
+        let input = dir.path().join("source.jsonl");
+        let original = source(&input);
+        let before = std::fs::read_dir(&sessions).unwrap().count();
+        ARTIFACT_COLLISION.set(true);
+        assert!(navigation
+            .prepare_import_jsonl(&serde_json::json!({"inputPath":input}))
+            .is_err());
+        let artifact_root = dir.path().join("session-artifacts");
+        let artifacts = std::fs::read_dir(artifact_root)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect::<Vec<_>>();
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(artifacts[0].join("foreign-owner")).unwrap(),
+            "keep"
+        );
+        assert_eq!(std::fs::read_dir(sessions).unwrap().count(), before);
+        assert_eq!(std::fs::read(input).unwrap(), original);
+    }
+
+    use super::*;
+    fn fixture(dir: &std::path::Path) -> (SessionNavigation, std::path::PathBuf) {
+        let sessions = dir.join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let mut live = SessionFile::create("/tmp", None, 0);
+        live.set_path(sessions.join("live.jsonl"));
+        live.rewrite().unwrap();
+        let core = Arc::new(Mutex::new(SessionCore::test_core(
+            Some(live),
+            "/tmp".into(),
+        )));
+        (
+            SessionNavigation::new(Arc::new(crate::engine::ScriptedEngine::default()), core),
+            sessions,
+        )
+    }
+    fn source(path: &std::path::Path) -> Vec<u8> {
+        let rows = [
+            json!({"type":"session","version":3,"id":"source","cwd":"/tmp","timestamp":"now"}),
+            json!({"type":"message","id":"u","parentId":null,"timestamp":"now","message":{"role":"user","content":"obsolete","timestamp":1}}),
+            json!({"type":"clm_on","id":"on","parentId":"u","timestamp":"now","epochId":"e","revision":0,"auditWatermark":"u","modeSource":"inherited-child","snapshot":{"blocks":[{"id":"image","message":{"role":"user","content":[{"type":"text","text":"accepted"},{"type":"image","data":"YWJj","mimeType":"image/png"}],"timestamp":1}}]}}),
+        ];
+        let bytes = rows
+            .iter()
+            .map(|r| r.to_string() + "\n")
+            .collect::<String>()
+            .into_bytes();
+        std::fs::write(path, &bytes).unwrap();
+        bytes
+    }
+    #[test]
+    fn import_jsonl_creates_independent_identity_and_accepted_mirror_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let (navigation, sessions) = fixture(dir.path());
+        let source_path = sessions.join("source.jsonl");
+        let original = source(&source_path);
+        let artifact = dir.path().join("session-artifacts/source/clm");
+        std::fs::create_dir_all(&artifact).unwrap();
+        std::fs::write(artifact.join("context.txt"), "pending source edits").unwrap();
+        std::fs::write(
+            source_path.with_extension("jsonl.clm-writer"),
+            "live marker",
+        )
+        .unwrap();
+        let target = navigation
+            .prepare_import_jsonl(&json!({"inputPath":source_path}))
+            .unwrap_or_else(|r| panic!("{r:?}"));
+        assert_ne!(target.file.header.id, "source");
+        assert_ne!(target.file.path, source_path);
+        let copied = std::fs::read(&target.file.path).unwrap();
+        assert_eq!(
+            copied.splitn(2, |b| *b == b'\n').nth(1),
+            original.splitn(2, |b| *b == b'\n').nth(1)
+        );
+        assert_eq!(std::fs::read(&source_path).unwrap(), original);
+        assert_eq!(
+            std::fs::read_to_string(artifact.join("context.txt")).unwrap(),
+            "pending source edits"
+        );
+        let mirror = dir
+            .path()
+            .join("session-artifacts")
+            .join(&target.file.header.id)
+            .join("clm/context.txt");
+        let text = std::fs::read_to_string(mirror).unwrap();
+        assert!(text.contains("accepted"));
+        assert!(!text.contains("pending"));
+        assert!(!text.contains("obsolete"));
+        assert!(!target.file.path.with_extension("jsonl.clm-writer").exists());
+        assert_eq!(target.file.model_context_checked().unwrap().len(), 1);
+        let second = navigation
+            .prepare_import_jsonl(&json!({"inputPath":source_path}))
+            .unwrap_or_else(|r| panic!("{r:?}"));
+        assert_ne!(second.file.path, target.file.path);
+        assert_ne!(second.file.header.id, target.file.header.id);
+        assert_eq!(std::fs::read(&source_path).unwrap(), original);
+    }
+    #[test]
+    fn import_jsonl_validates_unselected_clm_branch_before_copying() {
+        let dir = tempfile::tempdir().unwrap();
+        let (navigation, sessions) = fixture(dir.path());
+        let input = dir.path().join("bad.jsonl");
+        let mut bytes = source(&input);
+        bytes.extend_from_slice(
+            b"{\"type\":\"clm_revision\",\"id\":\"bad\",\"parentId\":\"missing\"}\n",
+        );
+        std::fs::write(&input, &bytes).unwrap();
+        let before = std::fs::read_dir(&sessions).unwrap().count();
+        assert!(navigation
+            .prepare_import_jsonl(&json!({"inputPath":input}))
+            .is_err());
+        assert_eq!(std::fs::read_dir(&sessions).unwrap().count(), before);
+        assert_eq!(std::fs::read(input).unwrap(), bytes);
+    }
+    #[test]
+    fn import_jsonl_keeps_an_ordinary_selected_branch_without_adopting_source_mirror() {
+        let dir = tempfile::tempdir().unwrap();
+        let (navigation, sessions) = fixture(dir.path());
+        let input = dir.path().join("branch.jsonl");
+        let mut bytes = source(&input);
+        let off = json!({"type":"clm_off_boundary","id":"off","parentId":"on","timestamp":"now","epochId":"e","revision":1,"auditWatermark":"u","snapshot":{"blocks":[]}});
+        bytes.extend_from_slice((off.to_string() + "\n").as_bytes());
+        let sibling = json!({"type":"message","id":"sibling","parentId":"u","timestamp":"now","message":{"role":"user","content":"selected ordinary branch","timestamp":2}});
+        bytes.extend_from_slice((sibling.to_string() + "\n").as_bytes());
+        std::fs::write(&input, &bytes).unwrap();
+        let target = navigation
+            .prepare_import_jsonl(&json!({"inputPath":input}))
+            .unwrap_or_else(|r| panic!("{r:?}"));
+        assert_eq!(target.file.model_context_checked().unwrap().len(), 2);
+        assert!(!sessions
+            .parent()
+            .unwrap()
+            .join("session-artifacts")
+            .join(&target.file.header.id)
+            .join("clm/context.txt")
+            .exists());
+        assert_eq!(std::fs::read(input).unwrap(), bytes);
+    }
+    #[test]
+    fn import_jsonl_preserves_revision_usage_and_frozen_off_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let (navigation, _) = fixture(dir.path());
+        let input = dir.path().join("revisions.jsonl");
+        let mut bytes = source(&input);
+        let snapshot = pa_types::clm::ClmSnapshot::from_value(
+            json!({"blocks":[{"id":"note","message":{"role":"user","content":"edited accepted note","timestamp":2}}]}),
+        );
+        let revision = json!({"type":"clm_revision","id":"rev","parentId":"on","timestamp":"now","epochId":"e","revision":1,"baseRevision":0,"snapshot":snapshot,"auditWatermark":"u","observedActionId":"edit","checksum":pa_core::clm::snapshot_checksum(&snapshot).unwrap()});
+        let usage = json!({"input":2,"output":3,"cacheRead":4,"cacheWrite":5,"totalTokens":14,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0.25}});
+        let pin = pa_types::clm::ClmUsagePin {
+            mode: pa_types::clm::ClmMode::On,
+            branch_id: Some("rev".into()),
+            epoch_id: Some("e".into()),
+            revision: Some(1),
+            entry_id: Some("rev".into()),
+        };
+        let mut receipt = pa_core::clm::clm_usage_receipt(&pin, &usage, None);
+        receipt["type"] = json!("custom");
+        receipt["id"] = json!("receipt");
+        receipt["parentId"] = json!("rev");
+        receipt["timestamp"] = json!("now");
+        bytes.extend_from_slice(
+            (revision.to_string() + "\n" + &receipt.to_string() + "\n").as_bytes(),
+        );
+        std::fs::write(&input, &bytes).unwrap();
+        let target = navigation
+            .prepare_import_jsonl(&json!({"inputPath":input}))
+            .unwrap_or_else(|r| panic!("{r:?}"));
+        let measured = pa_core::clm::get_clm_measured_usage(
+            &target.file.branch_file_entries_checked().unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            measured,
+            pa_types::clm::ClmMeasuredUsage {
+                input: 2.,
+                output: 3.,
+                cache_read: 4.,
+                cache_write: 5.,
+                cost: 0.25
+            }
+        );
+        let off = json!({"type":"clm_off_boundary","id":"off","parentId":"receipt","timestamp":"now","epochId":"e","revision":2,"snapshot":snapshot,"auditWatermark":"u"});
+        bytes.extend_from_slice((off.to_string() + "\n").as_bytes());
+        std::fs::write(&input, &bytes).unwrap();
+        let target = navigation
+            .prepare_import_jsonl(&json!({"inputPath":input}))
+            .unwrap_or_else(|r| panic!("{r:?}"));
+        assert_eq!(
+            target.file.model_context_checked().unwrap(),
+            vec![json!({"role":"user","content":"edited accepted note","timestamp":2})]
+        );
+        assert_eq!(
+            pa_core::clm::get_clm_measured_usage(
+                &target.file.branch_file_entries_checked().unwrap()
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(std::fs::read(input).unwrap(), bytes);
+    }
+    #[test]
+    fn imported_clm_reopen_preserves_destination_and_source_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (navigation, sessions) = fixture(dir.path());
+        let input = dir.path().join("source.jsonl");
+        let original = source(&input);
+        let target = navigation
+            .prepare_import_jsonl(&json!({"inputPath":input}))
+            .unwrap_or_else(|r| panic!("{r:?}"));
+        assert!(target.file.header.parent_session.is_some());
+        assert_eq!(target.file.header.rlm_depth, None);
+        let destination = target.file.path.clone();
+        let copied = std::fs::read(&destination).unwrap();
+        drop(target);
+        let mut core =
+            pa_core::session::manager::SessionManager::open(dir.path(), &sessions, &destination);
+        assert_eq!(core.get_header().unwrap().rlm_depth, None);
+        assert_eq!(std::fs::read(&destination).unwrap(), copied);
+        core.clm_journal(
+            pa_core::clm::journal::ClmJournalOp::ReadAfterEvents,
+            pa_core::clm::ProtectedActions::new(),
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&destination).unwrap(), copied);
+        assert_eq!(std::fs::read(&input).unwrap(), original);
+    }
+    #[test]
+    #[ignore = "required Task7 opt-in: serial 512 MiB owner/history/import proof; run --ignored --exact --nocapture --test-threads=1"]
+    fn clm_session_snapshot_cap_real_owners_and_history() -> anyhow::Result<()> {
+        use pa_core::clm::{
+            journal::{ClmCommit, ClmJournalOp, ClmJournalReply, ClmJournalView},
+            ClmError, ProtectedActions,
+        };
+        use sha2::{Digest, Sha256};
+        use std::io::{Read, Write};
+        use std::path::Path;
+
+        fn fingerprint(path: &Path) -> anyhow::Result<(u64, Vec<u8>)> {
+            let mut input = std::fs::File::open(path)?;
+            let mut hash = Sha256::new();
+            let mut buffer = vec![0u8; 64 * 1024].into_boxed_slice();
+            loop {
+                let count = input.read(&mut buffer)?;
+                if count == 0 {
+                    break;
+                }
+                hash.update(&buffer[..count]);
+            }
+            Ok((input.metadata()?.len(), hash.finalize().to_vec()))
+        }
+        fn padded_boundary(output: &mut impl Write, envelope: &str) -> anyhow::Result<()> {
+            output.write_all(envelope.as_bytes())?;
+            output.write_all(br#"{"blocks":[],"padding":""#)?;
+            let padding = pa_core::clm::MAX_CUMULATIVE_SNAPSHOT_BYTES / 2
+                - br#"{"blocks":[],"padding":""}"#.len();
+            let chunk = vec![b'x'; 64 * 1024].into_boxed_slice();
+            let mut remaining = padding;
+            while remaining > 0 {
+                let count = remaining.min(chunk.len());
+                output.write_all(&chunk[..count])?;
+                remaining -= count;
+            }
+            output.write_all(b"\"}}\n")?;
+            Ok(())
+        }
+        fn off(view: ClmJournalView) -> ClmCommit {
+            let state = pa_core::clm::validate_clm_branch(&view.branch).unwrap();
+            let row = serde_json::from_value(json!({"type":"clm_off_boundary","epochId":state.epoch_id,"revision":state.revision.unwrap()+1,"auditWatermark":"u","snapshot":{"blocks":[]}})).unwrap();
+            ClmCommit {
+                expected: view,
+                row,
+                allow_child_usage_suffix: false,
+            }
+        }
+        fn core_probe(label: &str, source: &Path, work: &Path) -> anyhow::Result<bool> {
+            std::fs::copy(source, work)?;
+            let before = fingerprint(work)?;
+            let dir = work.parent().unwrap();
+            let mut owner = pa_core::session::manager::SessionManager::open(dir, dir, work);
+            if label == "core-sibling" {
+                let pa_types::session::FileEntry::ClmOffBoundary { payload, .. } =
+                    &owner.get_all_entries()[3]
+                else {
+                    panic!("off fixture");
+                };
+                pa_core::clm::validate_clm_snapshot_admission(
+                    &owner.get_all_entries()[..3],
+                    &payload.boundary.snapshot,
+                )?;
+                println!("actual_512MiB_equality_allowed=true");
+            }
+            let count = owner.get_all_entries().len();
+            let leaf = owner.get_leaf_id().map(str::to_owned);
+            let readable = owner.active_context_checked().is_ok();
+            let current = owner.clm_journal(ClmJournalOp::ReadAfterEvents, ProtectedActions::new());
+            let rejected = if let Ok(ClmJournalReply::View(view)) = current {
+                matches!(
+                    owner.clm_journal(ClmJournalOp::Commit(off(view)), ProtectedActions::new()),
+                    Err(ClmError::Budget(_))
+                )
+            } else {
+                false
+            };
+            let unchanged = fingerprint(work)? == before
+                && owner.get_all_entries().len() == count
+                && owner.get_leaf_id() == leaf.as_deref();
+            let usable = owner.active_context_checked().is_ok()
+                && owner
+                    .clm_journal(ClmJournalOp::ReadAfterEvents, ProtectedActions::new())
+                    .is_ok();
+            println!("{label}: readable={readable} budget_rejected={rejected} unchanged={unchanged} usable={usable}");
+            Ok(readable && rejected && unchanged && usable)
+        }
+        fn daemon_probe(label: &str, source: &Path, work: &Path) -> anyhow::Result<bool> {
+            std::fs::copy(source, work)?;
+            let before = fingerprint(work)?;
+            let mut owner = SessionFile::open(work)?;
+            let count = owner.entries().len();
+            assert!(count >= 4, "native fixture rows must not be skipped");
+            let leaf = owner.leaf_id().map(str::to_owned);
+            let readable = owner.model_context_checked().is_ok();
+            let current = owner.clm_journal(ClmJournalOp::ReadAfterEvents, ProtectedActions::new());
+            let rejected = if let Ok(ClmJournalReply::View(view)) = current {
+                let result =
+                    owner.clm_journal(ClmJournalOp::Commit(off(view)), ProtectedActions::new());
+                if let Err(error) = &result {
+                    println!("{label}: commit_error={error}");
+                }
+                result.is_err_and(|e| {
+                    matches!(e.downcast_ref::<ClmError>(), Some(ClmError::Budget(_)))
+                })
+            } else {
+                false
+            };
+            let unchanged = fingerprint(work)? == before
+                && owner.entries().len() == count
+                && owner.leaf_id() == leaf.as_deref();
+            let usable = owner.model_context_checked().is_ok()
+                && owner
+                    .clm_journal(ClmJournalOp::ReadAfterEvents, ProtectedActions::new())
+                    .is_ok();
+            println!("{label}: readable={readable} budget_rejected={rejected} unchanged={unchanged} usable={usable}");
+            Ok(readable && rejected && unchanged && usable)
+        }
+        let temporary = tempfile::tempdir()?;
+        // An explicit artifact directory retains this generated fixture for the manual exercise.
+        let root = std::env::var_os("PA_CLM_CAP_PROOF_DIR")
+            .map_or_else(|| temporary.path().to_owned(), std::path::PathBuf::from);
+        std::fs::create_dir_all(&root)?;
+        let source = root.join("cap-history.jsonl");
+        let work = root.join("owner-probe.jsonl");
+        let mut output = std::io::BufWriter::new(
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&source)?,
+        );
+        writeln!(
+            output,
+            "{}",
+            json!({"type":"session","version":3,"id":"cap-source","cwd":"/tmp","timestamp":"now"})
+        )?;
+        writeln!(
+            output,
+            "{}",
+            json!({"type":"message","id":"u","parentId":null,"timestamp":"now","message":{"role":"user","content":"covered audit","timestamp":1}})
+        )?;
+        padded_boundary(
+            &mut output,
+            r#"{"type":"clm_on","id":"a","parentId":"u","timestamp":"now","epochId":"old","revision":0,"auditWatermark":"u","snapshot":"#,
+        )?;
+        padded_boundary(
+            &mut output,
+            r#"{"type":"clm_off_boundary","id":"a-off","parentId":"a","timestamp":"now","epochId":"old","revision":1,"auditWatermark":"u","snapshot":"#,
+        )?;
+        writeln!(
+            output,
+            "{}",
+            json!({"type":"clm_on","id":"b","parentId":"u","timestamp":"now","epochId":"sibling","revision":0,"auditWatermark":"u","snapshot":{"blocks":[]}})
+        )?;
+        output.flush()?;
+        output.get_ref().sync_all()?;
+        drop(output);
+        let mut outcomes = vec![
+            core_probe("core-sibling", &source, &work)?,
+            daemon_probe("daemon-sibling", &source, &work)?,
+        ];
+        // Extend the completed old epoch: this ancestry itself is now over the cap.
+        let mut output = std::fs::OpenOptions::new().append(true).open(&source)?;
+        writeln!(
+            output,
+            "{}",
+            json!({"type":"clm_on","id":"c","parentId":"a-off","timestamp":"now","epochId":"later","revision":0,"auditWatermark":"u","snapshot":{"blocks":[]}})
+        )?;
+        output.sync_all()?;
+        drop(output);
+        outcomes.push(core_probe("core-historical-over-cap", &source, &work)?);
+        outcomes.push(daemon_probe("daemon-historical-over-cap", &source, &work)?);
+        let source_before = fingerprint(&source)?;
+        let (navigation, _) = fixture(&root);
+        let imported = navigation.prepare_import_jsonl(&json!({"inputPath":source}));
+        let import_ok = if let Ok(mut prepared) = imported {
+            let before = fingerprint(&prepared.file.path)?;
+            let leaf = prepared.file.leaf_id().map(str::to_owned);
+            let count = prepared.file.entries().len();
+            let readable = prepared.file.model_context_checked().is_ok();
+            let current = prepared
+                .file
+                .clm_journal(ClmJournalOp::ReadAfterEvents, ProtectedActions::new());
+            let rejected = if let Ok(ClmJournalReply::View(view)) = current {
+                prepared
+                    .file
+                    .clm_journal(ClmJournalOp::Commit(off(view)), ProtectedActions::new())
+                    .is_err_and(|e| {
+                        matches!(e.downcast_ref::<ClmError>(), Some(ClmError::Budget(_)))
+                    })
+            } else {
+                false
+            };
+            let unchanged = before == fingerprint(&prepared.file.path)?
+                && prepared.file.leaf_id() == leaf.as_deref()
+                && prepared.file.entries().len() == count;
+            let usable = prepared.file.model_context_checked().is_ok();
+            println!("copy-import: readable={readable} budget_rejected={rejected} unchanged={unchanged} usable={usable}");
+            readable && rejected && unchanged && usable
+        } else {
+            println!("copy-import: rejected_existing_history=true");
+            false
+        };
+        let source_unchanged = source_before == fingerprint(&source)?;
+        println!(
+            "copy-source-unchanged={source_unchanged} fixture={}",
+            source.display()
+        );
+        outcomes.push(import_ok && source_unchanged);
+        assert!(
+            outcomes.iter().all(|outcome| *outcome),
+            "owner/history outcomes: {outcomes:?}"
+        );
+        Ok(())
     }
 }

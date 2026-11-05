@@ -143,6 +143,10 @@ pub const KNOWN_COMMAND_TYPES: &[&str] = &[
     "set_rlm_max_depth",
     "rename_saved_session",
     "delete_saved_session",
+    "get_clm_status",
+    "set_clm_mode",
+    "restore_clm_revision",
+    "get_clm_model_snapshot",
     "get_session_context",
     "get_session_tree",
     "get_user_messages_for_forking",
@@ -355,6 +359,7 @@ pub fn default_server_capabilities() -> Vec<DaemonServerCapability> {
                 "kernel_cwd_propagation",
                 "agent_roster",
                 "direct_peer_transport",
+                "clm_context_v1",
             ]
             .iter()
             .map(std::string::ToString::to_string),
@@ -861,6 +866,18 @@ pub fn command_active_session_id(command: &DaemonCommand) -> Option<&str> {
         | DaemonCommand::SetRlmMaxDepth {
             active_session_id, ..
         }
+        | DaemonCommand::GetClmStatus {
+            active_session_id, ..
+        }
+        | DaemonCommand::SetClmMode {
+            active_session_id, ..
+        }
+        | DaemonCommand::RestoreClmRevision {
+            active_session_id, ..
+        }
+        | DaemonCommand::GetClmModelSnapshot {
+            active_session_id, ..
+        }
         | DaemonCommand::GetSessionContext {
             active_session_id, ..
         }
@@ -1054,6 +1071,10 @@ pub fn command_type_name(command: &DaemonCommand) -> &'static str {
         DaemonCommand::SetRlmMaxDepth { .. } => "set_rlm_max_depth",
         DaemonCommand::RenameSavedSession { .. } => "rename_saved_session",
         DaemonCommand::DeleteSavedSession { .. } => "delete_saved_session",
+        DaemonCommand::GetClmStatus { .. } => "get_clm_status",
+        DaemonCommand::SetClmMode { .. } => "set_clm_mode",
+        DaemonCommand::RestoreClmRevision { .. } => "restore_clm_revision",
+        DaemonCommand::GetClmModelSnapshot { .. } => "get_clm_model_snapshot",
         DaemonCommand::GetSessionContext { .. } => "get_session_context",
         DaemonCommand::GetSessionTree { .. } => "get_session_tree",
         DaemonCommand::GetUserMessagesForForking { .. } => "get_user_messages_for_forking",
@@ -1077,6 +1098,25 @@ pub fn command_type_name(command: &DaemonCommand) -> &'static str {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn clm_vocabulary_and_functioning_backend_are_advertised() {
+        for command in [
+            json!({"type":"get_clm_status","activeSessionId":"session"}),
+            json!({"type":"set_clm_mode","activeSessionId":"session","enabled":true}),
+            json!({"type":"restore_clm_revision","activeSessionId":"session","epochId":"epoch","revision":0}),
+            json!({"type":"get_clm_model_snapshot","activeSessionId":"session"}),
+        ] {
+            let line = json!({"type":"command","id":"request","protocol":current_protocol_info(),"command":command}).to_string();
+            let parsed = parse_daemon_command_line(&line).unwrap();
+            assert_eq!(command_active_session_id(&parsed.command), Some("session"));
+            assert_eq!(
+                command_type_name(&parsed.command),
+                command["type"].as_str().unwrap()
+            );
+        }
+        assert!(default_server_capabilities().contains(&"clm_context_v1".to_string()));
+    }
 
     #[test]
     fn kernel_bash_activity_commands_are_session_scoped() {

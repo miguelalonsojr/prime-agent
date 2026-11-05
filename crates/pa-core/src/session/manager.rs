@@ -17,11 +17,12 @@ use super::{migrate_to_current_version, parse_session_entries, CURRENT_SESSION_V
 mod tests;
 
 mod append;
+mod clm;
 
 mod persist;
 
 mod queries;
-use super::{build_session_context, SessionContext};
+use super::SessionContext;
 
 mod lifecycle;
 use super::window;
@@ -58,6 +59,9 @@ pub struct NewSessionOptions {
 #[allow(clippy::struct_excessive_bools)]
 pub struct SessionManager {
     session_id: String,
+    clm_generation: String,
+    clm_default_eligible: bool,
+    clm_error: Option<String>,
     session_file: Option<PathBuf>,
     session_dir: PathBuf,
     cwd: PathBuf,
@@ -77,6 +81,8 @@ pub struct SessionManager {
     leaf_id: Option<String>,
     /// Exact worker-owned rows replayed by the current prompt admission.
     admitted_user_rows: std::collections::VecDeque<String>,
+    /// Original acknowledged assistant usage, before derived child accounting.
+    authoritative_assistant_usage: HashMap<String, pa_types::ai::Usage>,
     persist_listeners: Vec<SessionPersistListener>,
 }
 

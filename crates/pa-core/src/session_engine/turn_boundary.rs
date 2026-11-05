@@ -15,7 +15,7 @@ use crate::session::manager::SessionManager;
 
 use pa_types::usage::{calculate_context_tokens, estimate_tokens, valid_assistant_usage};
 
-use super::compact_session::{prepare_compaction, CompactSkip};
+use super::compact_session::{prepare_session_compaction, PrepareError};
 use super::engine::SessionEngine;
 
 /// A scheduled compaction (kernel `compact.run`).
@@ -279,10 +279,8 @@ impl TurnBoundaryRequests {
                     }
                     // TS `prepareCompaction`: only schedule a compaction
                     // that has history to summarize.
-                    let entries = runtime.session.lock().await.retained_entries().to_vec();
-                    if let Some(reason) =
-                        compaction_request_skip_reason(&entries, keep_recent_tokens)
-                    {
+                    let reason = compaction_request_skip_reason(&*runtime.session.lock().await, keep_recent_tokens)?;
+                    if let Some(reason) = reason {
                         return Ok(json!({ "scheduled": false, "reason": reason }));
                     }
                     requests.schedule_compaction(instructions).await;
@@ -482,12 +480,14 @@ fn no_active_turn(reason: &'static str) -> Value {
 /// The `compact.run` reason for a session that cannot prepare a
 /// compaction, distinct from the `/compact` skip message.
 fn compaction_request_skip_reason(
-    entries: &[FileEntry],
+    session: &SessionManager,
     keep_recent_tokens: u64,
-) -> Option<&'static str> {
-    prepare_compaction(entries, keep_recent_tokens)
-        .err()
-        .map(CompactSkip::request_reason)
+) -> anyhow::Result<Option<&'static str>> {
+    match prepare_session_compaction(session, keep_recent_tokens) {
+        Ok(_) => Ok(None),
+        Err(PrepareError::Skipped(skip)) => Ok(Some(skip.request_reason())),
+        Err(PrepareError::InvalidContext(error)) => Err(error.into()),
+    }
 }
 
 /// Estimated context usage: the last valid assistant usage anchors the

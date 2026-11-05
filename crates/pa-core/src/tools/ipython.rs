@@ -160,6 +160,9 @@ pub struct KernelExecuteOptions<'a> {
     /// Streams cell output while the cell runs.
     pub on_stream: StreamFn<'a>,
     pub on_late_sent_agent_message: Option<crate::kernel::shared::LateSentAgentMessageCallback>,
+    /// Trusted host tool identity, never supplied through Python parameters.
+    pub tool_call_id: Option<String>,
+    pub tool_execution_identity: Option<crate::kernel::shared::ToolExecutionIdentity>,
 }
 
 type ExecuteCellFuture =
@@ -288,6 +291,8 @@ async fn execute_with_busy_kernel_choice(
                     signal: execute.signal.clone(),
                     on_stream: execute.on_stream,
                     on_late_sent_agent_message: execute.on_late_sent_agent_message.clone(),
+                    tool_call_id: execute.tool_call_id.clone(),
+                    tool_execution_identity: execute.tool_execution_identity.clone(),
                 },
             )
             .await;
@@ -328,12 +333,16 @@ async fn execute_with_busy_kernel_choice(
     }
 }
 
+/// Observes the public tool result before model-facing text/details are built.
+pub type PublicResultObserver = Arc<dyn Fn(&str, &ExecuteResult) + Send + Sync>;
+
 pub struct IpythonToolOptions {
     /// Shared provisioner owning the kernel lifecycle.
     pub provisioner: Arc<dyn IpythonKernelProvisioner>,
     /// UI surface; `None` in headless sessions.
     pub ui: Option<Arc<dyn IpythonToolUi>>,
     pub on_late_sent_agent_message: Option<LateSentAgentMessageHandler>,
+    pub on_public_result: Option<PublicResultObserver>,
 }
 
 pub fn ipython_tool_schema() -> serde_json::Value {
@@ -365,7 +374,9 @@ pub async fn execute_ipython(
     signal: Option<AbortSignal>,
     on_update: Option<OnUpdate>,
     on_late_sent_agent_message: Option<crate::kernel::shared::LateSentAgentMessageCallback>,
+    tool_call_id: Option<String>,
 ) -> anyhow::Result<ToolExecutionResult> {
+    let tool_execution_identity = crate::kernel::shared::current_tool_execution_identity();
     let set_tool_working_message = |message: Option<&str>| {
         if let Some(ui) = &options.ui {
             ui.set_working_message(message);
@@ -407,6 +418,8 @@ pub async fn execute_ipython(
             signal,
             on_stream: Some(&stream_update),
             on_late_sent_agent_message,
+            tool_call_id: tool_call_id.clone(),
+            tool_execution_identity,
         },
         &|message| {
             set_tool_working_message(message);
@@ -418,6 +431,11 @@ pub async fn execute_ipython(
     set_tool_working_message(None);
 
     let (r, kernel_restarted) = result.map_err(|err| anyhow::anyhow!("{}", err.message()))?;
+    observe_public_result(
+        options.on_public_result.as_ref(),
+        tool_call_id.as_deref(),
+        &r,
+    );
 
     let mut text = format_execute_text(&r, r.background_output.as_deref());
     if kernel_restarted {
@@ -485,6 +503,16 @@ pub async fn execute_ipython(
     })
 }
 
+fn observe_public_result(
+    observer: Option<&PublicResultObserver>,
+    tool_call_id: Option<&str>,
+    result: &ExecuteResult,
+) {
+    if let (Some(observer), Some(tool_call_id)) = (observer, tool_call_id) {
+        observer(tool_call_id, result);
+    }
+}
+
 /// The `python_repl` tool definition: exact name, schema, and description.
 #[must_use]
 pub fn create_ipython_tool_definition(_cwd: &str, options: IpythonToolOptions) -> ToolDefinition {
@@ -493,10 +521,11 @@ pub fn create_ipython_tool_definition(_cwd: &str, options: IpythonToolOptions) -
         let options = options;
         Arc::new(move |tool_call_id, params, signal, on_update| {
             let options = options.clone();
+            let tool_call_id = tool_call_id.to_string();
             let on_late_sent_agent_message =
                 options.on_late_sent_agent_message.as_ref().map(|handler| {
                     let handler = std::sync::Arc::clone(handler);
-                    let tool_call_id = tool_call_id.to_string();
+                    let tool_call_id = tool_call_id.clone();
                     std::sync::Arc::new(move |message| handler(&tool_call_id, message))
                         as crate::kernel::shared::LateSentAgentMessageCallback
                 });
@@ -512,6 +541,7 @@ pub fn create_ipython_tool_definition(_cwd: &str, options: IpythonToolOptions) -
                     signal,
                     on_update,
                     on_late_sent_agent_message,
+                    Some(tool_call_id),
                 )
                 .await
             })
@@ -535,6 +565,171 @@ pub fn create_ipython_tool_definition(_cwd: &str, options: IpythonToolOptions) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    #[derive(Clone)]
+    struct AbortedKernel {
+        tool_ids: Arc<Mutex<Vec<Option<String>>>>,
+        identities: Arc<Mutex<Vec<Option<crate::kernel::shared::ToolExecutionIdentity>>>>,
+        busy_once: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl KernelExecutor for AbortedKernel {
+        fn execute(&self, _code: &str, options: KernelExecuteOptions<'_>) -> ExecuteCellFuture {
+            self.tool_ids.lock().unwrap().push(options.tool_call_id);
+            self.identities
+                .lock()
+                .unwrap()
+                .push(options.tool_execution_identity);
+            if self
+                .busy_once
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Box::pin(std::future::ready(Err(
+                    KernelExecError::BusyAfterInterrupt(
+                        crate::tools::ipython::KernelBusyAfterInterruptError::default(),
+                    ),
+                )));
+            }
+            Box::pin(std::future::ready(Ok(ExecuteResult {
+                status: ExecuteStatus::Aborted,
+                ..Default::default()
+            })))
+        }
+    }
+
+    struct AbortedKernelProvisioner(AbortedKernel);
+
+    impl IpythonKernelProvisioner for AbortedKernelProvisioner {
+        fn ensure(
+            &self,
+            _on_progress: Option<BootstrapProgressHandler>,
+            _signal: Option<AbortSignal>,
+        ) -> EnsureFuture {
+            let executor: Box<dyn KernelExecutor> = Box::new(self.0.clone());
+            Box::pin(std::future::ready(Ok(executor)))
+        }
+
+        fn kill(&self) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+            Box::pin(std::future::ready(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_execution_observes_aborted_status_with_the_real_tool_call_id() {
+        let tool_ids = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&observed);
+        let tool = create_ipython_tool_definition(
+            ".",
+            IpythonToolOptions {
+                provisioner: Arc::new(AbortedKernelProvisioner(AbortedKernel {
+                    tool_ids: Arc::clone(&tool_ids),
+                    identities: std::sync::Arc::default(),
+                    busy_once: std::sync::Arc::default(),
+                })),
+                ui: None,
+                on_late_sent_agent_message: None,
+                on_public_result: Some(Arc::new(move |id, result| {
+                    captured
+                        .lock()
+                        .unwrap()
+                        .push((id.to_string(), result.status.clone()));
+                })),
+            },
+        );
+        let result = (tool.execute)("tool-7", json!({"code": "1 + 1"}), None, None)
+            .await
+            .unwrap();
+        assert_eq!(*tool_ids.lock().unwrap(), [Some("tool-7".to_string())]);
+        assert_eq!(
+            *observed.lock().unwrap(),
+            [("tool-7".to_string(), ExecuteStatus::Aborted)]
+        );
+        assert!(result.is_error);
+        assert_eq!(result.details.unwrap()["status"], "aborted");
+    }
+
+    #[tokio::test]
+    async fn clm_builtin_ipython_keeps_identity_through_busy_retry_and_clears_unowned_calls() {
+        struct WaitUi;
+        impl IpythonToolUi for WaitUi {
+            fn select(
+                &self,
+                _: &str,
+                _: &[&str],
+                _: Option<&AbortSignal>,
+            ) -> Pin<Box<dyn Future<Output = Option<String>> + Send>> {
+                Box::pin(std::future::ready(Some(
+                    BUSY_KERNEL_WAIT_CHOICE.to_string(),
+                )))
+            }
+            fn set_working_message(&self, _: Option<&str>) {}
+        }
+        let identities = Arc::new(Mutex::new(Vec::new()));
+        let tool_ids = Arc::new(Mutex::new(Vec::new()));
+        let tool = create_ipython_tool_definition(
+            ".",
+            IpythonToolOptions {
+                provisioner: Arc::new(AbortedKernelProvisioner(AbortedKernel {
+                    identities: identities.clone(),
+                    tool_ids: tool_ids.clone(),
+                    busy_once: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                })),
+                ui: Some(Arc::new(WaitUi)),
+                on_late_sent_agent_message: None,
+                on_public_result: None,
+            },
+        );
+        let identity = crate::kernel::shared::ToolExecutionIdentity::new();
+        crate::kernel::shared::with_tool_execution_identity(Some(identity.clone()), async {
+            (tool.execute)("same-id", json!({"code":"1"}), None, None)
+                .await
+                .unwrap();
+            crate::kernel::shared::with_tool_execution_identity(None, async {
+                (tool.execute)("same-id", json!({"code":"2"}), None, None)
+                    .await
+                    .unwrap();
+            })
+            .await;
+        })
+        .await;
+        let identities = identities.lock().unwrap();
+        assert_eq!(identities.len(), 3);
+        assert!(identities[..2]
+            .iter()
+            .all(|item| item.as_ref().unwrap().same_instance(&identity)));
+        assert!(identities[2].is_none());
+        assert!(tool_ids
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|id| id.as_deref() == Some("same-id")));
+    }
+
+    #[test]
+    fn result_observer_receives_structured_aborted_status_not_python_done() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = Arc::clone(&seen);
+        let observer: PublicResultObserver = Arc::new(move |id, result| {
+            captured
+                .lock()
+                .unwrap()
+                .push((id.to_string(), result.status.clone()));
+        });
+        let result = ExecuteResult {
+            status: ExecuteStatus::Aborted,
+            ..Default::default()
+        };
+        observe_public_result(Some(&observer), Some("python-tool"), &result);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [("python-tool".into(), ExecuteStatus::Aborted)]
+        );
+        observe_public_result(None, Some("python-tool"), &result);
+        observe_public_result(Some(&observer), None, &result);
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
 
     #[test]
     fn sent_agent_message_json_matches_ts_wire_shape() {

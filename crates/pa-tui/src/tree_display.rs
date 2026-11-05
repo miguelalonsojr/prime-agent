@@ -310,6 +310,9 @@ pub fn entry_display_text<S: std::hash::BuildHasher + Default>(
             ),
         )],
         FileEntry::Header { .. }
+        | FileEntry::ClmOn { .. }
+        | FileEntry::ClmRevision { .. }
+        | FileEntry::ClmOffBoundary { .. }
         | FileEntry::SessionState { .. }
         | FileEntry::GitState { .. }
         | FileEntry::Unknown { .. } => Vec::new(),
@@ -400,4 +403,47 @@ pub fn searchable_text(node: &TreeNodeData) -> String {
         _ => {}
     }
     parts.join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::theme::ColorMode;
+
+    #[test]
+    fn clm_boundaries_render_without_content() {
+        let theme = Theme::builtin("prime", ColorMode::TrueColor);
+        let tools = HashMap::<String, ToolCallInfo>::new();
+        for kind in ["clm_on", "clm_revision", "clm_off_boundary"] {
+            let mut entry = serde_json::json!({
+                "type": kind, "id": kind, "parentId": null,
+                "timestamp": "2026-01-01T00:00:00.000Z", "epochId": "epoch",
+                "revision": u8::from(kind != "clm_on"),
+                "snapshot": {"blocks": []}, "auditWatermark": null
+            });
+            if kind == "clm_revision" {
+                entry["baseRevision"] = serde_json::json!(0);
+                entry["checksum"] = serde_json::json!("synthetic-checksum");
+                entry["observedActionId"] = serde_json::json!("tool-call");
+            }
+            let node = TreeNodeData {
+                entry: serde_json::from_value(entry).expect("valid typed CLM boundary"),
+                label: None,
+                label_timestamp: None,
+            };
+            assert!(
+                matches!(
+                    (&node.entry, kind),
+                    (FileEntry::ClmOn { .. }, "clm_on")
+                        | (FileEntry::ClmRevision { .. }, "clm_revision")
+                        | (FileEntry::ClmOffBoundary { .. }, "clm_off_boundary")
+                ),
+                "{kind} must decode as its typed variant"
+            );
+            assert!(
+                entry_display_text(&theme, &node, &tools).is_empty(),
+                "{kind}"
+            );
+        }
+    }
 }

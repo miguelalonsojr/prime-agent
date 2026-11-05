@@ -56,6 +56,13 @@ pub struct EngineModelSelection {
 /// emit callback cancels the prompt.
 #[derive(Debug, Clone, PartialEq)]
 pub enum EngineEvent {
+    /// Internal durable-message acknowledgement. Never serialized to clients.
+    ClmMessageAck {
+        event: Box<EngineEvent>,
+        acknowledged: Arc<std::sync::OnceLock<pa_types::clm::ClmBlock>>,
+    },
+    /// Provider-only receipt appended by the same worker owner as its assistant row.
+    ClmUsage(Value),
     /// A session model transition: the worker owns the durable `model_change`
     /// row; this internal event adds no client-facing protocol frame.
     ModelChange(pa_types::session::ModelChangeEntry),
@@ -257,6 +264,7 @@ pub type GoalAdmissionSink = std::sync::Arc<dyn Fn(GoalTurnEndWork) + Send + Syn
 #[derive(Debug, Clone, Default)]
 pub struct RlmSessionIdentity {
     pub rlm_depth: u32,
+    pub inherited_clm_mode: Option<bool>,
     pub rlm_max_depth: Option<u32>,
     pub cwd: Option<String>,
     pub session_id: Option<String>,

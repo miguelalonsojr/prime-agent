@@ -181,3 +181,11 @@ For per-model early compaction, use the existing provider-scoped
 
 Use the actual model ID for your provider. This sets that model's effective context
 window; it does not change every model's global compaction percentage.
+
+### Context ledger mode (CLM)
+
+`clm.enabled` in global or project settings sets the default for **new** sessions; it is off unless explicitly enabled. A project setting takes precedence. Changing settings does not switch an active session or its children. Where the daemon advertises `clm_context_v1` on protocol 7 and schema revision 32, use `/clm on`, `/clm off`, `/clm status`, `/clm view`, or `/clm restore <epoch:revision>`. `/clm view` shows accepted model context, not pending working-file bytes or audit history. `/context` remains the separate usage view. An older daemon refuses CLM controls locally; ordinary attachment stays available.
+
+CLM is experimental: older binaries can ignore CLM edits and replay the audit. Do not downgrade an active CLM session. CLM cannot promise a lower billed cost: estimated occupancy is not measured provider usage, and unavailable or invalid usage remains unknown. While CLM is on, side questions and other unsupported alternate writers are unavailable. Restore only a revision in the accepted epoch; CLM does not import arbitrary working files or replace the audit.
+
+When CLM is on, the session owns an absolute `clm/context.txt` working file. A Python cell can edit that file cooperatively. Only a validated, durably accepted revision changes the model context; `/clm view` never reads unaccepted file bytes. Active user and tool actions are protected while they run. The raw audit is not erased, and retained tool code can repeat text omitted from the accepted model context. `/clm off` freezes that context. Re-enabling CLM starts a new epoch from the current model context rather than replaying old audit text. A source CLM session may be imported only as a validated copy through the existing JSONL import flow; the source and pending working-file edits are not transferred. The cumulative 512 MiB limit applies when admitting the candidate snapshot together with stored snapshots, with equality allowed. It is not a general read, reopen, or import quota.

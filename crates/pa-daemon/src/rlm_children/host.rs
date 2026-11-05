@@ -120,6 +120,9 @@ impl RlmSubagentHost for SupervisorChildSessions {
                 .await?;
                 assert_thinking_supported(&this.agent_dir, request.thinking.as_deref(), &model)?;
                 let thinking = request.thinking.as_deref().or(identity.thinking.as_deref());
+                if let Some(admission) = &request.clm_admission {
+                    admission.recheck().await?;
+                }
                 let child_dir = this.child_session_dir(&child_id, &identity)?;
                 let cwd = identity.cwd.clone().unwrap_or_else(|| "/".to_string());
                 let runtime_metadata = json!({
@@ -135,6 +138,9 @@ impl RlmSubagentHost for SupervisorChildSessions {
                         Some(&name),
                         Some(&request.prompt),
                         identity.rlm_depth + 1,
+                        Some(request.clm_admission.as_ref().is_some_and(
+                            pa_core::session_engine::clm::ClmChildAdmission::inherited_mode,
+                        )),
                         &model,
                         thinking,
                         &cwd,
@@ -188,7 +194,18 @@ impl RlmSubagentHost for SupervisorChildSessions {
                     rename_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
                 };
                 let record = Arc::new(Mutex::new(record));
-                this.children.lock().await.push(Arc::clone(&record));
+                let mut children = this.children.lock().await;
+                if let Some(admission) = &request.clm_admission {
+                    if let Err(error) = admission.recheck().await {
+                        drop(children);
+                        let _ = this
+                            .kill_child(&created.active_session_id, ChildCloseReason::Killed)
+                            .await;
+                        return Err(error);
+                    }
+                }
+                children.push(Arc::clone(&record));
+                drop(children);
                 this.refresh_running().await;
                 this.emit_child_update(&record).await;
                 anyhow::Ok((record, created, model))

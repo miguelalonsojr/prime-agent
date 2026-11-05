@@ -239,6 +239,7 @@ fn strip_display_prefixes(plan: RefinementPlan) -> RefinementPlan {
 
 /// The transcript feeding the refinement planner: the conversation messages
 /// plus the in-session refinement history (no owned copy of every entry).
+#[derive(Clone, Copy)]
 pub struct RefinementTranscript<'a> {
     pub messages: &'a [AgentMessage],
     pub refinement_history: &'a [crate::refinement::RefinementResult],
@@ -309,96 +310,156 @@ pub async fn execute_refinement_with_rows(
     refine_call: crate::refinement::executor::RefinerFn,
     agent_dir: Option<&Path>,
 ) -> anyhow::Result<(RefinementResult, Vec<String>)> {
-    let settings = match agent_dir {
-        Some(dir) => {
-            let cwd = session.get_cwd().to_path_buf();
-            let dir = dir.to_path_buf();
-            Some(
-                tokio::task::spawn_blocking(move || {
-                    let settings = crate::settings::SettingsManager::create(&cwd, &dir);
-                    anyhow::ensure!(
-                        super::refinement_gate::enabled(Some(&settings)),
-                        "Harness refinements are disabled in /settings"
-                    );
-                    Ok::<_, anyhow::Error>(settings)
-                })
-                .await??,
-            )
-        }
-        None => None,
-    };
-    let RefinementTranscript {
-        messages,
-        refinement_history,
-    } = transcript;
-    let local_harness_dir = local_harness_state_dir(session);
-    let core_options = CoreRefineOptions {
-        global: options.global,
-        instructions: options.instructions.clone(),
-        rollback_id: options.rollback_id.clone(),
-    };
-    let requested_scope = if options.global {
-        HarnessScope::Global
-    } else {
-        HarnessScope::Local
-    };
-    // A local refinement needs the session's own directory: its harness state
-    // and artifact paths live there. The daemon's engine session is deliberately
-    // non-persisted but carries the session's directory, so local refinement runs.
-    if options.rollback_id.is_none()
-        && requested_scope == HarnessScope::Local
-        && !session.has_session_dir()
-    {
-        anyhow::bail!(
-            "Local harness refinement requires a session directory; use global refinement instead."
-        );
-    }
-    // Planning state: global, or merged global+local for local refinements.
-    let global_state = load_harness_state(global_harness_dir, HarnessScope::Global);
-    let planning_state = if requested_scope == HarnessScope::Global {
-        global_state.clone()
-    } else {
-        let local_state = load_harness_state(&local_harness_dir, HarnessScope::Local);
-        merge_harness_states(&global_state, Some(&local_state))
-    };
-    let global = load_global_refinement_history(global_harness_dir);
-    let history = crate::refinement::merge_refinement_history(&global, refinement_history);
-    // Baseline captured before the (slow) LLM pass, so concurrent kernel
-    // writes are rejected instead of clobbered.
-    let baseline_scope = options
-        .rollback_id
-        .as_ref()
-        .and_then(|id| history.iter().find(|item| &item.id == id))
-        .and_then(crate::refinement::infer_refinement_result_scope)
-        .unwrap_or(requested_scope);
-    let baseline_dir = match baseline_scope {
-        HarnessScope::Global => global_harness_dir.to_path_buf(),
-        HarnessScope::Local => local_harness_dir.clone(),
-    };
-    let baseline_state = load_harness_state(&baseline_dir, baseline_scope);
-
-    let mut plan = plan_refinement(
-        messages,
-        &planning_state,
-        &history,
+    let planned = plan_session_refinement(
+        session,
+        transcript,
+        global_harness_dir,
         model,
-        &core_options,
+        options,
         refine_call,
+        agent_dir,
     )
     .await?;
-    plan = strip_display_prefixes(plan);
+    apply_session_refinement(session, planned, global_harness_dir, source, agent_dir).await
+}
 
-    let target_scope = plan.rollback_scope.unwrap_or(requested_scope);
-    let target_dir = match target_scope {
-        HarnessScope::Global => global_harness_dir.to_path_buf(),
-        HarnessScope::Local => local_harness_dir.clone(),
-    };
+pub(super) struct PlannedSessionRefinement {
+    plan: RefinementPlan,
+    core_options: CoreRefineOptions,
+    target_scope: HarnessScope,
+    target_dir: PathBuf,
+    baseline_state: crate::refinement::HarnessState,
+    settings: Option<crate::settings::SettingsManager>,
+}
+
+pub(super) fn plan_session_refinement<'a>(
+    session: &SessionManager,
+    transcript: RefinementTranscript<'a>,
+    global_harness_dir: &'a Path,
+    model: &'a pa_types::ai::Model,
+    options: &'a RefineOptions,
+    refine_call: crate::refinement::executor::RefinerFn,
+    agent_dir: Option<&'a Path>,
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = anyhow::Result<PlannedSessionRefinement>> + Send + 'a>,
+> {
+    let cwd = session.get_cwd().to_path_buf();
+    let local_harness_dir = local_harness_state_dir(session);
+    let has_session_dir = session.has_session_dir();
+    Box::pin(async move {
+        let settings = match agent_dir {
+            Some(dir) => {
+                let dir = dir.to_path_buf();
+                Some(
+                    tokio::task::spawn_blocking(move || {
+                        let settings = crate::settings::SettingsManager::create(&cwd, &dir);
+                        anyhow::ensure!(
+                            super::refinement_gate::enabled(Some(&settings)),
+                            "Harness refinements are disabled in /settings"
+                        );
+                        Ok::<_, anyhow::Error>(settings)
+                    })
+                    .await??,
+                )
+            }
+            None => None,
+        };
+        let RefinementTranscript {
+            messages,
+            refinement_history,
+        } = transcript;
+        let core_options = CoreRefineOptions {
+            global: options.global,
+            instructions: options.instructions.clone(),
+            rollback_id: options.rollback_id.clone(),
+        };
+        let requested_scope = if options.global {
+            HarnessScope::Global
+        } else {
+            HarnessScope::Local
+        };
+        // A local refinement needs the session's own directory: its harness state
+        // and artifact paths live there. The daemon's engine session is deliberately
+        // non-persisted but carries the session's directory, so local refinement runs.
+        if options.rollback_id.is_none()
+            && requested_scope == HarnessScope::Local
+            && !has_session_dir
+        {
+            anyhow::bail!(
+            "Local harness refinement requires a session directory; use global refinement instead."
+        );
+        }
+        // Planning state: global, or merged global+local for local refinements.
+        let global_state = load_harness_state(global_harness_dir, HarnessScope::Global);
+        let planning_state = if requested_scope == HarnessScope::Global {
+            global_state.clone()
+        } else {
+            let local_state = load_harness_state(&local_harness_dir, HarnessScope::Local);
+            merge_harness_states(&global_state, Some(&local_state))
+        };
+        let global = load_global_refinement_history(global_harness_dir);
+        let history = crate::refinement::merge_refinement_history(&global, refinement_history);
+        // Baseline captured before the (slow) LLM pass, so concurrent kernel
+        // writes are rejected instead of clobbered.
+        let baseline_scope = options
+            .rollback_id
+            .as_ref()
+            .and_then(|id| history.iter().find(|item| &item.id == id))
+            .and_then(crate::refinement::infer_refinement_result_scope)
+            .unwrap_or(requested_scope);
+        let baseline_dir = match baseline_scope {
+            HarnessScope::Global => global_harness_dir.to_path_buf(),
+            HarnessScope::Local => local_harness_dir.clone(),
+        };
+        let baseline_state = load_harness_state(&baseline_dir, baseline_scope);
+
+        let mut plan = plan_refinement(
+            messages,
+            &planning_state,
+            &history,
+            model,
+            &core_options,
+            refine_call,
+        )
+        .await?;
+        plan = strip_display_prefixes(plan);
+
+        let target_scope = plan.rollback_scope.unwrap_or(requested_scope);
+        let target_dir = match target_scope {
+            HarnessScope::Global => global_harness_dir.to_path_buf(),
+            HarnessScope::Local => local_harness_dir.clone(),
+        };
+        Ok(PlannedSessionRefinement {
+            plan,
+            core_options,
+            target_scope,
+            target_dir,
+            baseline_state,
+            settings,
+        })
+    })
+}
+
+pub(super) async fn apply_session_refinement(
+    session: &mut SessionManager,
+    planned: PlannedSessionRefinement,
+    global_harness_dir: &Path,
+    source: RefinementSource,
+    agent_dir: Option<&Path>,
+) -> anyhow::Result<(RefinementResult, Vec<String>)> {
+    let PlannedSessionRefinement {
+        plan,
+        core_options,
+        target_scope,
+        target_dir,
+        baseline_state,
+        settings,
+    } = planned;
     // The factory opt-in resolves HERE — immediately before the apply,
     // after the planning request — so a setting that changed during the
     // request (`/factory off` mid-plan) decides, not a snapshot captured
     // before it. The read rides `spawn_blocking` so the settings I/O
-    // never blocks the async runtime worker (the refine arm holds the
-    // session lock across this whole call). A session without a wired
+    // never blocks the async runtime worker. A session without a wired
     // agent dir keeps the fail-closed disabled default, and a panicked
     // read task reads as disabled — the same fail-closed leniency as
     // `factory_enabled` itself.
@@ -506,10 +567,11 @@ impl AgentSession {
             }
             None => (api_key, None),
         };
-        Ok(default_refiner_call(
+        Ok(default_refiner_call_with_clm(
             api_key,
             headers,
             self.session_id().await,
+            self.clm.clone(),
         ))
     }
 
@@ -545,12 +607,16 @@ impl AgentSession {
                 load_global_refinement_history(global_harness_dir),
             )
         };
-        // Refinement deliberately reviews historical messages; await the
-        // transcript parts after releasing the session mutex.
         let crate::session::manager::RefineTranscriptParts {
-            messages,
             refinement_history: session_history,
+            ..
         } = parts.await?;
+        let messages = self
+            .session_handle()
+            .lock()
+            .await
+            .active_context_checked()?
+            .messages;
         let history = crate::refinement::merge_refinement_history(&history, &session_history);
         let review = review_auto_refine(
             &messages,
@@ -642,6 +708,15 @@ pub fn default_refiner_call(
     headers: Option<std::collections::BTreeMap<String, String>>,
     session_id: String,
 ) -> crate::refinement::executor::RefinerFn {
+    default_refiner_call_with_clm(api_key, headers, session_id, None)
+}
+
+fn default_refiner_call_with_clm(
+    api_key: Option<String>,
+    headers: Option<std::collections::BTreeMap<String, String>>,
+    session_id: String,
+    clm: Option<std::sync::Arc<super::clm::ClmRuntime>>,
+) -> crate::refinement::executor::RefinerFn {
     Box::new(move |model, system_prompt, prompt| {
         Box::pin(async move {
             let context = pa_types::ai::Context {
@@ -665,7 +740,15 @@ pub fn default_refiner_call(
                     ..Default::default()
                 });
             stream_options.reasoning = pa_types::ai::minimum_reasoning(&model);
-            Ok(pa_ai::complete_simple(&model, &context, Some(stream_options)).await?)
+            let on_observed_response = match clm {
+                Some(runtime) => Some(runtime.on_observed_response(&model, &context).await?),
+                None => None,
+            };
+            let assistant = pa_ai::complete_simple(&model, &context, Some(stream_options)).await?;
+            if let Some(observed) = on_observed_response {
+                observed(assistant.clone()).await?;
+            }
+            Ok(assistant)
         })
     })
 }

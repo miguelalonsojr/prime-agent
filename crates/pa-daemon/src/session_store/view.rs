@@ -236,56 +236,70 @@ impl SessionFile {
     }
 
     pub(crate) fn restored_settings(&self) -> pa_core::session::SessionContext {
-        if let Some(window) = &self.window {
-            let mut context = pa_core::session::SessionContext {
-                messages: Vec::new(),
-                thinking_level: window.thinking_level.clone(),
-                service_tier: window.service_tier,
-                model: window.model.clone(),
-            };
-            for entry in &self.entries[window.loaded_entries..] {
-                match entry.type_.as_str() {
-                    "model_change" => {
+        if self.window.is_none()
+            && self.clm_error.is_none()
+            && !self.entries.iter().any(|entry| {
+                matches!(
+                    entry.type_.as_str(),
+                    "clm_on" | "clm_revision" | "clm_off_boundary"
+                )
+            })
+        {
+            let entries = self.branch_file_entries();
+            return pa_core::session::build_session_context(&entries, self.leaf_id());
+        }
+        let mut context = pa_core::session::SessionContext {
+            messages: Vec::new(),
+            thinking_level: self
+                .window
+                .as_ref()
+                .map_or_else(|| "off".to_owned(), |window| window.thinking_level.clone()),
+            service_tier: self.window.as_ref().and_then(|window| window.service_tier),
+            model: self.window.as_ref().and_then(|window| window.model.clone()),
+        };
+        let entries = match &self.window {
+            Some(window) => self.entries[window.loaded_entries..]
+                .iter()
+                .collect::<Vec<_>>(),
+            None => self.branch(),
+        };
+        for entry in entries {
+            match entry.type_.as_str() {
+                "model_change" => {
+                    if let (Some(provider), Some(model)) = (
+                        entry.fields.get("provider").and_then(Value::as_str),
+                        entry.fields.get("modelId").and_then(Value::as_str),
+                    ) {
+                        context.model = Some((provider.to_owned(), model.to_owned()));
+                    }
+                }
+                "message" => {
+                    if let Some(message) = entry.fields.get("message").filter(|message| {
+                        message.get("role").and_then(Value::as_str) == Some("assistant")
+                    }) {
                         if let (Some(provider), Some(model)) = (
-                            entry.fields.get("provider").and_then(Value::as_str),
-                            entry.fields.get("modelId").and_then(Value::as_str),
+                            message.get("provider").and_then(Value::as_str),
+                            message.get("model").and_then(Value::as_str),
                         ) {
                             context.model = Some((provider.to_owned(), model.to_owned()));
                         }
                     }
-                    "message" => {
-                        if let Some(message) = entry.fields.get("message").filter(|message| {
-                            message.get("role").and_then(Value::as_str) == Some("assistant")
-                        }) {
-                            if let (Some(provider), Some(model)) = (
-                                message.get("provider").and_then(Value::as_str),
-                                message.get("model").and_then(Value::as_str),
-                            ) {
-                                context.model = Some((provider.to_owned(), model.to_owned()));
-                            }
-                        }
-                    }
-                    "thinking_level_change" => {
-                        if let Some(level) =
-                            entry.fields.get("thinkingLevel").and_then(Value::as_str)
-                        {
-                            level.clone_into(&mut context.thinking_level);
-                        }
-                    }
-                    "service_tier_change" => {
-                        context.service_tier = entry
-                            .fields
-                            .get("serviceTier")
-                            .and_then(|tier| serde_json::from_value(tier.clone()).ok());
-                    }
-                    _ => {}
                 }
+                "thinking_level_change" => {
+                    if let Some(level) = entry.fields.get("thinkingLevel").and_then(Value::as_str) {
+                        level.clone_into(&mut context.thinking_level);
+                    }
+                }
+                "service_tier_change" => {
+                    context.service_tier = entry
+                        .fields
+                        .get("serviceTier")
+                        .and_then(|tier| serde_json::from_value(tier.clone()).ok());
+                }
+                _ => {}
             }
-            context
-        } else {
-            let entries = self.branch_file_entries();
-            pa_core::session::build_session_context(&entries, self.leaf_id())
         }
+        context
     }
 
     pub(crate) fn has_thinking_level(&self) -> bool {
@@ -352,6 +366,7 @@ impl SessionFile {
     /// The branch's conversation, compacted view first: a `compactionSummary`
     /// message, the retained messages from `firstKeptEntryId`, then everything
     /// appended after; without a compaction, the plain message list.
+    /// This is the audit/display transcript. Model callers use `model_context_checked`.
     #[must_use]
     pub fn messages(&self) -> Vec<Value> {
         let mut messages = Vec::new();

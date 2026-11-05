@@ -54,7 +54,9 @@ impl Inner {
                     let _ = tx.send(Ok(protocol));
                 }
             }
-            Event::HostRequest { id, data } => self.start_host_request(&id, data),
+            Event::HostRequest { id, cell_id, data } => {
+                self.start_host_request(&id, cell_id.as_deref(), data);
+            }
             Event::Stdout { id, text } => {
                 self.route_stream(id.as_deref(), StreamName::Stdout, &text);
             }

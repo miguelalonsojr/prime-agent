@@ -422,6 +422,8 @@ impl TurnRunner {
         let abort_gate_armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let abort_gate_armed_seen = Arc::clone(&abort_gate_armed);
         let turn = tokio::task::spawn_blocking(move || {
+            // One owned delivery action spans co-delivery, continuation and retries.
+            let clm_action_id = uuid::Uuid::new_v4().to_string();
             // The engine's own terminal `turn_end` frame keeps the
             // trailing `Done` fallback silent.
             let mut engine_turn_ended = false;
@@ -436,6 +438,16 @@ impl TurnRunner {
             // (operator ruling 2026-09-23).
             let mut last_retry_error: Option<String> = None;
             let mut emit = |mut event: EngineEvent| -> bool {
+                let acknowledgement = if let EngineEvent::ClmMessageAck {
+                    event: inner,
+                    acknowledged,
+                } = event
+                {
+                    event = *inner;
+                    Some(acknowledged)
+                } else {
+                    None
+                };
                 // A cancelled turn stops consuming its own events, except the frames
                 // TS still broadcasts for an interrupted turn: aborted row/tool settle
                 // frames and the trailing `Done` (a dropped Done hung `prompt_and_wait`
@@ -499,7 +511,12 @@ impl TurnRunner {
                 }
                 // Durable model cleanup is independent of visual abort-row
                 // suppression and emits no client-facing frame.
-                if core.abort_requested && !matches!(&event, EngineEvent::ModelChange(_)) {
+                if core.abort_requested
+                    && !matches!(
+                        &event,
+                        EngineEvent::ModelChange(_) | EngineEvent::ClmUsage(_)
+                    )
+                {
                     // The sighting arms the fallback's silence only when
                     // load-bearing: a sighting on a run that completed on its own
                     // cancels nothing.
@@ -587,6 +604,18 @@ impl TurnRunner {
                     }
                 }
                 match &event {
+                    EngineEvent::ClmUsage(receipt) => {
+                        let result = core
+                            .store
+                            .as_mut()
+                            .ok_or_else(|| anyhow::anyhow!("CLM owner missing"))
+                            .and_then(|store| store.persist_entry("custom", receipt.clone()));
+                        if let Err(error) = result {
+                            core.clm_persistence_error =
+                                Some(format!("CLM usage persistence uncertain: {error:#}"));
+                            return false;
+                        }
+                    }
                     EngineEvent::ModelChange(change) => {
                         if let Some(Err(error)) = core.store.as_mut().map(|store| {
                             store.persist_entry(
@@ -605,7 +634,31 @@ impl TurnRunner {
                     | EngineEvent::AssistantMessage(message)
                     | EngineEvent::ToolResultMessage(message) => {
                         if let Some(store) = core.store.as_mut() {
-                            let _ = store.persist_entry("message", json!({ "message": message }));
+                            match store.persist_entry("message", json!({ "message": message })) {
+                                Ok(id) => {
+                                    if let Some(acknowledged) = &acknowledgement {
+                                        let _ = acknowledged.set(pa_types::clm::ClmBlock {
+                                            id: id.clone(),
+                                            message: message.clone(),
+                                        });
+                                    }
+                                    if matches!(&event, EngineEvent::UserMessage(_)) {
+                                        core.clm_protected
+                                            .entry(clm_action_id.clone())
+                                            .or_default()
+                                            .push(pa_types::clm::ClmBlock {
+                                                id,
+                                                message: message.clone(),
+                                            });
+                                    }
+                                }
+                                Err(error) => {
+                                    core.clm_persistence_error = Some(format!(
+                                        "CLM delivery persistence uncertain: {error:#}"
+                                    ));
+                                    return false;
+                                }
+                            }
                         }
                     }
                     // The in-flight tool-call set, updated under the same core lock
@@ -621,16 +674,59 @@ impl TurnRunner {
                         core.running_tool_calls.remove(tool_call_id);
                     }
                     EngineEvent::CustomMessage(message) => {
-                        if let Some(store) = core.store.as_mut() {
-                            let _ = store.persist_entry(
-                                "custom_message",
-                                json!({
-                                    "customType": message.get("customType").cloned().unwrap_or(Value::Null),
-                                    "content": message.get("content").cloned().unwrap_or(Value::Null),
-                                    "display": message.get("display").cloned().unwrap_or(Value::Bool(true)),
-                                    "details": message.get("details").cloned().unwrap_or(Value::Null),
-                                }),
+                        let persisted = (|| -> anyhow::Result<Option<pa_types::clm::ClmBlock>> {
+                            let Some(store) = core.store.as_mut() else {
+                                anyhow::ensure!(acknowledgement.is_none(), "CLM owner missing");
+                                return Ok(None);
+                            };
+                            let id = store.persist_entry("custom_message",json!({
+                                "customType":message.get("customType").cloned().unwrap_or(Value::Null),
+                                "content":message.get("content").cloned().unwrap_or(Value::Null),
+                                "display":message.get("display").cloned().unwrap_or(Value::Bool(true)),
+                                "details":message.get("details").cloned().unwrap_or(Value::Null),
+                            }))?;
+                            let row = store.entries().last().ok_or_else(|| {
+                                anyhow::anyhow!("acknowledged custom row missing")
+                            })?;
+                            anyhow::ensure!(row.id == id, "acknowledged custom identity changed");
+                            let entry: pa_types::session::FileEntry =
+                                serde_json::from_value(serde_json::to_value(row)?)?;
+                            anyhow::ensure!(
+                                matches!(entry, pa_types::session::FileEntry::CustomMessage { .. }),
+                                "acknowledged row is not custom"
                             );
+                            // Convert this one acknowledged row through the canonical owner format.
+                            let message = pa_core::session::clm::build_session_context_checked(
+                                &[entry],
+                                Some(&id),
+                            )?
+                            .messages
+                            .into_iter()
+                            .next()
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("acknowledged custom message missing")
+                            })?;
+                            let message = serde_json::to_value(message)?;
+                            Ok(Some(pa_types::clm::ClmBlock { id, message }))
+                        })();
+                        match persisted {
+                            Ok(Some(block)) => {
+                                if let Some(acknowledged) = &acknowledgement {
+                                    let _ = acknowledged.set(block.clone());
+                                }
+                                if !emitting_prefix_rows.get() {
+                                    core.clm_protected
+                                        .entry(clm_action_id.clone())
+                                        .or_default()
+                                        .push(block);
+                                }
+                            }
+                            Ok(None) => (),
+                            Err(error) => {
+                                core.clm_persistence_error =
+                                    Some(format!("CLM custom persistence uncertain: {error:#}"));
+                                return false;
+                            }
                         }
                     }
                     EngineEvent::Compaction { entry, .. } => {
@@ -873,7 +969,9 @@ impl TurnRunner {
                         "type": "turn_end",
                         "error": ABORTED_TURN_SETTLE_ERROR,
                     })],
-                    EngineEvent::ModelChange(_)
+                    EngineEvent::ClmMessageAck { .. }
+                    | EngineEvent::ClmUsage(_)
+                    | EngineEvent::ModelChange(_)
                     | EngineEvent::Done(Ok(()) | Err(_))
                     | EngineEvent::DoneAborted => Vec::new(),
                     EngineEvent::AutoRetryStart {
@@ -1067,6 +1165,7 @@ impl TurnRunner {
             }
             core.busy = false;
             core.active_action = None;
+            core.clm_protected.clear();
             core.running_admission_ids.clear();
             more_queued
         };

@@ -9,7 +9,12 @@ use super::{
 impl Inner {
     /// Dispatch one typed request from kernel code to the registered handler
     /// and reply over the protocol. Unhandled requests answer with an error.
-    pub(crate) fn start_host_request(self: &Arc<Self>, request_id: &str, data: Value) {
+    pub(crate) fn start_host_request(
+        self: &Arc<Self>,
+        request_id: &str,
+        cell_id: Option<&str>,
+        data: Value,
+    ) {
         {
             let mut g = lock(&self.guarded);
             let (seen, order) = &mut g.handled_host_request_ids;
@@ -26,10 +31,20 @@ impl Inner {
                 }
             }
         }
+        // Verify before dispatch. Detached requests must not borrow the next cell's identity.
+        let (verified_tool_call_id, verified_tool_execution_identity) = self
+            .verified_tool_origin(cell_id)
+            .map_or((None, None), |(id, identity)| (Some(id), identity));
         let inner = Arc::clone(self);
         let request_id = request_id.to_string();
         let task = tokio::spawn(async move {
-            let result = inner.handle_host_request(&data).await;
+            let result = inner
+                .handle_host_request(
+                    &data,
+                    verified_tool_call_id,
+                    verified_tool_execution_identity,
+                )
+                .await;
             let reply = match result {
                 Ok(result) => json!({ "status": "ok", "result": result }),
                 Err(error) => {
@@ -52,7 +67,55 @@ impl Inner {
         g.host_inflight.push(task);
     }
 
-    async fn handle_host_request(&self, data: &Value) -> anyhow::Result<Value> {
+    #[cfg(test)]
+    pub(crate) fn verified_tool_call_id(&self, cell_id: Option<&str>) -> Option<String> {
+        self.verified_tool_origin(cell_id).map(|(id, _)| id)
+    }
+
+    fn verified_tool_origin(
+        &self,
+        cell_id: Option<&str>,
+    ) -> Option<(String, Option<crate::kernel::shared::ToolExecutionIdentity>)> {
+        let execution = lock(&self.guarded).active_execution.clone()?;
+        self.verified_execution_origin(&execution, cell_id)
+    }
+
+    pub(super) fn verified_execution_origin(
+        &self,
+        execution: &Arc<super::ActiveExecution>,
+        cell_id: Option<&str>,
+    ) -> Option<(String, Option<crate::kernel::shared::ToolExecutionIdentity>)> {
+        let buffers = lock(&execution.buffers);
+        let guarded = lock(&self.guarded);
+        if !guarded
+            .active_execution
+            .as_ref()
+            .is_some_and(|active| Arc::ptr_eq(active, execution))
+            || cell_id != Some(execution.request_id.as_str())
+            || execution.opts.internal
+            || !execution.namespace_code
+            || buffers.settled
+            || buffers.status != super::ExecuteStatus::Ok
+            || execution
+                .opts
+                .signal
+                .as_ref()
+                .is_some_and(super::super::cancellation::AbortSignal::is_aborted)
+        {
+            return None;
+        }
+        Some((
+            execution.opts.tool_call_id.clone()?,
+            execution.opts.tool_execution_identity.clone(),
+        ))
+    }
+
+    async fn handle_host_request(
+        &self,
+        data: &Value,
+        verified_tool_call_id: Option<String>,
+        verified_tool_execution_identity: Option<crate::kernel::shared::ToolExecutionIdentity>,
+    ) -> anyhow::Result<Value> {
         let Some(obj) = data.as_object() else {
             return Err(anyhow!("host request payload must be an object"));
         };
@@ -69,7 +132,12 @@ impl Inner {
                 anyhow!("host request type \"{request_type}\" is not available in this session")
             })?
             .clone();
-        handler(HostRequestPayload { data: data.clone() }).await
+        handler(HostRequestPayload {
+            data: data.clone(),
+            verified_tool_call_id,
+            verified_tool_execution_identity,
+        })
+        .await
     }
 
     /// Wait (bounded) for the in-flight host request tasks to settle.

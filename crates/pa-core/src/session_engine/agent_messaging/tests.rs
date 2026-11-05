@@ -271,7 +271,11 @@ impl AgentMessageController for RecordingMessageController {
 fn send_request(send: &crate::kernel::shared::HostHandlerFn, data: Value) -> anyhow::Result<Value> {
     // The handler futures here are plain (no tokio IO), so driving
     // them on the test executor is safe.
-    futures::executor::block_on(send(crate::kernel::shared::HostRequestPayload { data }))
+    futures::executor::block_on(send(crate::kernel::shared::HostRequestPayload {
+        data,
+        verified_tool_call_id: None,
+        verified_tool_execution_identity: None,
+    }))
 }
 
 #[tokio::test]

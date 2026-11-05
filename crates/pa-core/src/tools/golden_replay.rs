@@ -218,10 +218,12 @@ async fn golden_ipython_group_matches_ts() {
                 None
             },
             on_late_sent_agent_message: None,
+            on_public_result: None,
         };
         let result = ipython::execute_ipython(
             &options,
             case["code"].as_str().expect("code"),
+            None,
             None,
             None,
             None,
@@ -284,6 +286,7 @@ fn golden_schema_group_matches_ts() {
                 "/tmp",
                 IpythonToolOptions {
                     on_late_sent_agent_message: None,
+                    on_public_result: None,
                     provisioner: Arc::new(MockProvisioner {
                         kernel: Arc::new(MockKernel {
                             executions: Mutex::new(Vec::new()),

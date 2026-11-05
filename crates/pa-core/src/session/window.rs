@@ -273,6 +273,12 @@ impl WindowedSessionStore {
             let Ok(meta) = serde_json::from_str::<Envelope>(text) else {
                 return Ok(None);
             };
+            if matches!(
+                meta.kind.as_str(),
+                "clm_on" | "clm_revision" | "clm_off_boundary"
+            ) {
+                return Ok(None);
+            }
             if meta.kind == "session" {
                 if reader.position != 0
                     || reader
@@ -868,7 +874,8 @@ impl WindowedSessionStore {
         }
         let path = self.path.clone();
         let entries = tokio::task::spawn_blocking(move || {
-            std::fs::read_to_string(path).map(|text| super::parse_session_entries(&text))
+            let bytes = std::fs::read(path)?;
+            Ok::<_, anyhow::Error>(super::clm::parse_session_entries_checked(&bytes)?)
         })
         .await??;
         self.entries = entries;

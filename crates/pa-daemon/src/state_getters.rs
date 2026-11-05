@@ -189,13 +189,19 @@ impl Worker {
                 None,
             );
         };
-        let entries = store.branch_file_entries();
-        let context = pa_core::session::build_session_context(&entries, store.leaf_id());
-        let messages: Vec<Value> = context
-            .messages
-            .iter()
-            .map(|message| serde_json::to_value(message).unwrap_or(Value::Null))
-            .collect();
+        let checked = (|| -> anyhow::Result<_> {
+            let messages = store.model_context_checked()?;
+            let entries = store.branch_file_entries();
+            let context =
+                pa_core::session::clm::build_session_context_checked(&entries, store.leaf_id())?;
+            Ok((messages, context))
+        })();
+        let (messages, context) = match checked {
+            Ok(context) => context,
+            Err(error) => {
+                return response_failure(None, "get_session_context", &error.to_string(), None)
+            }
+        };
         response_success(
             None,
             "get_session_context",

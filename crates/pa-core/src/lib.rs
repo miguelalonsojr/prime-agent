@@ -46,6 +46,7 @@ pub use tools::ipython::{
 pub mod agent_traces;
 pub mod auth;
 pub mod autonomous;
+pub mod clm;
 pub mod cron;
 pub mod export_html;
 pub mod goals;

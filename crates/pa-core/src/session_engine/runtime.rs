@@ -206,7 +206,11 @@ mod tests {
     }
 
     fn payload(data: Value) -> HostRequestPayload {
-        HostRequestPayload { data }
+        HostRequestPayload {
+            data,
+            verified_tool_call_id: None,
+            verified_tool_execution_identity: None,
+        }
     }
 
     /// The purge seam fires only for `goal.complete`, never on the way in.

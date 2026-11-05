@@ -326,6 +326,8 @@ async fn send_agent_message(
 ) -> anyhow::Result<Value> {
     let send = handlers.get("agent_message.send").expect("send handler");
     send(HostRequestPayload {
+        verified_tool_call_id: None,
+        verified_tool_execution_identity: None,
         data: json!({
             "message": "hello there",
             "receiver_role": "child",
@@ -423,6 +425,7 @@ async fn parent_child_agent_message_round_trip_end_to_end() {
             model: None,
             thinking: None,
             spawned_by_request_id: None,
+            clm_admission: None,
         })
         .await
         .expect("spawn the child");
@@ -752,6 +755,7 @@ async fn family_edges_never_cross_families_end_to_end() {
                 model: None,
                 thinking: None,
                 spawned_by_request_id: None,
+                clm_admission: None,
             })
             .await
             .expect("spawn the child");
@@ -892,6 +896,7 @@ async fn family_edges_never_cross_families_end_to_end() {
             model: None,
             thinking: None,
             spawned_by_request_id: None,
+            clm_admission: None,
         })
         .await
         .expect("spawn the grandchild");
@@ -1210,6 +1215,7 @@ async fn parent_renames_a_child_end_to_end() {
             model: None,
             thinking: None,
             spawned_by_request_id: None,
+            clm_admission: None,
         })
         .await
         .expect("spawn the child");
@@ -1262,6 +1268,8 @@ async fn parent_renames_a_child_end_to_end() {
         .expect("rlm.rename handler registered")
         .clone();
     let reply = rename(HostRequestPayload {
+        verified_tool_call_id: None,
+        verified_tool_execution_identity: None,
         data: json!({
             "name": "  bench-runner ",
             "session_id": handle.rlm_child_id,

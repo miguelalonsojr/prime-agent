@@ -569,6 +569,8 @@ mod tests {
         McpManager::register_host_handlers(&manager, &mut handlers);
         let begin_login = handlers.get("mcp.begin_login").expect("wired").clone();
         begin_login(HostRequestPayload {
+            verified_tool_call_id: None,
+            verified_tool_execution_identity: None,
             data: json!({ "server": "fixture" }),
         })
         .await
@@ -663,6 +665,8 @@ mod tests {
         McpManager::register_host_handlers(&manager, &mut handlers);
         let begin_login = handlers.get("mcp.begin_login").expect("wired").clone();
         begin_login(HostRequestPayload {
+            verified_tool_call_id: None,
+            verified_tool_execution_identity: None,
             data: json!({ "server": "linear" }),
         })
         .await
@@ -694,16 +698,22 @@ mod tests {
         McpManager::register_host_handlers(&manager, &mut handlers);
         let begin_login = handlers.get("mcp.begin_login").expect("wired").clone();
         let error = begin_login(HostRequestPayload {
+            verified_tool_call_id: None,
+            verified_tool_execution_identity: None,
             data: json!({ "server": "nope" }),
         })
         .await
         .unwrap_err()
         .to_string();
         assert_eq!(error, "Unknown MCP integration: nope");
-        let error = begin_login(HostRequestPayload { data: json!({}) })
-            .await
-            .unwrap_err()
-            .to_string();
+        let error = begin_login(HostRequestPayload {
+            data: json!({}),
+            verified_tool_call_id: None,
+            verified_tool_execution_identity: None,
+        })
+        .await
+        .unwrap_err()
+        .to_string();
         assert_eq!(error, "mcp.begin_login requires a server");
     }
 
@@ -755,6 +765,8 @@ mod tests {
         McpManager::register_host_handlers(&manager, &mut handlers);
         let refresh = handlers.get("mcp.refresh").expect("wired").clone();
         let error = refresh(HostRequestPayload {
+            verified_tool_call_id: None,
+            verified_tool_execution_identity: None,
             data: json!({ "server": "fixture" }),
         })
         .await
@@ -783,6 +795,8 @@ mod tests {
         );
 
         refresh(HostRequestPayload {
+            verified_tool_call_id: None,
+            verified_tool_execution_identity: None,
             data: json!({ "server": "fixture" }),
         })
         .await
@@ -811,6 +825,8 @@ mod tests {
         McpManager::register_host_handlers(&manager, &mut handlers);
         let refresh = handlers.get("mcp.refresh").expect("wired").clone();
         let error = refresh(HostRequestPayload {
+            verified_tool_call_id: None,
+            verified_tool_execution_identity: None,
             data: json!({ "server": "session-tool" }),
         })
         .await

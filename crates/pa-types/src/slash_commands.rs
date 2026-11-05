@@ -55,6 +55,7 @@ const CANONICAL_BUILTIN_SLASH_COMMANDS: &[BuiltinSlashCommand] = &[
     BuiltinSlashCommand { name: "logs", description: "Show where daemon and client logs are saved", execution: SlashCommandExecution::Client, argument_hint: None, aliases: &[], takes_argument: false },
     BuiltinSlashCommand { name: "traces", description: "Preview, upload, or configure Prime Agent traces", execution: SlashCommandExecution::Client, argument_hint: Some("[status|on|off|preview|upload|upload-current|upload-all|login]"), aliases: &[], takes_argument: false },
     BuiltinSlashCommand { name: "telemetry", description: "Show or change usage telemetry (pseudonymous metrics, never prompts or code)", execution: SlashCommandExecution::Client, argument_hint: Some("[status|on|off]"), aliases: &[], takes_argument: true },
+    BuiltinSlashCommand { name: "clm", description: "Inspect or control accepted model context", execution: SlashCommandExecution::Client, argument_hint: Some("on|off|status|view|restore <epoch:revision>"), aliases: &[], takes_argument: true },
     BuiltinSlashCommand { name: "context", description: "Show token, cost, and context usage for agent and sub-agents", execution: SlashCommandExecution::Client, argument_hint: None, aliases: &["usage"], takes_argument: false },
     BuiltinSlashCommand { name: "changelog", description: "Show changelog entries", execution: SlashCommandExecution::Client, argument_hint: None, aliases: &[], takes_argument: false },
     BuiltinSlashCommand { name: "update", description: "Update to the latest Rust build (uninstalls the TypeScript version; sessions preserved)", execution: SlashCommandExecution::Client, argument_hint: None, aliases: &[], takes_argument: false },
@@ -248,6 +249,18 @@ fn slash_command_edit_distance(left: &str, right: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clm_is_a_local_command_with_argument_completion() {
+        let registry = SlashCommandRegistry::builtin();
+        let parsed = registry.parse("/clm restore epoch:0").expect("CLM builtin");
+        assert_eq!(parsed.name, "clm");
+        assert_eq!(parsed.args, "restore epoch:0");
+        let command = registry.get("clm").unwrap();
+        assert_eq!(command.execution, SlashCommandExecution::Client);
+        assert!(command.takes_argument);
+        assert!(command.argument_hint.unwrap().contains("restore"));
+    }
 
     #[test]
     fn registry_resolves_aliases() {

@@ -1002,3 +1002,72 @@ fn append_cached_bounds_an_unterminated_tail() {
         "the header and the appended row parse on their own lines; the torn row alone stays skipped:\n{text}"
     );
 }
+
+#[test]
+fn clm_boundary_hidden_by_matching_old_cache_requires_full_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("old-cache.jsonl");
+    let ordinary = fixture();
+    std::fs::write(&path, &ordinary).unwrap();
+    let window = WindowedSessionStore::open(&path).unwrap().unwrap();
+    let mut snapshot = window.snapshot;
+    let insertion=json!({"type":"clm_on","id":"on","parentId":"settings","epochId":"e","revision":0,"snapshot":{"blocks":[]},"auditWatermark":null}).to_string()+"\n";
+    let mut lines = ordinary.lines().map(str::to_owned).collect::<Vec<_>>();
+    let mut first: serde_json::Value = serde_json::from_str(&lines[2]).unwrap();
+    first["parentId"] = json!("on");
+    lines[2] = first.to_string();
+    lines.insert(2, insertion.trim_end().to_owned());
+    let clm = lines.join("\n") + "\n";
+    // The retained suffix starts at the same row, but the discarded prefix grew.
+    snapshot.start += (clm.len() - ordinary.len()) as u64;
+    std::fs::write(&path, &clm).unwrap();
+    snapshot.generation = Generation::of(&std::fs::metadata(&path).unwrap());
+    snapshot.version = 7;
+    window_cache::save(&path, &snapshot).unwrap();
+    window_cache::evict_live_snapshot(&path);
+    assert!(WindowedSessionStore::open(&path).unwrap().is_none());
+}
+
+#[tokio::test]
+async fn clm_publication_invalidates_live_window_before_next_ordinary_append() {
+    use crate::clm::{
+        journal::{ClmCommit, ClmJournalOp, ClmJournalReply},
+        ProtectedActions,
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cached.jsonl");
+    std::fs::write(&path, fixture()).unwrap();
+    let mut manager =
+        super::super::manager::SessionManager::open_windowed(dir.path(), dir.path(), &path)
+            .await
+            .unwrap();
+    manager.set_append_ownership(AppendOwnership::SessionLeaseHeld);
+    assert!(manager
+        .clm_journal(ClmJournalOp::ReadAfterEvents, ProtectedActions::new())
+        .is_err());
+    manager.ensure_full_history().await.unwrap();
+    let ClmJournalReply::View(expected) = manager
+        .clm_journal(ClmJournalOp::ReadAfterEvents, ProtectedActions::new())
+        .unwrap()
+    else {
+        panic!("view");
+    };
+    let row=serde_json::from_value(json!({"type":"clm_on","epochId":"e","revision":0,"snapshot":{"blocks":[]},"auditWatermark":"leaf"})).unwrap();
+    manager
+        .clm_journal(
+            ClmJournalOp::Commit(ClmCommit {
+                expected,
+                row,
+                allow_child_usage_suffix: false,
+            }),
+            ProtectedActions::new(),
+        )
+        .unwrap();
+    manager
+        .append_message(
+            serde_json::from_value(json!({"role":"user","content":"next","timestamp":0})).unwrap(),
+        )
+        .unwrap();
+    assert!(WindowedSessionStore::open(&path).unwrap().is_none());
+}

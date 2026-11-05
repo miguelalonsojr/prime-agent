@@ -89,6 +89,10 @@ pub fn command_plane(command_type: &str) -> DaemonCommandPlane {
         | "export_jsonl"
         | "get_rlm_max_depth_status"
         | "set_rlm_max_depth"
+        | "get_clm_status"
+        | "set_clm_mode"
+        | "restore_clm_revision"
+        | "get_clm_model_snapshot"
         | "get_session_context"
         | "get_session_tree"
         | "get_user_messages_for_forking"
@@ -143,6 +147,8 @@ const READ_ONLY_DAEMON_COMMANDS: &[&str] = &[
     "heartbeats_list",
     "update_restore_status",
     "heartbeat_get",
+    "get_clm_status",
+    "get_clm_model_snapshot",
     "get_session_context",
     "get_session_tree",
     "get_user_messages_for_forking",
@@ -248,6 +254,22 @@ mod tests {
         ] {
             assert!(is_daemon_mutating_command(mutating), "{mutating}");
         }
+    }
+
+    #[test]
+    fn clm_commands_stay_on_session_plane_and_reads_do_not_mutate() {
+        for name in [
+            "get_clm_status",
+            "set_clm_mode",
+            "restore_clm_revision",
+            "get_clm_model_snapshot",
+        ] {
+            assert!(is_session_plane_daemon_command(name), "{name}");
+        }
+        assert!(!is_daemon_mutating_command("get_clm_status"));
+        assert!(!is_daemon_mutating_command("get_clm_model_snapshot"));
+        assert!(is_daemon_mutating_command("set_clm_mode"));
+        assert!(is_daemon_mutating_command("restore_clm_revision"));
     }
 
     #[test]

@@ -120,11 +120,91 @@ pub fn prepare_compaction(
 }
 
 /// The cut computed for a session (test seam for decision verification).
-#[must_use]
-pub fn compute_cut(session: &SessionManager, keep_recent_tokens: u64) -> (CutPointResult, u64) {
-    let entries = session.retained_entries();
+///
+/// # Errors
+/// Rejects invalid accepted context or an unsafe compaction projection.
+pub fn compute_cut(
+    session: &SessionManager,
+    keep_recent_tokens: u64,
+) -> Result<(CutPointResult, u64), crate::clm::ClmError> {
+    session.active_context_checked()?;
+    let entries = model_compaction_entries(session)?;
     let start = usize::from(matches!(entries.first(), Some(FileEntry::Header { .. })));
-    let cut = find_cut_point(entries, start, entries.len(), keep_recent_tokens);
-    let tokens = context_tokens(entries, session.get_leaf_id());
-    (cut, tokens)
+    let cut = find_cut_point(&entries, start, entries.len(), keep_recent_tokens);
+    let tokens = context_tokens(session.retained_entries(), session.get_leaf_id())?;
+    Ok((cut, tokens))
+}
+
+/// Build disposable compaction input from accepted bodies, not covered audit rows.
+pub(crate) fn model_compaction_entries(
+    session: &SessionManager,
+) -> Result<Vec<FileEntry>, crate::clm::ClmError> {
+    use crate::clm::ClmError;
+    session.active_context_checked()?;
+    let audit = session.retained_entries();
+    // Audit-only receipts must not move legacy turn cuts.
+    let is_usage_receipt = |entry: &FileEntry| {
+        matches!(entry, FileEntry::Custom { payload, .. }
+            if matches!(payload.custom_type.as_str(), "clm_usage_v1" | "clm_usage_unknown_v1"))
+    };
+    if !audit.iter().any(crate::session::clm::is_clm_entry) {
+        return Ok(audit
+            .iter()
+            .filter(|entry| !is_usage_receipt(entry))
+            .cloned()
+            .collect());
+    }
+    let branch = crate::session::clm::selected_branch(audit, session.get_leaf_id())?;
+    let state = crate::clm::validate_clm_branch(&branch)?;
+    let Some(snapshot) = state.snapshot else {
+        return Ok(branch
+            .into_iter()
+            .filter(|entry| !is_usage_receipt(entry))
+            .collect());
+    };
+    if state.mode == pa_types::clm::ClmMode::On {
+        return Err(ClmError::Writer("turn CLM off before compaction".into()));
+    }
+    let accepted = branch
+        .iter()
+        .rposition(crate::session::clm::is_clm_entry)
+        .ok_or_else(|| ClmError::Journal("accepted compaction boundary missing".into()))?;
+    let watermark = match state.audit_watermark {
+        Some(id) => branch[..accepted]
+            .iter()
+            .position(|entry| entry.id() == Some(id.as_str()))
+            .ok_or_else(|| ClmError::Journal("compaction watermark missing".into()))?,
+        None => accepted,
+    };
+    let invalid = |error: serde_json::Error| ClmError::Journal(error.to_string());
+    let blocks: Vec<pa_types::clm::ClmBlock> =
+        serde_json::from_value(snapshot.as_value()["blocks"].clone()).map_err(invalid)?;
+    let mut entries = blocks
+        .into_iter()
+        .map(|block| {
+            Ok(FileEntry::Message {
+                base: pa_types::session::EntryBase {
+                    id: Some(block.id),
+                    parent_id: None,
+                    timestamp: Some(branch[accepted].timestamp().to_owned()),
+                    rest: serde_json::Map::default(),
+                },
+                message: serde_json::from_value(block.message).map_err(invalid)?,
+            })
+        })
+        .collect::<Result<Vec<_>, ClmError>>()?;
+    entries.extend(
+        branch[watermark + 1..]
+            .iter()
+            .filter(|entry| !crate::session::clm::is_clm_entry(entry) && !is_usage_receipt(entry))
+            .cloned(),
+    );
+    let mut parent = None::<String>;
+    for entry in &mut entries {
+        let mut value = serde_json::to_value(&*entry).map_err(invalid)?;
+        value["parentId"] = serde_json::to_value(&parent).map_err(invalid)?;
+        *entry = serde_json::from_value(value).map_err(invalid)?;
+        parent = entry.id().map(str::to_owned);
+    }
+    Ok(entries)
 }

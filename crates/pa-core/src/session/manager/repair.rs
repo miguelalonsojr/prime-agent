@@ -4,6 +4,13 @@
 use super::{parse_session_entries, FileEntry, Path};
 
 pub(super) fn serialize_entry(entry: &FileEntry) -> String {
+    if matches!(entry, FileEntry::Custom { payload, .. }
+        if matches!(payload.custom_type.as_str(), "clm_usage_v1" | "clm_usage_unknown_v1"))
+    {
+        return serde_json::to_value(entry)
+            .and_then(|value| serde_json::to_string(&value))
+            .unwrap_or_default();
+    }
     serde_json::to_string(entry).unwrap_or_default()
 }
 
@@ -91,6 +98,9 @@ pub fn repair_jsonl_damage(file_path: &Path) {
     };
     let file_path = target_path.as_path();
     if !tail_looks_damaged(file_path) {
+        return;
+    }
+    if std::fs::read(file_path).is_ok_and(|bytes| super::super::clm::contains_clm_records(&bytes)) {
         return;
     }
     if !first_line_is_session_header(file_path) {

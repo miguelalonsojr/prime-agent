@@ -50,6 +50,7 @@ async fn compaction_auxiliary_selector_equal_to_the_session_model_runs_on_the_se
     let outcome = execute_compaction(
         &mut session,
         CompactOptions {
+            clm: None,
             model,
             api_key: None,
             custom_instructions: None,
@@ -99,6 +100,7 @@ async fn compaction_auxiliary_selector_unusable_falls_back_to_the_session_model(
     let outcome = execute_compaction(
         &mut session,
         CompactOptions {
+            clm: None,
             model,
             api_key: None,
             custom_instructions: None,

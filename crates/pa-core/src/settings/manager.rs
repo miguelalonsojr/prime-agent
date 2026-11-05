@@ -413,6 +413,16 @@ impl SettingsManager {
             .unwrap_or(true)
     }
 
+    /// `clm.enabled`: the default for future sessions only; unset is off.
+    #[must_use]
+    pub fn get_clm_enabled(&self) -> bool {
+        self.merged
+            .clm
+            .as_ref()
+            .and_then(|clm| clm.enabled)
+            .unwrap_or(false)
+    }
+
     /// `agentTraces.enabled`: unset means OFF — trace sharing is opt-in, exactly the TS default.
     #[must_use]
     pub fn get_agent_traces_enabled(&self) -> bool {
@@ -1223,6 +1233,20 @@ mod tests {
         assert!(manager.agent_traces_choice_written());
         manager.set_agent_traces_enabled(true).unwrap();
         assert!(manager.agent_traces_choice_written());
+    }
+
+    #[test]
+    fn clm_defaults_off_and_project_settings_override_global() {
+        let mut manager = SettingsManager::in_memory(&Settings::default());
+        assert!(!manager.get_clm_enabled());
+        manager.global.clm = Some(super::super::types::ClmSettings {
+            enabled: Some(true),
+        });
+        manager.project.clm = Some(super::super::types::ClmSettings {
+            enabled: Some(false),
+        });
+        manager.merged = super::super::merge::deep_merge(&manager.global, &manager.project);
+        assert!(!manager.get_clm_enabled());
     }
 
     #[test]

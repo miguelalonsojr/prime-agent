@@ -150,6 +150,32 @@ pub async fn complete_summary_call(
     on_delta: Option<SummaryDeltaSink>,
     failure: &'static str,
 ) -> anyhow::Result<SummarySlice> {
+    complete_summary_call_observed(
+        model,
+        session_id,
+        api_key,
+        headers,
+        max_tokens,
+        request_messages,
+        on_delta,
+        failure,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn complete_summary_call_observed(
+    model: &pa_types::ai::Model,
+    session_id: &str,
+    api_key: Option<String>,
+    headers: Option<std::collections::BTreeMap<String, String>>,
+    max_tokens: u64,
+    request_messages: Vec<AgentMessage>,
+    on_delta: Option<SummaryDeltaSink>,
+    failure: &'static str,
+    clm: Option<&std::sync::Arc<super::clm::ClmRuntime>>,
+) -> anyhow::Result<SummarySlice> {
     let messages = request_messages
         .into_iter()
         .filter_map(|message| match message {
@@ -180,6 +206,14 @@ pub async fn complete_summary_call(
             ..Default::default()
         });
     stream_options.reasoning = pa_types::ai::minimum_reasoning(model);
+    let on_observed_response = match clm {
+        Some(runtime) => {
+            let mut target = model.clone();
+            target.max_tokens = max_tokens;
+            Some(runtime.on_observed_response(&target, &context).await?)
+        }
+        None => None,
+    };
     let assistant = match on_delta {
         None => pa_ai::complete_simple(model, &context, Some(stream_options)).await?,
         Some(on_delta) => {
@@ -195,6 +229,9 @@ pub async fn complete_summary_call(
             stream.result().await
         }
     };
+    if let Some(observed) = on_observed_response {
+        observed(assistant.clone()).await?;
+    }
     let stop_reason = assistant.stop_reason;
     let truncated = match stop_reason {
         pa_types::ai::StopReason::Stop => false,

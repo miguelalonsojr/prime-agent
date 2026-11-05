@@ -12,6 +12,20 @@ use crate::protocol::DaemonResponse;
 
 impl Worker {
     pub(crate) async fn dispatch(&self, command_type: &str, payload: &Value) -> DaemonResponse {
+        if matches!(
+            command_type,
+            "compact"
+                | "navigate_tree"
+                | "fork"
+                | "start_side_question"
+                | "new_session"
+                | "switch_session"
+                | "import_jsonl"
+        ) {
+            if let Err(error) = self.assert_clm_operation_allowed(command_type).await {
+                return response_failure(None, command_type, &error.to_string(), None);
+            }
+        }
         // Only operations that inspect or change historical branches need hydration.
         // Cancellation is deliberately excluded: it must reach the live turn immediately.
         let history_page = command_type == "get_messages"
@@ -66,6 +80,10 @@ impl Worker {
             pa_types::memory_release::trim_freed_heap();
         }
         match command_type {
+            "get_clm_status"
+            | "set_clm_mode"
+            | "restore_clm_revision"
+            | "get_clm_model_snapshot" => self.handle_clm(command_type, payload).await,
             "create" => self.handle_create(payload).await,
             "attach" => self.handle_attach(payload),
             "detach" => self.handle_detach(payload),

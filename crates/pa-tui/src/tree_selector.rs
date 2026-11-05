@@ -59,6 +59,7 @@ pub struct TreeSelector {
     /// The `branchSummary.skipPrompt` setting: select navigates
     /// directly with no summary instead of asking.
     skip_summarize_prompt: bool,
+    current_point_id: Option<String>,
 }
 
 impl TreeSelector {
@@ -73,20 +74,45 @@ impl TreeSelector {
         if flat.is_empty() {
             return None;
         }
+        let leaf_id = data
+            .get("leafId")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let mut current_point_id = leaf_id.clone();
+        let by_id: std::collections::HashMap<_, _> = flat
+            .iter()
+            .filter_map(|node| Some((node.entry.id()?, &node.entry)))
+            .collect();
+        let mut seen = std::collections::HashSet::new();
+        while let Some(id) = current_point_id.as_deref() {
+            if !seen.insert(id.to_owned()) {
+                current_point_id = None;
+                break;
+            }
+            let Some(pa_types::session::FileEntry::Custom { payload, base }) =
+                by_id.get(id).copied()
+            else {
+                break;
+            };
+            if !matches!(
+                payload.custom_type.as_str(),
+                "clm_usage_v1" | "clm_usage_unknown_v1"
+            ) {
+                break;
+            }
+            current_point_id.clone_from(&base.parent_id);
+        }
         let tree: Vec<TreeNode> = build_tree(flat);
         if tree.is_empty() {
             return None;
         }
-        let leaf_id = data
-            .get("leafId")
-            .and_then(Value::as_str)
-            .map(str::to_string);
         let max_visible_lines = (terminal_rows as usize / 2).max(5);
         let list = TreeList::new(&tree, leaf_id, max_visible_lines, None, initial_filter_mode);
         Some(TreeSelector {
             list,
             mode: Mode::Tree,
             skip_summarize_prompt,
+            current_point_id,
         })
     }
 
@@ -94,6 +120,11 @@ impl TreeSelector {
     #[must_use]
     pub fn current_leaf_id(&self) -> Option<&str> {
         self.list.current_leaf_id()
+    }
+
+    pub(crate) fn is_current_point(&self, target_id: &str) -> bool {
+        self.current_leaf_id() == Some(target_id)
+            || self.current_point_id.as_deref() == Some(target_id)
     }
 
     /// Re-open helper: after a cancelled branch summary, TS re-shows

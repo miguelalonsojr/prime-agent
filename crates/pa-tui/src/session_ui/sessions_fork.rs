@@ -99,12 +99,12 @@ impl SessionUi {
                 custom_instructions,
             } => {
                 // Selecting the current leaf is a no-op.
-                let leaf = view
+                let current_point = view
                     .tree_selector
                     .as_ref()
-                    .and_then(|selector| selector.current_leaf_id().map(str::to_string));
+                    .is_some_and(|selector| selector.is_current_point(&target_id));
                 view.tree_selector = None;
-                if leaf.as_deref() == Some(target_id.as_str()) {
+                if current_point {
                     self.note("Already at this point", view);
                     self.dirty = true;
                     return Ok(());
@@ -613,4 +613,41 @@ async fn describe_session_open_failure(
         // never reaches this decorator: `owner_from_refusal` passes it through).
         error_info,
     })
+}
+
+#[cfg(test)]
+mod usage_receipt_noop_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn selector(kind: &str) -> TreeSelector {
+        let data = json!({"leafId":"receipt","flatNodes":[
+            {"entry":{"type":"message","id":"assistant","parentId":null,
+                "message":{"role":"assistant","content":[{"type":"text","text":"answer"}],
+                    "api":"faux","provider":"faux","model":"faux-1",
+                    "usage":pa_types::ai::Usage::default(),"stopReason":"stop","timestamp":1}}},
+            {"entry":{"type":"custom","id":"receipt","parentId":"assistant",
+                "customType":kind,"data":{}}}
+        ]});
+        TreeSelector::new(&data, 20, true, crate::tree_list::FilterMode::Default).unwrap()
+    }
+
+    #[test]
+    fn usage_receipts_are_transparent_only_for_current_point_comparison() {
+        for kind in ["clm_usage_v1", "clm_usage_unknown_v1"] {
+            let selector = selector(kind);
+            assert_eq!(selector.current_leaf_id(), Some("receipt"));
+            assert!(selector.is_current_point("receipt"));
+            assert!(selector.is_current_point("assistant"), "{kind}");
+            assert!(!selector.is_current_point("other"));
+        }
+    }
+
+    #[test]
+    fn unrelated_hidden_custom_row_is_not_a_current_point() {
+        let selector = selector("clm_usage_other");
+        assert_eq!(selector.current_leaf_id(), Some("receipt"));
+        assert!(selector.is_current_point("receipt"));
+        assert!(!selector.is_current_point("assistant"));
+    }
 }

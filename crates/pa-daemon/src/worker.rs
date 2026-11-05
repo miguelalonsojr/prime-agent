@@ -293,6 +293,8 @@ impl Worker {
         let events = Arc::new(EventPump::new());
         let supervisor_claims = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let core = SessionCore {
+            clm_protected: std::collections::BTreeMap::default(),
+            clm_persistence_error: None,
             active_session_id: config.active_session_id.clone(),
             generation: crate::util::new_display_id(),
             last_event_sequence: 0,
@@ -460,6 +462,76 @@ impl Worker {
                 // The in-run autonomous continuation seam: the hook holds
                 // itself weakly through the registered arc.
                 concrete.register_arc();
+                let journal_core = Arc::clone(&core);
+                *concrete.clm_journal.lock().expect("CLM journal lock") =
+                    Some(Arc::new(move |op| {
+                        let core = Arc::clone(&journal_core);
+                        Box::pin(async move {
+                            let mut core = core
+                                .lock()
+                                .map_err(|_| anyhow!("CLM owner lock poisoned"))?;
+                            if let Some(error) = &core.clm_persistence_error {
+                                return Err(anyhow!(error.clone()));
+                            }
+                            let protected = core.clm_protected.clone();
+                            let store = core
+                                .store
+                                .as_mut()
+                                .ok_or_else(|| anyhow!("CLM session not created"))?;
+                            if store.window.is_some() {
+                                let full = SessionFile::open(&store.path)?;
+                                store.install_full_history(full);
+                            }
+                            store.clm_journal(op, protected)
+                        })
+                    }));
+                let receipt_core = Arc::clone(&core);
+                *concrete
+                    .clm_helper_receipt
+                    .lock()
+                    .expect("CLM helper receipt lock") =
+                    Some(Arc::new(move |expected, receipt| {
+                        let core = Arc::clone(&receipt_core);
+                        Box::pin(async move {
+                            let mut core = core
+                                .lock()
+                                .map_err(|_| anyhow!("CLM owner lock poisoned"))?;
+                            if let Some(error) = &core.clm_persistence_error {
+                                return Err(anyhow!(error.clone()));
+                            }
+                            let protected = core.clm_protected.clone();
+                            let store = core
+                                .store
+                                .as_mut()
+                                .ok_or_else(|| anyhow!("CLM helper owner missing"))?;
+                            if store.window.is_some() {
+                                let full = SessionFile::open(&store.path)?;
+                                store.install_full_history(full);
+                            }
+                            let pa_core::clm::journal::ClmJournalReply::View(current) = store
+                                .clm_journal(
+                                    pa_core::clm::journal::ClmJournalOp::ReadAfterEvents,
+                                    protected,
+                                )?
+                            else {
+                                anyhow::bail!("CLM helper owner read returned a commit")
+                            };
+                            anyhow::ensure!(
+                                current.session_id == expected.session_id
+                                    && current.generation == expected.generation,
+                                "CLM helper response belongs to a replaced session"
+                            );
+                            match store.persist_entry("custom", receipt) {
+                                Ok(id) => Ok(id),
+                                Err(error) => {
+                                    core.clm_persistence_error = Some(format!(
+                                        "CLM helper persistence uncertain: {error:#}"
+                                    ));
+                                    Err(error)
+                                }
+                            }
+                        })
+                    }));
                 concrete
                     .set_rlm_usage_store(std::sync::Arc::new(CoreUsageStore(Arc::clone(&core))));
                 let sink_core = Arc::clone(&core);
@@ -1097,6 +1169,8 @@ mod worker_resume_settings_tests;
 #[cfg(test)]
 mod agent_message_tests;
 
+#[cfg(test)]
+mod clm_tests;
 #[cfg(test)]
 mod prompt_image_tests;
 

@@ -63,7 +63,7 @@ async fn split_turn_compaction_runs_two_summarizer_calls_and_merges_the_turn_con
     session.append_message(reply("reply three")).unwrap();
     // The tiny keep-recent budget lands the cut on the big turn's
     // assistant reply — a mid-turn cut.
-    let (cut, _) = compute_cut(&session, 10);
+    let (cut, _) = compute_cut(&session, 10).unwrap();
     assert!(cut.is_split_turn);
     assert_eq!(cut.turn_start_index, Some(3));
     assert_eq!(cut.first_kept_entry_index, 4);
@@ -115,6 +115,7 @@ async fn split_turn_compaction_runs_two_summarizer_calls_and_merges_the_turn_con
     let outcome = execute_compaction(
         &mut session,
         CompactOptions {
+            clm: None,
             model,
             api_key: None,
             custom_instructions: None,
@@ -307,6 +308,7 @@ async fn injected_custom_turn_cuts_whole_turns_the_double_row_splits() {
     let outcome = execute_compaction(
         &mut session,
         CompactOptions {
+            clm: None,
             model: model.clone(),
             api_key: None,
             custom_instructions: None,
@@ -358,6 +360,7 @@ async fn injected_custom_turn_cuts_whole_turns_the_double_row_splits() {
     let outcome = execute_compaction(
         &mut doubled,
         CompactOptions {
+            clm: None,
             model,
             api_key: None,
             custom_instructions: None,
@@ -461,7 +464,7 @@ async fn split_turn_without_history_makes_only_the_prefix_call() {
         .unwrap();
     session.append_message(user("small")).unwrap();
     session.append_message(reply("small reply")).unwrap();
-    let (cut, _) = compute_cut(&session, 10);
+    let (cut, _) = compute_cut(&session, 10).unwrap();
     assert!(cut.is_split_turn);
     assert_eq!(cut.turn_start_index, Some(1));
     let kept_id = session.get_all_entries()[2]
@@ -471,6 +474,7 @@ async fn split_turn_without_history_makes_only_the_prefix_call() {
     let outcome = execute_compaction(
         &mut session,
         CompactOptions {
+            clm: None,
             model,
             api_key: None,
             custom_instructions: None,
@@ -603,7 +607,7 @@ async fn a_split_turn_compaction_commits_both_summary_slices_before_its_entry() 
     session
         .append_message(reply(&format!("reply {}", "y".repeat(4_000))))
         .unwrap();
-    let (cut, _) = compute_cut(&session, 10);
+    let (cut, _) = compute_cut(&session, 10).unwrap();
     assert!(cut.is_split_turn, "the cut spans the big turn");
     let (identity, recorder) = semantic_fixture(tmp.path());
     // Two scripted summaries; each factory call records its request's
@@ -636,6 +640,7 @@ async fn a_split_turn_compaction_commits_both_summary_slices_before_its_entry() 
     let outcome = execute_compaction(
         &mut session,
         CompactOptions {
+            clm: None,
             model,
             api_key: None,
             custom_instructions: None,
@@ -740,6 +745,7 @@ async fn an_aborted_compaction_fails_its_slices_and_records_cancelled() {
     let error = execute_compaction(
         &mut session,
         CompactOptions {
+            clm: None,
             model,
             api_key: None,
             custom_instructions: None,
