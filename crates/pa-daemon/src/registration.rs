@@ -336,6 +336,10 @@ mod tests {
         ));
         assert!(!is_definitive_rejection("registration connect timed out"));
         assert!(!is_definitive_rejection("read daemon hello"));
+        assert!(!is_definitive_rejection(&format!(
+            "registration rejected: {} for disputed-worker",
+            crate::supervisor::ORDINARY_WORKER_IDENTITY_REFUSAL,
+        )));
     }
 
     fn test_config(dir: &std::path::Path, supervisor_socket: &std::path::Path) -> WorkerConfig {

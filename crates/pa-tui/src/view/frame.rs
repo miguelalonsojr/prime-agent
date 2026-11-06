@@ -151,9 +151,12 @@ impl AgentView {
             // The replacement surfaces swap only the editor part; the `/speed` footer stays
             // the dock's last row (TS `footerSlot`).
             Some(mut dock) => {
-                if let Some(speed) = &self.chrome.speed_text {
-                    dock.push(crate::chrome::render_speed_footer(
-                        speed,
+                if let Some(cwd) = &self.chrome.footer_cwd {
+                    dock.push(crate::chrome::render_cwd_footer(
+                        self.chrome.speed_text.as_deref(),
+                        cwd,
+                        self.chrome.footer_branch.as_deref(),
+                        std::env::var("HOME").ok().as_deref(),
                         &self.theme,
                         width,
                     ));

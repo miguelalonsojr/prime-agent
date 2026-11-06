@@ -687,6 +687,7 @@ async fn run_interactive_surface(
     // open path does not block on a stats fetch.
     session.spawn_model_catalog_refresh();
     session.rebuild_view(&mut view, &crate::session_ui::RebuildKind::Rebind);
+    view.chrome.footer_cwd = Some(session.effective_cwd().to_string_lossy().into_owned());
     // The cross-view layout handoff's adopt (view::handoff): a re-entry whose attach cursor exactly
     // matches the previous run's held handoff holds its visible-window packs for the first draw;
     // any chat mutation retires it. A cursor-less re-attach never adopts.
@@ -860,7 +861,61 @@ async fn run_interactive_surface(
     // again.
     let mut session_reconnect: Option<SessionReconnect> = None;
 
+    let (footer_tx, mut footer_rx) =
+        mpsc::unbounded_channel::<(u64, std::path::PathBuf, Option<String>)>();
+    let mut displayed_cwd: Option<std::path::PathBuf> = None;
+    let mut lookup_generation = 0;
     'run: while running {
+        let effective = session.effective_cwd().to_path_buf();
+        if displayed_cwd.as_ref() != Some(&effective) {
+            lookup_generation += 1;
+            displayed_cwd = Some(effective.clone());
+            view.chrome.footer_cwd = Some(effective.to_string_lossy().into_owned());
+            view.chrome.footer_branch = None;
+            view.editor.set_autocomplete_file_base(effective.clone());
+            let sender = footer_tx.clone();
+            tokio::task::spawn_blocking(move || {
+                let branch = std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&effective)
+                    .args(["branch", "--show-current"])
+                    .stdin(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .output()
+                    .ok()
+                    .filter(|result| result.status.success())
+                    .and_then(|result| String::from_utf8(result.stdout).ok())
+                    .map(|branch| branch.trim().to_string())
+                    .filter(|branch| !branch.is_empty());
+                #[cfg(all(test, unix))]
+                let branch_receipt = branch.clone();
+                let _ = sender.send((lookup_generation, effective, branch));
+                #[cfg(all(test, unix))]
+                if let Ok(socket) = std::env::var("PA_FOOTER_OBSERVER_SOCKET") {
+                    use std::io::Write as _;
+                    if let Ok(mut observer) = std::os::unix::net::UnixStream::connect(socket) {
+                        let _ = writeln!(
+                            observer,
+                            "FOOTER_SENT:{}",
+                            branch_receipt.as_deref().unwrap_or("<none>")
+                        );
+                    }
+                }
+            });
+            session.dirty = true;
+        }
+        while let Ok((generation, cwd, branch)) = footer_rx.try_recv() {
+            if let Ok(branch) = branch_for_current_cwd(
+                displayed_cwd.as_deref(),
+                lookup_generation,
+                &cwd,
+                generation,
+                branch,
+            ) {
+                view.chrome.footer_branch = branch;
+                session.dirty = true;
+            }
+        }
         if !session.dirty {
             session.spawn_transcript_page(&mut view);
         }
@@ -1194,6 +1249,53 @@ async fn run_interactive_surface(
                         unreachable!("barrier handled above")
                     }
                 }
+                if let Some((shell, cwd)) = session.take_shell_request() {
+                    let launch_physical_cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.clone());
+                    if renderer.is_terminal_mut().is_some() {
+                        let outcome = async {
+                            let guard = ShellTerminalGuard::start(&mut renderer, &mut view)?;
+                            let result = crate::shell_session::run_shell_session(
+                                crate::shell_session::ShellSessionOptions {
+                                    shell,
+                                    shell_args: Vec::new(),
+                                    cwd: cwd.clone(),
+                                },
+                            )
+                            .await;
+                            guard.finish()?;
+                            result
+                        }
+                        .await;
+                        match outcome {
+                            Ok(outcome) => {
+                                let _ = outcome.exit_code;
+                                if let Some(final_cwd) = outcome.final_cwd {
+                                    if final_cwd != launch_physical_cwd {
+                                        if let Err(error) =
+                                            session.set_kernel_cwd(&final_cwd, &mut view).await
+                                        {
+                                            session.error_row(
+                                                &format!(
+                                                    "Kernel CWD propagation failed: {error:#}"
+                                                ),
+                                                &mut view,
+                                            );
+                                        }
+                                    }
+                                } else {
+                                    session.note(
+                                        "Shell final directory could not be observed.",
+                                        &mut view,
+                                    );
+                                }
+                            }
+                            Err(error) => session
+                                .error_row(&format!("Shell handoff failed: {error:#}"), &mut view),
+                        }
+                    } else {
+                        session.note("/term needs a terminal.", &mut view);
+                    }
+                }
                 // Paint the handled input in this iteration: the select below can otherwise wait
                 // out its 50ms tick before the next draw, felt as keystroke-to-render lag. A
                 // handoff paints nothing: the next surface owns the pane.
@@ -1350,6 +1452,23 @@ async fn run_interactive_surface(
         } else {
             None
         };
+        #[cfg(test)]
+        select_observer::waiting(
+            !session.dirty
+                && render_deadline.is_none()
+                && quiet_tick_deadline.is_none()
+                && !bash_refresh_wanted
+                && !factory_refresh_wanted
+                && !headless_done
+                && !autocomplete_pending
+                && !auto_scroll_armed
+                && !ui_rx.is_closed()
+                && !events_closed
+                && reconnect.is_none()
+                && session_reconnect.is_none()
+                && anim_started.is_none()
+                && view.chrome.footer_branch.is_none(),
+        );
         tokio::select! {
             maybe_event = async {
                 // A closed channel's recv() resolves None instantly and forever; while the
@@ -1361,6 +1480,8 @@ async fn run_interactive_surface(
                 }
                 events.recv().await
             } => {
+                #[cfg(test)]
+                select_observer::handling("event");
                                 if let Some(event) = maybe_event {
                     session.apply_client_event(event, &mut view);
                     // Batch the rest of the queued frames: a stream burst applies as one
@@ -1495,6 +1616,8 @@ async fn run_interactive_surface(
                 }
                 reader_dead.changed().await
             } => {
+                #[cfg(test)]
+                select_observer::handling("reader");
                 reader_loss_handled = true;
                 if reader_death.is_ok() && *reader_dead.borrow_and_update() {
                     // An update restart's close frame can race this signal (the reader emits the
@@ -1553,6 +1676,8 @@ async fn run_interactive_surface(
                     ui_rx.recv().await
                 }
             } => {
+                #[cfg(test)]
+                select_observer::handling("input");
                 if let Some(input) = maybe_input {
                     // A keystroke restarts the window: the rest of a typed burst (a
                     // command plus its Enter) applies before a parked request materializes.
@@ -1563,71 +1688,115 @@ async fn run_interactive_surface(
                 }
             }
             maybe_note = notes_rx.recv() => {
+                #[cfg(test)]
+                select_observer::handling("note");
                 if let Some(note) = maybe_note {
                     session.apply_background_note(&note, &mut view);
                 }
             }
+            maybe_footer = footer_rx.recv() => {
+                #[cfg(test)]
+                select_observer::handling("footer");
+                if let Some((generation, cwd, branch)) = maybe_footer {
+                    if let Ok(branch) = branch_for_current_cwd(
+                        displayed_cwd.as_deref(), lookup_generation, &cwd, generation, branch,
+                    ) {
+                        view.chrome.footer_branch = branch;
+                        session.dirty = true;
+                    }
+                }
+            }
             maybe_page = page_rx.recv() => {
+                #[cfg(test)]
+                select_observer::handling("page");
                 if let Some(note) = maybe_page {
                     session.apply_transcript_page(note, &mut view);
                 }
             }
             maybe_compaction_abort = compaction_abort_rx.recv() => {
+                #[cfg(test)]
+                select_observer::handling("compaction");
                 if let Some(outcome) = maybe_compaction_abort {
                     session.apply_compaction_abort_outcome(outcome, &mut view);
                 }
             }
             maybe_share = share_rx.recv() => {
+                #[cfg(test)]
+                select_observer::handling("share");
                 if let Some(outcome) = maybe_share {
                     session.apply_share_outcome(outcome, &mut view);
                 }
             }
             maybe_update = update_rx.recv() => {
+                #[cfg(test)]
+                select_observer::handling("update");
                 if let Some(outcome) = maybe_update {
                     session.apply_update_note(outcome, &mut view);
                 }
             }
             maybe_reload = reload_rx.recv() => {
+                #[cfg(test)]
+                select_observer::handling("reload");
                 if let Some(outcome) = maybe_reload {
                     session.apply_reload_outcome(outcome, &mut view).await;
                 }
             }
             maybe_traces_upload = traces_upload_rx.recv() => {
+                #[cfg(test)]
+                select_observer::handling("traces");
                 if let Some(note) = maybe_traces_upload {
                     session.apply_traces_upload_note(note, &mut view);
                 }
             }
             maybe_catalog = catalog_rx.recv() => {
+                #[cfg(test)]
+                select_observer::handling("catalog");
                 if let Some(update) = maybe_catalog {
                     session.apply_model_catalog(update, &mut view);
+                    #[cfg(test)]
+                    select_observer::model_catalog_applied();
                 }
             }
             maybe_auth_panel = auth_panel_rx.recv() => {
+                #[cfg(test)]
+                select_observer::handling("auth");
                 if let Some(request) = maybe_auth_panel {
                     session.apply_auth_panel_request(request, &mut view).await;
                 }
             }
             maybe_heartbeats = heartbeats_rx.recv() => {
+                #[cfg(test)]
+                select_observer::handling("heartbeat");
                 if let Some(update) = maybe_heartbeats {
                     session.apply_heartbeat_update(update, &mut view);
                 }
             }
             maybe_bash = bash_rx.recv() => {
+                #[cfg(test)]
+                select_observer::handling("bash");
                 if let Some(update) = maybe_bash {
                     session.apply_bash_activity(update, &mut view);
                 }
             }
             maybe_factory = factory_rx.recv() => {
+                #[cfg(test)]
+                select_observer::handling("factory");
                 if let Some(update) = maybe_factory {
                     session.apply_factory_update(update, &mut view);
                 }
             }
             maybe_commands = commands_rx.recv() => {
+                #[cfg(test)]
+                select_observer::handling("commands");
                 if let Some(update) = maybe_commands {
                     session.apply_command_catalog(update, &mut view);
+                    #[cfg(test)]
+                    select_observer::commands_applied();
                 }
             }
             maybe_prompt = prompt_rx.recv() => {
+                #[cfg(test)]
+                select_observer::handling("prompt");
                 if let Some(note) = maybe_prompt {
                     // Protocol corruption stays fatal exactly like the inline submit's ladder.
                     session.apply_prompt_outcome(note, &mut view).await?;
@@ -1644,6 +1813,8 @@ async fn run_interactive_surface(
                     None => std::future::pending::<()>().await,
                 }
             } => {
+                #[cfg(test)]
+                select_observer::handling("reconnect_timer");
                 if reconnect_connect.is_some() {
                     continue;
                 }
@@ -1709,6 +1880,8 @@ async fn run_interactive_surface(
                     None => std::future::pending().await,
                 }
             } => {
+                #[cfg(test)]
+                select_observer::handling("reconnect_result");
                 reconnect_connect = None;
                 reconnect_attempt_in_flight = false;
                 // The deadline check runs here too: the tick arm parks while an attempt is in
@@ -1832,6 +2005,8 @@ async fn run_interactive_surface(
                     None => std::future::pending::<()>().await,
                 }
             } => {
+                #[cfg(test)]
+                select_observer::handling("session_reconnect");
                 let Some(state) = session_reconnect.take() else {
                     continue;
                 };
@@ -1912,6 +2087,8 @@ async fn run_interactive_surface(
                     None => std::future::pending::<()>().await,
                 }
             } => {
+                #[cfg(test)]
+                select_observer::handling("quiet_timer");
                 quiet_tick_deadline = None;
                 session.materialize_editor_autocomplete(&mut view);
                 session.selection_auto_scroll_tick(&mut view);
@@ -1928,6 +2105,8 @@ async fn run_interactive_surface(
                 )
                 .await;
             } => {
+                #[cfg(test)]
+                select_observer::handling("bash_timer");
                 last_bash_refresh = Instant::now();
                 session.spawn_bash_activity_refresh();
                 session.refresh_expanded_dock(&mut view);
@@ -1947,6 +2126,8 @@ async fn run_interactive_surface(
                 )
                 .await;
             } => {
+                #[cfg(test)]
+                select_observer::handling("factory_timer");
                 last_factory_refresh = Instant::now();
                 session.spawn_factory_refresh();
             }
@@ -1958,10 +2139,14 @@ async fn run_interactive_surface(
                     None => std::future::pending::<()>().await,
                 }
             } => {
+                #[cfg(test)]
+                select_observer::handling("frame_timer");
                 // The coalesced frame's deadline arrived: the render gate below paints the
                 // accumulated state now.
             }
         }
+        #[cfg(test)]
+        select_observer::outside();
 
         // Spinner animation: the wall clock drives the phase, not the render rate — the frame gate
         // below caps renders, and only a phase change dirties the frame.
@@ -2190,4 +2375,806 @@ mod tests {
         assert_eq!(next_spinner_deadline(started, at(161)), at(240));
         assert_eq!(next_spinner_deadline(started, at(239)), at(240));
     }
+}
+
+/// Owns the input reader and terminal modes across the shell's async wait, including cancellation.
+struct ShellTerminalGuard<'a> {
+    renderer: &'a mut Renderer,
+    view: &'a mut AgentView,
+    reader: Option<(mpsc::UnboundedSender<UiInput>, ExitGuard)>,
+    signals: crate::suspend::ProcessSignals,
+    active: bool,
+}
+
+impl<'a> ShellTerminalGuard<'a> {
+    fn start(renderer: &'a mut Renderer, view: &'a mut AgentView) -> Result<Self> {
+        let reader = match renderer {
+            Renderer::Terminal {
+                ui_tx, exit_guard, ..
+            } => Some((ui_tx.clone(), exit_guard.clone())),
+            Renderer::Headless { .. } => None,
+        };
+        crate::input::stop_reader();
+        let mut guard = Self {
+            renderer,
+            view,
+            reader,
+            signals: crate::suspend::ProcessSignals,
+            active: true,
+        };
+        if crate::suspend::supported() {
+            use crate::suspend::SuspendSignals;
+            guard.signals.ignore_sigint()?;
+        }
+        TerminalHandoff {
+            renderer: guard.renderer,
+            view: guard.view,
+        }
+        .stop()?;
+        Ok(guard)
+    }
+
+    fn finish(mut self) -> Result<()> {
+        self.restore()
+    }
+
+    fn restore(&mut self) -> Result<()> {
+        if !self.active {
+            return Ok(());
+        }
+        self.active = false;
+        if crate::suspend::supported() {
+            use crate::suspend::SuspendSignals;
+            let _ = self.signals.restore_sigint();
+        }
+        let resumed = TerminalHandoff {
+            renderer: self.renderer,
+            view: self.view,
+        }
+        .resume();
+        if let Some((ui_tx, exit_guard)) = self.reader.take() {
+            spawn_session_reader(ui_tx, exit_guard);
+        }
+        resumed
+    }
+}
+impl Drop for ShellTerminalGuard<'_> {
+    fn drop(&mut self) {
+        let _ = self.restore();
+    }
+}
+
+/// A lookup started for an older CWD must never repaint the newer directory's branch.
+fn branch_for_current_cwd(
+    current: Option<&std::path::Path>,
+    current_generation: u64,
+    result_cwd: &std::path::Path,
+    result_generation: u64,
+    branch: Option<String>,
+) -> Result<Option<String>, ()> {
+    (current_generation == result_generation && current == Some(result_cwd))
+        .then_some(branch)
+        .ok_or(())
+}
+
+#[cfg(test)]
+mod select_observer {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use std::sync::mpsc::Sender;
+
+    thread_local! {
+        static ACTIVE: RefCell<Option<Rc<RefCell<Recorder>>>> = const { RefCell::new(None) };
+    }
+
+    #[derive(Clone, Copy)]
+    pub(super) enum Phase {
+        Outside,
+        Waiting { epoch: u64, eligible: bool },
+        Handling,
+    }
+
+    pub(super) struct Recorder {
+        pub phase: Phase,
+        epoch: u64,
+        commands_applied: u8,
+        model_catalog_applied: bool,
+        pub parked: bool,
+        pub sender: Sender<String>,
+    }
+
+    pub(super) fn install(sender: Sender<String>) -> Rc<RefCell<Recorder>> {
+        let recorder = Rc::new(RefCell::new(Recorder {
+            phase: Phase::Outside,
+            epoch: 0,
+            commands_applied: 0,
+            model_catalog_applied: false,
+            parked: false,
+            sender,
+        }));
+        ACTIVE.with(|active| *active.borrow_mut() = Some(Rc::clone(&recorder)));
+        recorder
+    }
+
+    fn with_recorder(visit: impl FnOnce(&mut Recorder)) {
+        ACTIVE.with(|active| {
+            if let Some(recorder) = active.borrow().as_ref() {
+                visit(&mut recorder.borrow_mut());
+            }
+        });
+    }
+
+    pub(super) fn waiting(eligible: bool) {
+        with_recorder(|recorder| {
+            recorder.epoch += 1;
+            recorder.phase = Phase::Waiting {
+                epoch: recorder.epoch,
+                eligible: eligible
+                    && recorder.commands_applied >= 2
+                    && recorder.model_catalog_applied,
+            };
+        });
+    }
+
+    pub(super) fn handling(arm: &'static str) {
+        with_recorder(|recorder| {
+            recorder.phase = Phase::Handling;
+            if recorder.parked {
+                let _ = recorder.sender.send(format!("ARM:{arm}"));
+            }
+        });
+    }
+
+    pub(super) fn commands_applied() {
+        with_recorder(|recorder| {
+            recorder.commands_applied = recorder.commands_applied.saturating_add(1);
+        });
+    }
+
+    pub(super) fn model_catalog_applied() {
+        with_recorder(|recorder| recorder.model_catalog_applied = true);
+    }
+
+    pub(super) fn outside() {
+        with_recorder(|recorder| recorder.phase = Phase::Outside);
+    }
+
+    pub(super) fn after_pending(recorder: &Rc<RefCell<Recorder>>, in_poll_wakes: usize) {
+        if in_poll_wakes != 0 {
+            return;
+        }
+        let mut observation = recorder.borrow_mut();
+        if let Phase::Waiting {
+            epoch,
+            eligible: true,
+        } = observation.phase
+        {
+            if !observation.parked {
+                observation.parked = true;
+                let _ = observation.sender.send(format!("PARKED:{epoch}"));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod footer_branch_tests {
+    use super::branch_for_current_cwd;
+    use std::path::Path;
+
+    #[test]
+    fn stale_lookup_cannot_overwrite_newer_cwd() {
+        let old = Path::new("/old");
+        let current = Path::new("/new");
+        assert_eq!(
+            branch_for_current_cwd(Some(current), 2, old, 1, Some("stale".into())),
+            Err(())
+        );
+        assert_eq!(
+            branch_for_current_cwd(Some(current), 2, current, 2, Some("latest".into())),
+            Ok(Some("latest".into()))
+        );
+    }
+
+    #[test]
+    fn old_a_result_cannot_overwrite_a_newer_a_after_a_b_a() {
+        let a = Path::new("/a");
+        let b = Path::new("/b");
+        assert_eq!(
+            branch_for_current_cwd(Some(a), 3, b, 2, Some("b".into())),
+            Err(())
+        );
+        assert_eq!(
+            branch_for_current_cwd(Some(a), 3, a, 3, Some("new".into())),
+            Ok(Some("new".into()))
+        );
+        let old_some = branch_for_current_cwd(Some(a), 3, a, 1, Some("old".into()));
+        let old_none = branch_for_current_cwd(Some(a), 3, a, 1, None);
+        assert_eq!((old_some, old_none), (Err(()), Err(())));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod footer_terminal_wake_tests {
+    use super::{run_interactive, select_observer, SessionSelection, UiMode};
+    use std::future::Future;
+    use std::io::Write;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::task::{Context, Poll, Wake, Waker};
+
+    struct ForwardWake {
+        original: Waker,
+        wakes: AtomicUsize,
+    }
+
+    impl Wake for ForwardWake {
+        fn wake(self: Arc<Self>) {
+            self.wakes.fetch_add(1, Ordering::SeqCst);
+            self.original.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.wakes.fetch_add(1, Ordering::SeqCst);
+            self.original.wake_by_ref();
+        }
+    }
+
+    fn run_child() {
+        let (sender, receiver) = std::sync::mpsc::channel::<String>();
+        let observer_socket = std::env::var("PA_FOOTER_OBSERVER_SOCKET").expect("observer socket");
+        let _reporter = std::thread::spawn(move || {
+            let mut stream =
+                std::os::unix::net::UnixStream::connect(observer_socket).expect("observer connect");
+            for message in receiver {
+                writeln!(stream, "{message}").expect("observer receipt");
+            }
+        });
+        let recorder = select_observer::install(sender);
+        let mut options = super::super::tests::options(super::super::ModelSelection::default());
+        options.socket_path = std::env::var("PA_FOOTER_MOCK_SOCKET")
+            .expect("mock socket")
+            .into();
+        options.cwd = std::env::var("PA_FOOTER_CWD").expect("fixture cwd").into();
+        options.session = SessionSelection::Attach("s1".into());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let result = runtime.block_on(async {
+            let mut ui = Box::pin(run_interactive(options, UiMode::Terminal));
+            std::future::poll_fn(|cx| {
+                let forward = Arc::new(ForwardWake {
+                    original: cx.waker().clone(),
+                    wakes: AtomicUsize::new(0),
+                });
+                let forwarding_waker = Waker::from(Arc::clone(&forward));
+                let mut ui_context = Context::from_waker(&forwarding_waker);
+                let outcome = ui.as_mut().poll(&mut ui_context);
+                if matches!(outcome, Poll::Pending) {
+                    select_observer::after_pending(&recorder, forward.wakes.load(Ordering::SeqCst));
+                }
+                outcome
+            })
+            .await
+        });
+        panic!("terminal run ended before fixture quit: {result:?}");
+    }
+
+    #[test]
+    fn selected_handler_pending_does_not_masquerade_as_parked_select() {
+        let (sender, received) = std::sync::mpsc::channel();
+        let recorder = select_observer::install(sender);
+        select_observer::commands_applied();
+        select_observer::commands_applied();
+        select_observer::model_catalog_applied();
+        select_observer::waiting(true);
+        select_observer::handling("prompt");
+        let mut handler = Box::pin(std::future::pending::<()>());
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(matches!(handler.as_mut().poll(&mut context), Poll::Pending));
+        select_observer::after_pending(&recorder, 0);
+        assert!(matches!(
+            recorder.borrow().phase,
+            select_observer::Phase::Handling
+        ));
+        assert!(
+            received.try_recv().is_err(),
+            "a handler await is not a parked select"
+        );
+        select_observer::waiting(true);
+        select_observer::after_pending(&recorder, 1);
+        assert!(
+            received.try_recv().is_err(),
+            "in-poll wake is not a parked receipt"
+        );
+        select_observer::after_pending(&recorder, 0);
+        assert!(received
+            .try_recv()
+            .expect("genuine new select")
+            .starts_with("PARKED:"));
+    }
+
+    fn frame_from_hex(hex: &str) -> String {
+        assert_eq!(hex.len() % 2, 0, "complete PTY bytes");
+        let bytes = hex
+            .as_bytes()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| {
+                let pair = std::str::from_utf8(pair).expect("hex pair");
+                u8::from_str_radix(pair, 16).expect("hex byte")
+            })
+            .collect::<Vec<_>>();
+        let mut terminal = vt100::Parser::new(24, 80, 0);
+        terminal.process(&bytes);
+        terminal.screen().contents()
+    }
+
+    #[test]
+    fn idle_branch_completion_paints_without_unrelated_wake() {
+        if std::env::var_os("PA_FOOTER_CHILD").is_some() {
+            run_child();
+            return;
+        }
+        let result = std::process::Command::new("python3")
+            .arg("-c")
+            .arg(PY_DRIVER)
+            .arg(std::env::current_exe().expect("unit binary"))
+            .output()
+            .expect("run stdlib PTY controller");
+        assert!(
+            result.status.success(),
+            "PTY controller failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let output = String::from_utf8(result.stdout).expect("controller UTF-8");
+        let frames = |name| {
+            output
+                .lines()
+                .find_map(|line| line.strip_prefix(name))
+                .map_or_else(
+                    || panic!("missing {name} frame in {output}"),
+                    frame_from_hex,
+                )
+        };
+        let initial = frames("INITIAL_HEX=");
+        let final_frame = frames("FINAL_HEX=");
+        assert!(
+            initial.contains("pa4-footer-dir") && !initial.contains("fix4wake"),
+            "path-only frame: {initial}"
+        );
+        assert!(
+            final_frame.contains("pa4-footer-dir") && final_frame.contains("fix4wake"),
+            "branch not painted in vt100 frame: {final_frame}"
+        );
+    }
+
+    const PY_DRIVER: &str = r##"import fcntl, json, os, pty, re, selectors, signal, socket, struct, sys, tempfile, termios, time, traceback
+from pathlib import Path
+
+branch = b'fix4wake'
+sel = selectors.DefaultSelector()
+streams = {}
+raw = bytearray()
+parked = False
+gate = None
+released = False
+footer_arm = False
+footer_sent = False
+observer_connections = 0
+child = None
+
+def listen(path, kind):
+    sock = socket.socket(socket.AF_UNIX)
+    sock.bind(str(path))
+    sock.listen(4)
+    sock.setblocking(False)
+    sel.register(sock, selectors.EVENT_READ, (kind, None))
+    return sock
+
+def plain(data):
+    return re.sub(rb'\x1b(?:\[[0-9;?]*[ -/]*[@-~]|\][^\x07]*\x07|\][^\x1b]*\x1b\\)', b'', data)
+
+def attach(id, cwd):
+    return {'type':'response','id':id,'command':'attach','success':True,'data':{
+        'protocol':{'name':'prime-agent.daemon','version':7},
+        'activeSessionId':'s1', 'snapshot':{
+            'activeSessionId':'s1','summary':{'id':'s1','cwd':cwd},
+            'state':{'activeSessionId':'s1','cwd':cwd,'sessionId':'sess-1',
+                     'sessionName':'footer park probe','model':'faux-1',
+                     'isStreaming':False,'isCompacting':False,
+                     'sessionActions':{'queuedCount':0,'steering':[],'followUps':[]}},
+            'messages':[], 'lastEventSequence':0,'lastEventCursor':None},
+        'client':{'id':'mock','capabilities':[]},'lastEventSequence':0,'lastEventCursor':None}}
+
+def send(conn, value):
+    conn.sendall((json.dumps(value, separators=(',',':'))+'\n').encode())
+
+try:
+    with tempfile.TemporaryDirectory(prefix='pa4-', dir='/tmp') as private:
+        base = Path(private)
+        cwd = base / 'pa4-footer-dir'
+        cwd.mkdir()
+        gitdir = cwd / '.git'
+        gitdir.mkdir()
+        (gitdir / 'objects').mkdir()
+        (gitdir / 'refs' / 'heads').mkdir(parents=True)
+        (gitdir / 'config').write_text('[core]\n repositoryformatversion = 0\n bare = false\n')
+        (gitdir / 'HEAD').write_text('ref: refs/heads/fix4wake\n')
+        listen(base/'mock.sock', 'mock_accept')
+        listen(base/'observer.sock', 'observer_accept')
+        listen(base/'git.sock', 'git_accept')
+        scripts = base/'scripts'
+        scripts.mkdir()
+        wrapper = scripts/'git'
+        wrapper.write_text("#!/usr/bin/python3\nimport os,socket,sys\nif sys.argv[-2:]==['branch','--show-current']:\n s=socket.socket(socket.AF_UNIX); s.connect(os.environ['PA_FOOTER_GIT_SOCKET']); s.sendall(b'GIT_WAIT\\n'); assert s.recv(1)==b'R'; s.close()\nos.execv('/usr/bin/git',['/usr/bin/git']+sys.argv[1:])\n")
+        wrapper.chmod(0o700)
+        env = {'PATH':str(scripts)+':/usr/bin:/bin', 'HOME':str(base),'XDG_CONFIG_HOME':str(base/'config'),
+               'XDG_DATA_HOME':str(base/'data'),'XDG_CACHE_HOME':str(base/'cache'),
+               'TMPDIR':str(base),'TERM':'xterm-256color','LANG':'C.UTF-8','DO_NOT_TRACK':'1',
+               'RLM_DEPTH':'0','PA_FOOTER_CHILD':'1','PA_FOOTER_CWD':str(cwd),
+               'PA_FOOTER_MOCK_SOCKET':str(base/'mock.sock'),
+               'PA_FOOTER_OBSERVER_SOCKET':str(base/'observer.sock'),
+               'PA_FOOTER_GIT_SOCKET':str(base/'git.sock')}
+        child, master = pty.fork()
+        if child == 0:
+            fcntl.ioctl(1, termios.TIOCSWINSZ, struct.pack('HHHH',24,80,0,0))
+            os.chdir(cwd)
+            os.execve(sys.argv[1],[sys.argv[1], '--exact',
+                'interactive::run::footer_terminal_wake_tests::idle_branch_completion_paints_without_unrelated_wake',
+                '--nocapture','--test-threads=1'], env)
+        os.set_blocking(master, False)
+        sel.register(master, selectors.EVENT_READ, ('pty',None))
+        deadline = time.monotonic()+14
+        while time.monotonic() < deadline:
+            for key, _ in sel.select(deadline-time.monotonic()):
+                kind, _ = key.data
+                if kind.endswith('_accept'):
+                    conn, _ = key.fileobj.accept()
+                    conn.setblocking(False)
+                    conn_kind = kind[:-7]
+                    if conn_kind == 'observer':
+                        observer_connections += 1
+                        if observer_connections > 1: conn_kind = 'footer_receipt'
+                    sel.register(conn, selectors.EVENT_READ, (conn_kind,bytearray()))
+                    if kind == 'mock_accept':
+                        send(conn, {'type':'daemon_hello','protocol':{'name':'prime-agent.daemon','version':7},
+                                    'serverCapabilities':[],'clientId':'mock'})
+                    continue
+                if kind == 'pty':
+                    try: chunk = os.read(master,8192)
+                    except OSError: chunk = b''
+                    if not chunk: raise AssertionError('PTY closed before branch frame: '+repr(plain(raw[-1500:])))
+                    raw.extend(chunk)
+                else:
+                    try: chunk = key.fileobj.recv(8192)
+                    except BlockingIOError: continue
+                    if not chunk:
+                        if kind == 'footer_receipt':
+                            sel.unregister(key.fileobj)
+                            key.fileobj.close()
+                            continue
+                        raise AssertionError(kind+' closed before branch frame: '+repr(plain(raw[-1500:])))
+                    buffer = key.data[1]
+                    buffer.extend(chunk)
+                    while b'\n' in buffer:
+                        line,_,rest = buffer.partition(b'\n')
+                        buffer[:] = rest
+                        if kind == 'mock':
+                            envelope = json.loads(line)
+                            command = envelope.get('command',{})
+                            name = command.get('type','')
+                            if name in ('shutdown','list'): raise AssertionError('unexpected supervisor replacement')
+                            if name == 'attach': value = attach(envelope['id'],str(cwd))
+                            else:
+                                data = {'contextUsage':{'tokens':0,'contextWindow':200000},'cost':0} if name == 'get_session_stats' else {}
+                                value = {'type':'response','id':envelope['id'],'command':name,'success':True,'data':data}
+                            send(key.fileobj,value)
+                        elif kind == 'git':
+                            assert line == b'GIT_WAIT', line
+                            assert gate is None, 'second Git branch lookup'
+                            gate = key.fileobj
+                        elif kind in ('observer','footer_receipt'):
+                            if line.startswith(b'PARKED:'):
+                                parked = True
+                            elif line.startswith(b'FOOTER_SENT:'):
+                                assert line == b'FOOTER_SENT:fix4wake', 'Git branch not real: '+repr(line)
+                                footer_sent = True
+                            elif line.startswith(b'ARM:'):
+                                if not released: raise AssertionError('selected arm before gate release: '+repr(line))
+                                if not footer_arm and line != b'ARM:footer':
+                                    raise AssertionError('unrelated ready arm before footer: '+repr(line))
+                                if line == b'ARM:footer': footer_arm = True
+            if gate is not None and parked and not released and b'pa4-footer-dir' in plain(raw):
+                assert branch not in plain(raw), 'branch already painted before Git result'
+                print('INITIAL_HEX='+bytes(raw).hex(),flush=True)
+                gate.sendall(b'R')
+                sel.unregister(gate)
+                gate.close()
+                released = True
+            if released and footer_sent and footer_arm and branch in plain(raw):
+                print('FINAL_HEX='+bytes(raw).hex(),flush=True)
+                print('PATH_FRAME=1 PARKED=1 FOOTER_SENT=1 FIRST_ARM=footer BRANCH_FRAME=1',flush=True)
+                break
+        else:
+            raise AssertionError('branch frame absent after eligible parked select; parked=%s gate=%s released=%s footer_sent=%s arm=%s raw=%r' %
+                                 (parked,bool(gate),released,footer_sent,footer_arm,(len(raw),plain(raw)[-400:])))
+except Exception:
+    traceback.print_exc()
+    sys.exit(1)
+finally:
+    if child:
+        try: os.killpg(child,signal.SIGKILL)
+        except ProcessLookupError: pass
+        os.waitpid(child,0)
+    for key in list(sel.get_map().values()):
+        sel.unregister(key.fileobj)
+        if isinstance(key.fileobj,int):
+            os.close(key.fileobj)
+        else:
+            key.fileobj.close()
+    sel.close()
+"##;
+}
+
+#[cfg(all(test, unix))]
+mod shell_cancel_terminal_tests {
+    use super::{
+        apply_startup_chrome, mpsc, AgentView, ExitGuard, Renderer, ShellTerminalGuard, UiInput,
+        UiMode,
+    };
+    use std::io::{Read, Write};
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+
+    fn run_child() {
+        let (observer_tx, observer_rx) = std::sync::mpsc::channel::<String>();
+        crate::input::install_reader_recorder(observer_tx.clone());
+        let observer_socket = std::env::var("PA_CANCEL_OBSERVER").expect("observer socket");
+        let _reporter = std::thread::spawn(move || {
+            let mut stream =
+                std::os::unix::net::UnixStream::connect(observer_socket).expect("observer connect");
+            for message in observer_rx {
+                writeln!(stream, "{message}").expect("observer write");
+            }
+        });
+        let (control_tx, mut control_rx) = tokio::sync::mpsc::unbounded_channel();
+        let control_socket = std::env::var("PA_CANCEL_CONTROL").expect("control socket");
+        let _controller = std::thread::spawn(move || {
+            let mut stream =
+                std::os::unix::net::UnixStream::connect(control_socket).expect("control connect");
+            let mut command = [0];
+            while stream.read_exact(&mut command).is_ok() {
+                control_tx.send(command[0]).expect("control receiver");
+            }
+        });
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async move {
+            let options = super::super::tests::options(super::super::ModelSelection::default());
+            let mut view = AgentView::new(crate::app::load_theme(&options.theme));
+            apply_startup_chrome(&mut view, &options);
+            let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
+            let mounted = Arc::new(AtomicBool::new(false));
+            let mut renderer = Renderer::setup(UiMode::Terminal, ui_tx, ExitGuard::new(), true, &mounted)
+                .expect("terminal renderer");
+            if let Renderer::Terminal { term, .. } = &mut renderer {
+                crate::app::draw(term, &mut view).expect("first terminal draw");
+            }
+            observer_tx.send("DRAWN".into()).expect("draw receipt");
+            let mut shell = Box::pin(async {
+                let guard = ShellTerminalGuard::start(&mut renderer, &mut view).expect("shell handoff");
+                let gate = std::env::var("PA_CANCEL_SHELL_GATE").expect("shell gate");
+                let script = format!("exec /usr/bin/python3 -c 'import socket,os; s=socket.socket(socket.AF_UNIX); s.connect(\"{gate}\"); s.sendall(b\"SHELL_READY\\n\"); s.recv(1)'");
+                let outcome = crate::shell_session::run_shell_session(crate::shell_session::ShellSessionOptions {
+                    shell: "/bin/sh".into(), shell_args: vec!["-c".into(), script],
+                    cwd: options.cwd,
+                }).await.expect("shell run");
+                guard.finish().expect("normal finish must not run before cancellation");
+                outcome
+            });
+            tokio::select! {
+                outcome = shell.as_mut() => panic!("shell completed before cancellation: {:?}", outcome.exit_code),
+                command = control_rx.recv() => assert_eq!(command, Some(b'C'), "cancel instruction"),
+            }
+            drop(shell);
+            observer_tx.send("RESTORED".into()).expect("restored receipt");
+            let mut received = String::new();
+            while received != "N0NC3" {
+                let input = ui_rx.recv().await.expect("reader input");
+                if let UiInput::Key(key) = input {
+                    if let crossterm::event::KeyCode::Char(ch) = key.code {
+                        received.push(ch);
+                    }
+                }
+            }
+            observer_tx.send(format!("NONCE:{received}")).expect("nonce receipt");
+            assert_eq!(control_rx.recv().await, Some(b'T'), "teardown instruction");
+            crate::input::stop_reader();
+            observer_tx.send("TEARDOWN".into()).expect("teardown receipt");
+            std::future::pending::<()>().await;
+        });
+    }
+
+    #[test]
+    fn cancelling_inner_shell_future_restores_terminal_and_exactly_one_reader() {
+        if std::env::var_os("PA_CANCEL_CHILD").is_some() {
+            run_child();
+            return;
+        }
+        let result = std::process::Command::new("python3")
+            .arg("-c")
+            .arg(PY_CANCEL_DRIVER)
+            .arg(std::env::current_exe().expect("unit binary"))
+            .output()
+            .expect("run controlling PTY controller");
+        assert!(
+            result.status.success(),
+            "cancellation PTY controller failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+
+    const PY_CANCEL_DRIVER: &str = r"import fcntl, os, pty, selectors, signal, socket, struct, sys, tempfile, termios, time, traceback
+from pathlib import Path
+
+sel=selectors.DefaultSelector()
+raw=bytearray()
+readers={'CREATED':[], 'STARTED':[], 'ENDED':[]}
+control=None
+observer=None
+observer_registered=False
+shell_gate=None
+shell_ready=False
+restored=False
+nonce=False
+teardown=False
+cancel_sent=False
+nonce_sent=False
+teardown_sent=False
+signal_sent=False
+tail_seen=False
+child=None
+outcome=None
+
+def listen(path,kind):
+    listener=socket.socket(socket.AF_UNIX)
+    listener.bind(str(path)); listener.listen(2); listener.setblocking(False)
+    sel.register(listener,selectors.EVENT_READ,(kind+'_accept',bytearray()))
+
+def modes(fd):
+    flags=termios.tcgetattr(fd)[3]
+    return tuple(bool(flags&mode) for mode in (termios.ICANON,termios.ECHO,termios.ISIG))
+
+def require_readers(phase,created,started,ended):
+    assert tuple(len(readers[k]) for k in ('CREATED','STARTED','ENDED'))==(created,started,ended), (phase,readers)
+    assert readers['CREATED']==readers['STARTED'] or set(readers['CREATED'])==set(readers['STARTED']), (phase,readers)
+    assert len(set(readers['CREATED']))==created, (phase,readers)
+    assert set(readers['ENDED'])==set(readers['CREATED'][:ended]), (phase,readers)
+
+try:
+    with tempfile.TemporaryDirectory(prefix='pa4-cancel-',dir='/tmp') as private:
+        base=Path(private)
+        listen(base/'observe.sock','observer')
+        listen(base/'control.sock','control')
+        listen(base/'shell.sock','shell_gate')
+        env={'PATH':'/usr/bin:/bin','HOME':str(base),'TMPDIR':str(base),
+             'XDG_CONFIG_HOME':str(base/'config'),'XDG_DATA_HOME':str(base/'data'),
+             'XDG_CACHE_HOME':str(base/'cache'),'TERM':'xterm-256color',
+             'TERM_PROGRAM':'kitty','LANG':'C.UTF-8','DO_NOT_TRACK':'1','RLM_DEPTH':'0',
+             'PA_CANCEL_CHILD':'1','PA_CANCEL_OBSERVER':str(base/'observe.sock'),
+             'PA_CANCEL_CONTROL':str(base/'control.sock'),'PA_CANCEL_SHELL_GATE':str(base/'shell.sock')}
+        child,master=pty.fork()
+        if child==0:
+            fcntl.ioctl(1,termios.TIOCSWINSZ,struct.pack('HHHH',24,80,0,0))
+            os.chdir(base)
+            os.execve(sys.argv[1],[sys.argv[1],'--exact',
+                'interactive::run::shell_cancel_terminal_tests::cancelling_inner_shell_future_restores_terminal_and_exactly_one_reader',
+                '--nocapture','--test-threads=1'],env)
+        os.set_blocking(master,False)
+        sel.register(master,selectors.EVENT_READ,('pty',bytearray()))
+        deadline=time.monotonic()+15
+        while time.monotonic()<deadline:
+            for key,_ in sel.select(deadline-time.monotonic()):
+                kind,buffer=key.data
+                if kind.endswith('_accept'):
+                    conn,_=key.fileobj.accept(); conn.setblocking(False)
+                    if kind=='observer_accept':
+                        observer=conn  # Queue real reader receipts until shell and control are ready.
+                    else:
+                        sel.register(conn,selectors.EVENT_READ,(kind[:-7],bytearray()))
+                        if kind=='control_accept': control=conn
+                        else: shell_gate=conn
+                    continue
+                if kind=='pty':
+                    try: chunk=os.read(master,8192)
+                    except OSError: chunk=b''
+                    if not chunk:
+                        if not signal_sent: raise AssertionError('PTY closed before final signal: '+repr(raw[-900:]))
+                        _,status=os.waitpid(child,0); child=None
+                        assert os.WIFSIGNALED(status) and os.WTERMSIG(status)==signal.SIGINT, status
+                        outcome='signal_exit_SIGINT'
+                        break
+                    raw.extend(chunk)
+                    continue
+                try: chunk=key.fileobj.recv(8192)
+                except BlockingIOError: continue
+                if not chunk:
+                    if (kind=='shell_gate' and cancel_sent) or (signal_sent and kind in ('control','observer')):
+                        sel.unregister(key.fileobj); key.fileobj.close(); continue
+                    raise AssertionError(kind+' closed early: '+repr((signal_sent,cancel_sent,restored,nonce,teardown,readers,raw[-900:])))
+                buffer.extend(chunk)
+                while b'\n' in buffer:
+                    line,_,remaining=buffer.partition(b'\n'); buffer[:]=remaining
+                    if kind=='shell_gate':
+                        assert line==b'SHELL_READY',line
+                        shell_ready=True
+                    elif kind=='observer':
+                        if line.startswith(b'READER:'):
+                            _,event,tid=line.decode().split(':',2)
+                            readers[event].append(tid)
+                        elif line==b'RESTORED':
+                            restored=True
+                            assert modes(master)==(False,False,False), ('TUI not raw after inner drop',modes(master))
+                        elif line==b'NONCE:N0NC3': nonce=True
+                        elif line==b'TEARDOWN': teardown=True
+                        elif line!=b'DRAWN': raise AssertionError('unexpected observation '+repr(line))
+            if outcome: break
+            if shell_ready and control is not None and observer is not None and not observer_registered:
+                sel.register(observer,selectors.EVENT_READ,('observer',bytearray()))
+                observer_registered=True
+            handoff_tokens=(b'\x1b[?1049l',b'\x1b[?25h',b'\x1b[?2004l',b'\x1b[?1002l')
+            if (shell_ready and not cancel_sent and control is not None
+                    and observer_registered and all(len(readers[k])>=1 for k in readers)
+                    and all(token in raw for token in handoff_tokens)):
+                require_readers('before cancellation',1,1,1)
+                assert modes(master)==(True,True,True), ('shell not cooked',modes(master))
+                kitty_push=b'\x1b[>7u'
+                activation=raw.find(kitty_push)
+                assert activation>=0, 'actual startup Kitty activation missing'
+                handoff_start=activation+len(kitty_push)
+                leave=raw.find(b'\x1b[?1049l',handoff_start)
+                assert leave>=0, 'alt-screen leave after startup Kitty activation missing'
+                tail_seen=b'\x1b[?2026l' in raw[leave+len(b'\x1b[?1049l'):]
+                if tail_seen:
+                    assert b'\x1b[<u' in raw[handoff_start:], ('Kitty not disabled before shell',raw[handoff_start:])
+                    restore_offset=len(raw)
+                    control.sendall(b'C'); cancel_sent=True
+            if restored and not nonce_sent and len(readers['STARTED']) >= 2:
+                if all(token in raw[restore_offset:] for token in
+                       (b'\x1b[?1049h',b'\x1b[?25l',b'\x1b[?2004h',b'\x1b[>7u',b'\x1b[?1002h')):
+                    require_readers('after cancellation',2,2,1)
+                    assert modes(master)==(False,False,False), ('TUI not raw',modes(master))
+                    os.write(master,b'N0NC3'); nonce_sent=True
+            if nonce and not teardown_sent:
+                require_readers('nonce delivered',2,2,1)
+                control.sendall(b'T'); teardown_sent=True
+            if teardown and not signal_sent:
+                require_readers('final teardown',2,2,2)
+                os.kill(child,signal.SIGINT); signal_sent=True
+        assert outcome=='signal_exit_SIGINT', ('deadline',shell_ready,tail_seen,cancel_sent,restored,nonce,teardown,signal_sent,readers,repr(raw[-500:]))
+        print('SHELL_COOKED=1 CANCEL_INNER=1 TUI_RAW=1 MODES_REARMED=1 NONCE=1 CREATED=2 STARTED=2 ENDED=2 SIGINT_EXIT=1',flush=True)
+except Exception:
+    traceback.print_exc(); sys.exit(1)
+finally:
+    if child:
+        try: os.killpg(child,signal.SIGKILL)
+        except ProcessLookupError: pass
+        os.waitpid(child,0)
+    if observer is not None and not observer_registered:
+        observer.close()
+    for key in list(sel.get_map().values()):
+        sel.unregister(key.fileobj)
+        if isinstance(key.fileobj,int):
+            os.close(key.fileobj)
+        else:
+            key.fileobj.close()
+    sel.close()
+";
 }

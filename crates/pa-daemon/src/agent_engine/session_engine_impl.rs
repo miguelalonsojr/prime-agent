@@ -11,6 +11,34 @@ use super::{
 };
 
 impl SessionEngine for AgentSessionEngine {
+    fn kernel_cwd(&self) -> Option<std::path::PathBuf> {
+        self.kernel_cwd_probe
+            .lock()
+            .expect("kernel cwd probe lock")
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+            .map(|owner| owner.kernel_cwd())
+    }
+
+    fn set_kernel_cwd(
+        &self,
+        dir: std::path::PathBuf,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = anyhow::Result<std::path::PathBuf>> + Send + '_>,
+    > {
+        Box::pin(async move {
+            let model = self.resolve_model()?;
+            self.ensure_core_session_async(&model).await?;
+            let core = self
+                .session
+                .lock()
+                .await
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("Session kernel unavailable"))?;
+            core.session.set_kernel_cwd(&dir).await
+        })
+    }
+
     /// Withdraw the queued minted goal-context turns so a state change leaves nothing stale to run.
     fn purge_queued_goal_contexts(&self) {
         let purge = self

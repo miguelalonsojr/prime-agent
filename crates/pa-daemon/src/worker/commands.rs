@@ -77,6 +77,7 @@ impl Worker {
             "abort_and_clear_queue" => self.handle_abort_and_clear_queue(),
             "get_last_assistant_text" => self.handle_get_last_assistant_text(),
             "get_connection_state" => self.handle_get_connection_state(),
+            "set_kernel_cwd" => self.handle_set_kernel_cwd(payload).await,
             "get_mcp_connections" => self.handle_get_mcp_connections().await,
             "set_mcp_static_token" => self.handle_set_mcp_static_token(payload).await,
             "remove_mcp_connection" => self.handle_remove_mcp_connection(payload).await,
@@ -165,6 +166,27 @@ impl Worker {
                 &format!("Unknown worker command: {other}"),
                 None,
             ),
+        }
+    }
+
+    async fn handle_set_kernel_cwd(&self, payload: &Value) -> DaemonResponse {
+        if let Err(response) = self.require_created("set_kernel_cwd") {
+            return response;
+        }
+        let active_session_id = payload.get("activeSessionId").and_then(Value::as_str);
+        if active_session_id != Some(self.config.active_session_id.as_str()) {
+            return response_failure(None, "set_kernel_cwd", "Unknown active session", None);
+        }
+        let Some(dir) = payload.get("dir").and_then(Value::as_str) else {
+            return response_failure(None, "set_kernel_cwd", "Missing kernel directory", None);
+        };
+        match self
+            .engine
+            .set_kernel_cwd(std::path::PathBuf::from(dir))
+            .await
+        {
+            Ok(_) => response_success(None, "set_kernel_cwd", None),
+            Err(error) => response_failure(None, "set_kernel_cwd", &error.to_string(), None),
         }
     }
 

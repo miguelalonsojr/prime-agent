@@ -166,6 +166,7 @@ impl PeerGrantStore {
         &self,
         presented: &DaemonPeerCommand,
         context: &GrantContext,
+        live_issuer_generation: Option<&str>,
         now_ms: u64,
     ) -> Result<DaemonWorkerPeerGrant, &'static str> {
         let DaemonPeerCommand::PeerAuth {
@@ -191,6 +192,7 @@ impl PeerGrantStore {
             && purpose.as_str() == grant.purpose.as_str()
             && peer_purpose_valid(&grant.purpose)
             && expires_ok
+            && live_issuer_generation == Some(grant.issuer_generation.as_str())
         {
             return Ok(grant);
         }
@@ -284,21 +286,29 @@ impl Worker {
             }
         };
         let context = self.grant_context();
-        match self
-            .peer_grants
-            .authenticate(&presentation, &context, crate::util::now_ms())
-        {
-            Ok(grant) => {
+        let authenticated = {
+            let live = self.supervisor_generation_claim.lock().unwrap();
+            let generation = live.as_ref().map(|claim| claim.generation.as_str());
+            // The role promotion remains in the same synchronous claim window
+            // as grant consumption: a final supervisor drop cannot interleave.
+            let result = self.peer_grants.authenticate(
+                &presentation,
+                &context,
+                generation,
+                crate::util::now_ms(),
+            );
+            if let Ok(grant) = &result {
                 let session = Arc::new(PeerSession::new(grant.clone()));
                 *role.lock().unwrap() = if grant.purpose == PEER_PURPOSE_WORKER {
-                    ConnectionRole::PeerWorker {
-                        session: Arc::clone(&session),
-                    }
+                    ConnectionRole::PeerWorker { session }
                 } else {
-                    ConnectionRole::SessionClient {
-                        session: Arc::clone(&session),
-                    }
+                    ConnectionRole::SessionClient { session }
                 };
+            }
+            result
+        };
+        match authenticated {
+            Ok(grant) => {
                 let success = response_success(
                     Some(request_id),
                     "peer_auth",
@@ -406,11 +416,46 @@ mod tests {
             .register(grant(&soon(NOW, 10_000)), &context, "sup:1", NOW)
             .expect("register");
         let admitted = store
-            .authenticate(&peer_auth("secret"), &context, NOW)
+            .authenticate(&peer_auth("secret"), &context, Some("sup:1"), NOW)
             .expect("auth");
         assert_eq!(admitted.active_session_id, "abc123");
-        let replay = store.authenticate(&peer_auth("secret"), &context, NOW);
+        let replay = store.authenticate(&peer_auth("secret"), &context, Some("sup:1"), NOW);
         assert_eq!(replay.unwrap_err(), PEER_AUTH_FAILED);
+    }
+
+    #[test]
+    fn grant_burns_when_supervisor_generation_is_replaced_or_lost() {
+        for live_generation in [Some("sup:2"), None] {
+            for purpose in [PEER_PURPOSE_SESSION_CLIENT, PEER_PURPOSE_WORKER] {
+                let store = PeerGrantStore::new();
+                let context = grant_context();
+                let mut issued = grant(&soon(NOW, 10_000));
+                issued.purpose = purpose.to_string();
+                store
+                    .register(issued, &context, "sup:1", NOW)
+                    .expect("register");
+                let mut presentation = peer_auth("secret");
+                let DaemonPeerCommand::PeerAuth {
+                    purpose: presented_purpose,
+                    ..
+                } = &mut presentation;
+                *presented_purpose = purpose.to_string();
+                assert_eq!(
+                    store
+                        .authenticate(&presentation, &context, live_generation, NOW)
+                        .unwrap_err(),
+                    PEER_AUTH_FAILED,
+                    "a {purpose} grant must fail against {live_generation:?}"
+                );
+                assert_eq!(
+                    store
+                        .authenticate(&presentation, &context, Some("sup:1"), NOW)
+                        .unwrap_err(),
+                    PEER_AUTH_FAILED,
+                    "failed authentication consumes the grant"
+                );
+            }
+        }
     }
 
     #[test]
@@ -422,14 +467,14 @@ mod tests {
             .expect("register");
         assert_eq!(
             store
-                .authenticate(&peer_auth("wrong"), &context, NOW)
+                .authenticate(&peer_auth("wrong"), &context, Some("sup:1"), NOW)
                 .unwrap_err(),
             PEER_AUTH_FAILED
         );
         // Burned by the failed attempt: the correct token no longer works.
         assert_eq!(
             store
-                .authenticate(&peer_auth("secret"), &context, NOW)
+                .authenticate(&peer_auth("secret"), &context, Some("sup:1"), NOW)
                 .unwrap_err(),
             PEER_AUTH_FAILED
         );
@@ -445,7 +490,7 @@ mod tests {
         let later = NOW + 10_001;
         assert_eq!(
             store
-                .authenticate(&peer_auth("secret"), &context, later)
+                .authenticate(&peer_auth("secret"), &context, Some("sup:1"), later)
                 .unwrap_err(),
             PEER_AUTH_FAILED
         );
@@ -539,7 +584,7 @@ mod tests {
         *stale_id = "live-0".to_string();
         assert_eq!(
             store
-                .authenticate(&stale_auth, &context, later)
+                .authenticate(&stale_auth, &context, Some("sup:1"), later)
                 .unwrap_err(),
             PEER_AUTH_FAILED
         );
@@ -591,12 +636,12 @@ mod tests {
         } = &mut presentation;
         *auth_purpose = "worker".to_string();
         let admitted = store
-            .authenticate(&presentation, &context, NOW)
+            .authenticate(&presentation, &context, Some("sup:1"), NOW)
             .expect("worker grant authenticates");
         assert_eq!(admitted.purpose, "worker");
         assert_eq!(
             store
-                .authenticate(&presentation, &context, NOW)
+                .authenticate(&presentation, &context, Some("sup:1"), NOW)
                 .unwrap_err(),
             PEER_AUTH_FAILED
         );

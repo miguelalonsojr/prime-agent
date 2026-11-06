@@ -43,6 +43,455 @@ mod recorded_process_tests {
     }
 }
 
+#[cfg(test)]
+mod ordinary_identity_tests {
+    use super::*;
+    use crate::descriptor::persist_worker;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ordinary_identity_mismatch_refuses_both_admission_orders() {
+        run_mismatch_order(false, "stale-worker").await;
+        run_mismatch_order(true, "stale-worker").await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ordinary_identity_mismatch_scan_first() {
+        run_mismatch_order(false, "stale-worker").await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ordinary_identity_mismatch_registration_first() {
+        run_mismatch_order(true, "stale-worker").await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ordinary_identity_refusal_never_self_retires_for_opaque_worker_id() {
+        run_mismatch_order(true, "Unknown session worker").await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unavailable_identity_observation_preserves_authenticated_adoption() {
+        for registration_first in [false, true] {
+            run_authenticated_adoption(registration_first, Some("recorded"), &[None]).await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn matching_or_missing_recorded_identity_adopts_once() {
+        for registration_first in [false, true] {
+            run_authenticated_adoption(registration_first, Some("matching"), &[Some("matching")])
+                .await;
+            run_authenticated_adoption(registration_first, None, &[Some("observed")]).await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn registration_reuses_pid_bound_admission_observation() {
+        run_authenticated_adoption(true, Some("recorded"), &[None, Some("different")]).await;
+        run_authenticated_adoption(
+            true,
+            Some("recorded"),
+            &[Some("recorded"), Some("different")],
+        )
+        .await;
+    }
+
+    #[cfg(unix)]
+    async fn run_authenticated_adoption(
+        registration_first: bool,
+        expected: Option<&str>,
+        observations: &[Option<&str>],
+    ) {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let supervisor = Arc::new(
+            Supervisor::new(super::super::SupervisorOptions {
+                socket_path: dir.path().join("daemon.sock"),
+                agent_dir: dir.path().join("agent"),
+            })
+            .expect("supervisor"),
+        );
+        let worker_id = "authenticated-worker";
+        let path = supervisor.descriptor_dir.join(format!("{worker_id}.json"));
+        let socket_path = dir.path().join("worker.sock");
+        let descriptor: crate::descriptor::WorkerDescriptor = serde_json::from_value(json!({
+            "version": 2, "workerId": worker_id, "pid": std::process::id(),
+            "processStartId": expected,
+            "socketPath": socket_path.to_string_lossy(),
+            "supervisorSocketPath": supervisor.options.socket_path.to_string_lossy(),
+            "recoveryJournalPath": dir.path().join("recovery.jsonl").to_string_lossy(),
+            "authenticationToken": "original-token", "rootActiveSessionId": worker_id,
+            "createdAt": "t", "updatedAt": "t", "lifecycle": "ready",
+            "createCommand": {}, "consecutiveFailures": 0,
+        }))
+        .expect("descriptor");
+        persist_worker(&path, &descriptor).expect("persist descriptor");
+        let sequence: Vec<Option<String>> = observations
+            .iter()
+            .map(|observation| observation.map(str::to_string))
+            .collect();
+        let probe_index = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let next_probe = Arc::clone(&probe_index);
+        *supervisor.process_start_id_observer.lock().unwrap() = Some(Arc::new(move |_| {
+            let index = next_probe.fetch_add(1, Ordering::SeqCst);
+            sequence
+                .get(index)
+                .or_else(|| sequence.last())
+                .cloned()
+                .flatten()
+        }));
+        let listener =
+            tokio::net::UnixListener::bind(&socket_path).expect("bind authenticated worker");
+        let worker = tokio::spawn(async move {
+            if !registration_first {
+                // The scan's liveness probe connects before the authenticated channel.
+                let (probe, _) = listener.accept().await.expect("scan socket probe");
+                drop(probe);
+            }
+            let (mut stream, _) = listener.accept().await.expect("supervisor authenticates");
+            loop {
+                let frame = {
+                    let mut reader = crate::framing::PrivateFrameReader::new(
+                        &mut stream,
+                        crate::framing::DEFAULT_PRIVATE_FRAME_LIMITS,
+                    );
+                    reader
+                        .read_frame()
+                        .await
+                        .expect("worker frame")
+                        .expect("live supervisor channel")
+                };
+                let command = frame.header["commandType"].as_str().expect("command type");
+                assert!(
+                    matches!(command, "worker_auth" | "get_state"),
+                    "no stop, retirement or shutdown command: {command}"
+                );
+                if command == "worker_auth" {
+                    let payload: Value =
+                        serde_json::from_slice(&frame.payload).expect("auth payload");
+                    assert_eq!(payload["token"], "original-token");
+                }
+                let response = DaemonResponse {
+                    id: None,
+                    command: command.into(),
+                    success: true,
+                    data: Some(if command == "worker_auth" {
+                        json!({"capabilities": ["agent_roster"]})
+                    } else {
+                        json!({"id": worker_id, "activeSessionId": worker_id,
+                            "sessionId": worker_id, "cwd": dir.path().to_string_lossy()})
+                    }),
+                    error: None,
+                    error_info: None,
+                };
+                crate::framing::write_frame(
+                    &mut stream,
+                    &json!({"kind": "outbound", "requestId": frame.header["requestId"],
+                        "outboundType": "response"}),
+                    &crate::protocol::response_line_bytes(&response),
+                    crate::framing::DEFAULT_PRIVATE_FRAME_LIMITS,
+                )
+                .await
+                .expect("reply to supervisor");
+            }
+        });
+        let registration = DaemonCommand::WorkerRegister {
+            id: None,
+            active_session_id: worker_id.into(),
+            session_id: None,
+            socket_path: descriptor.socket_path.clone(),
+            worker_instance_id: String::new(),
+            token: descriptor.authentication_token.clone(),
+            pid: descriptor.pid,
+            rest: super::super::Map::default(),
+        };
+        if registration_first {
+            let response = supervisor
+                .handle_worker_register("r", "worker_register", &registration)
+                .await;
+            assert!(response.success, "authenticated registration: {response:?}");
+            assert!(matches!(
+                supervisor
+                    .adopt_persisted_worker(
+                        path.clone(),
+                        descriptor.clone(),
+                        AdoptionBoot::PlainStartup
+                    )
+                    .await,
+                AdoptionOutcome::AdoptedLive
+            ));
+        } else {
+            assert!(matches!(
+                supervisor
+                    .adopt_persisted_worker(
+                        path.clone(),
+                        descriptor.clone(),
+                        AdoptionBoot::PlainStartup
+                    )
+                    .await,
+                AdoptionOutcome::AdoptedLive
+            ));
+            let response = supervisor
+                .handle_worker_register("r", "worker_register", &registration)
+                .await;
+            assert!(response.success, "authenticated registration: {response:?}");
+        }
+        let resident = supervisor
+            .registry
+            .get(worker_id)
+            .await
+            .expect("one admitted resident");
+        assert_eq!(supervisor.registry.list().await.len(), 1);
+        assert_eq!(
+            resident.monitor_epoch.load(Ordering::SeqCst),
+            1,
+            "one monitor owns the process"
+        );
+        assert_eq!(
+            resident.descriptor.lock().await.process_start_id.as_deref(),
+            observations.first().copied().flatten().or(expected),
+            "the admitted observation, not a later probe, determines the recorded identity"
+        );
+        if observations.len() > 1 {
+            assert_eq!(
+                probe_index.load(Ordering::SeqCst),
+                1,
+                "persisted registration reuses the one PID-bound admission observation"
+            );
+        }
+        worker.abort();
+        let _ = worker.await;
+    }
+
+    #[cfg(unix)]
+    async fn run_mismatch_order(registration_first: bool, worker_id: &str) {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let agent_dir = dir.path().join("agent");
+        let supervisor = Arc::new(
+            Supervisor::new(super::super::SupervisorOptions {
+                socket_path: dir.path().join("daemon.sock"),
+                agent_dir,
+            })
+            .expect("supervisor"),
+        );
+        let path = supervisor.descriptor_dir.join(format!("{worker_id}.json"));
+        let descriptor: crate::descriptor::WorkerDescriptor = serde_json::from_value(json!({
+            "version": 2, "workerId": worker_id, "pid": std::process::id(),
+            "processStartId": "known-recycled-identity",
+            "socketPath": dir.path().join("worker.sock").to_string_lossy(),
+            "supervisorSocketPath": supervisor.options.socket_path.to_string_lossy(),
+            "recoveryJournalPath": dir.path().join("recovery.jsonl").to_string_lossy(),
+            "authenticationToken": "original-token", "rootActiveSessionId": worker_id,
+            "createdAt": "2026-09-23T00:00:00Z", "updatedAt": "2026-09-23T00:00:00Z",
+            "lifecycle": "ready", "createCommand": {}, "consecutiveFailures": 0
+        }))
+        .expect("descriptor");
+        persist_worker(&path, &descriptor).expect("persist original descriptor");
+        let listener = tokio::net::UnixListener::bind(&descriptor.socket_path)
+            .expect("bind still-live worker socket");
+        let received_frames = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let worker_frames = Arc::clone(&received_frames);
+        let worker = tokio::spawn(async move {
+            let mut connections = tokio::task::JoinSet::new();
+            loop {
+                let (mut stream, _) = listener.accept().await.expect("worker accepts");
+                let frames = Arc::clone(&worker_frames);
+                connections.spawn(async move {
+                    loop {
+                        let frame = {
+                            let mut reader = crate::framing::PrivateFrameReader::new(
+                                &mut stream,
+                                crate::framing::DEFAULT_PRIVATE_FRAME_LIMITS,
+                            );
+                            let Some(frame) = reader.read_frame().await.expect("worker frame")
+                            else {
+                                return; // The scan's liveness-only connection.
+                            };
+                            frame
+                        };
+                        frames.fetch_add(1, Ordering::SeqCst);
+                        let command = frame.header["commandType"]
+                            .as_str()
+                            .expect("worker command");
+                        assert!(
+                            matches!(command, "worker_auth" | "get_state"),
+                            "mismatched worker received control frame: {command}"
+                        );
+                        if command == "worker_auth" {
+                            let payload: Value =
+                                serde_json::from_slice(&frame.payload).expect("auth payload");
+                            assert_eq!(payload["token"], "original-token");
+                        }
+                        let response = DaemonResponse {
+                            id: None,
+                            command: command.into(),
+                            success: true,
+                            data: Some(if command == "worker_auth" {
+                                json!({"capabilities": ["agent_roster"]})
+                            } else {
+                                json!({"id": "stale-worker", "activeSessionId": "stale-worker"})
+                            }),
+                            error: None,
+                            error_info: None,
+                        };
+                        crate::framing::write_frame(
+                            &mut stream,
+                            &json!({"kind": "outbound", "requestId": frame.header["requestId"],
+                                "outboundType": "response"}),
+                            &crate::protocol::response_line_bytes(&response),
+                            crate::framing::DEFAULT_PRIVATE_FRAME_LIMITS,
+                        )
+                        .await
+                        .expect("worker answers");
+                    }
+                });
+            }
+        });
+        let registration = DaemonCommand::WorkerRegister {
+            id: None,
+            active_session_id: worker_id.into(),
+            session_id: None,
+            socket_path: descriptor.socket_path.clone(),
+            worker_instance_id: String::new(),
+            token: descriptor.authentication_token.clone(),
+            pid: descriptor.pid,
+            rest: super::super::Map::default(),
+        };
+        let (entered_tx, mut entered_rx) = tokio::sync::oneshot::channel();
+        let entered_tx = std::sync::Mutex::new(Some(entered_tx));
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let probe_calls = Arc::clone(&calls);
+        let release_rx = std::sync::Mutex::new(release_rx);
+        *supervisor.process_start_id_observer.lock().unwrap() = Some(Arc::new(move |_| {
+            if probe_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                entered_tx
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .expect("first probe")
+                    .send(())
+                    .expect("test waits for probe");
+                // Dropping the sender also releases the blocking probe when an assertion fails.
+                let _ = release_rx.lock().unwrap().recv();
+            }
+            Some("observed-other-process".into())
+        }));
+        let (waiting_tx, mut waiting_rx) = tokio::sync::oneshot::channel();
+        let waiting_tx = std::sync::Mutex::new(Some(waiting_tx));
+        *supervisor.registry.adoption_wait_observer.lock().unwrap() = Some(Arc::new(move || {
+            waiting_tx
+                .lock()
+                .unwrap()
+                .take()
+                .expect("one pending contender")
+                .send(())
+                .expect("test awaits pending lock");
+        }));
+        let mut first = {
+            let supervisor = Arc::clone(&supervisor);
+            let path = path.clone();
+            let descriptor = descriptor.clone();
+            let registration = registration.clone();
+            tokio::spawn(async move {
+                if registration_first {
+                    let response = supervisor
+                        .handle_worker_register("r", "worker_register", &registration)
+                        .await;
+                    assert!(!response.success, "mismatched registration: {response:?}");
+                    assert!(!format!("{response:?}")
+                        .contains(crate::registration::UNKNOWN_SESSION_WORKER_PREFIX));
+                } else {
+                    assert!(matches!(
+                        supervisor
+                            .adopt_persisted_worker(path, descriptor, AdoptionBoot::PlainStartup)
+                            .await,
+                        AdoptionOutcome::Failed
+                    ));
+                }
+            })
+        };
+        tokio::select! {
+            signal = &mut entered_rx => { signal.expect("probe entered"); }
+            completed = &mut first => panic!("admission completed without guarded identity observation: {completed:?}"),
+        }
+        let mut second = {
+            let supervisor = Arc::clone(&supervisor);
+            let path = path.clone();
+            let descriptor = descriptor.clone();
+            let registration = registration.clone();
+            tokio::spawn(async move {
+                if registration_first {
+                    assert!(matches!(
+                        supervisor
+                            .adopt_persisted_worker(path, descriptor, AdoptionBoot::PlainStartup)
+                            .await,
+                        AdoptionOutcome::Failed
+                    ));
+                } else {
+                    let response = supervisor
+                        .handle_worker_register("r", "worker_register", &registration)
+                        .await;
+                    assert!(!response.success, "mismatched registration: {response:?}");
+                    assert!(!format!("{response:?}")
+                        .contains(crate::registration::UNKNOWN_SESSION_WORKER_PREFIX));
+                }
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                pending = &mut waiting_rx => pending.expect("contender polled the adoption lock Pending"),
+                completed = &mut second => panic!("contender completed before guard contention: {completed:?}"),
+            }
+        })
+        .await
+        .expect("contender must reach the actual pending lock before probe release");
+        assert!(
+            !second.is_finished(),
+            "the contender is still waiting on the adoption guard"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "no second observation before guard release"
+        );
+        release_tx.send(()).expect("release first probe");
+        first.await.expect("first admission task");
+        second.await.expect("second admission task");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "both entrypoints observed under the guard"
+        );
+        assert!(supervisor.registry.get(worker_id).await.is_none());
+        assert_eq!(
+            received_frames.load(Ordering::SeqCst),
+            0,
+            "the disputed worker receives no auth, stop, shutdown or retirement frame"
+        );
+        let failed: crate::descriptor::WorkerDescriptor =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(failed.lifecycle, DaemonWorkerLifecycle::Failed);
+        assert_eq!(failed.pid, descriptor.pid);
+        assert_eq!(failed.process_start_id, descriptor.process_start_id);
+        assert_eq!(failed.authentication_token, descriptor.authentication_token);
+        assert_eq!(failed.socket_path, descriptor.socket_path);
+        assert_eq!(
+            failed.last_error.as_deref(),
+            Some(super::super::ORDINARY_WORKER_IDENTITY_REFUSAL)
+        );
+        assert!(failed.last_failure_at.is_some());
+        worker.abort();
+        let _ = worker.await;
+    }
+}
+
 /// The boot the descriptor-adoption pass runs under. An update boot relaunches kept
 /// workers before the roster restore walks the rows (spec §6 step 2's create-or-adopt
 /// order). A plain startup revives only genuinely interrupted ones — no mass-revival
@@ -173,6 +622,56 @@ impl Supervisor {
         self.spawn_roster_boot_seed();
     }
 
+    /// Observe a process identity off the async executor; test supervisors may
+    /// substitute a local observer to model unavailable and reordered probes.
+    async fn observe_process_start_id(&self, pid: u32) -> Option<String> {
+        #[cfg(test)]
+        let observer = { self.process_start_id_observer.lock().unwrap().clone() };
+        #[cfg(test)]
+        if let Some(observer) = observer {
+            return tokio::task::spawn_blocking(move || observer(pid))
+                .await
+                .ok()
+                .flatten();
+        }
+        tokio::task::spawn_blocking(move || crate::lease::get_process_start_id(pid))
+            .await
+            .ok()
+            .flatten()
+    }
+
+    /// Only positive conflicting process identities refuse ordinary adoption.
+    /// Failure records the verdict without touching the unverified process or its socket.
+    async fn validate_ordinary_worker_identity(
+        &self,
+        resident: &Arc<ResidentWorker>,
+    ) -> Result<Option<String>> {
+        let (pid, expected) = {
+            let descriptor = resident.descriptor.lock().await;
+            (descriptor.pid, descriptor.process_start_id.clone())
+        };
+        let Some(expected) = expected else {
+            return Ok(None);
+        };
+        let Ok(pid) = u32::try_from(pid) else {
+            return Ok(None);
+        };
+        let observed = self.observe_process_start_id(pid).await;
+        if observed
+            .as_deref()
+            .is_none_or(|observed| observed == expected)
+        {
+            return Ok(observed);
+        }
+        let mut descriptor = resident.descriptor.lock().await;
+        descriptor.lifecycle = DaemonWorkerLifecycle::Failed;
+        descriptor.last_error = Some(super::ORDINARY_WORKER_IDENTITY_REFUSAL.into());
+        descriptor.last_failure_at = Some(crate::util::now_iso());
+        crate::descriptor::persist_worker(&resident.descriptor_path, &descriptor)
+            .context("persist worker identity refusal")?;
+        Err(anyhow!(super::ORDINARY_WORKER_IDENTITY_REFUSAL))
+    }
+
     /// Positive owner-death evidence for the recorded pid (the inverse of
     /// the tombstone's [`recorded_process_alive`]): the process is
     /// provably gone, or the pid provably names a different process now.
@@ -261,6 +760,10 @@ impl Supervisor {
         if resident.descriptor.lock().await.stop_requested_at.is_some() {
             self.finish_tombstoned_stop(&resident, alive).await;
             return AdoptionOutcome::Stopped;
+        }
+        if let Err(error) = self.validate_ordinary_worker_identity(&resident).await {
+            self.log_line(&format!("could not adopt worker {worker_id}: {error:#}"));
+            return AdoptionOutcome::Failed;
         }
         // The monitor must watch the process that actually runs, never the
         // descriptor's stale pre-restart pid (a revived worker was once left
@@ -431,16 +934,20 @@ impl Supervisor {
         };
         // Serialize against descriptor adoption for the same worker.
         let guard = self.registry.adoption_guard(active_session_id).await;
-        let (resident, re_arm_monitor) = match self.registry.get(active_session_id).await {
+        let (resident, re_arm_monitor, admission_observation) = match self
+            .registry
+            .get(active_session_id)
+            .await
+        {
             Some(resident) => {
                 // The monitor ownership reads before this registration's
                 // descriptor update overwrites the pid: a registrant naming
                 // a different process than the watched one takes the resident.
                 let pid_changed = resident.descriptor.lock().await.pid != *pid;
-                (resident, pid_changed)
+                (resident, pid_changed, None)
             }
             None => match self.adopt_registered_worker(&registration, token).await {
-                Ok(resident) => (resident, false),
+                Ok((resident, observed)) => (resident, false, Some(observed)),
                 Err(error) => {
                     let message = format!("{error:#}");
                     // The definitive unknown-worker refusal is observable (log + telemetry)
@@ -454,6 +961,13 @@ impl Supervisor {
                     }
                     return fail(&message);
                 }
+            },
+        };
+        let observed_start_id = match admission_observation {
+            Some((recorded_pid, observed)) if recorded_pid == *pid => observed,
+            _ => match u32::try_from(*pid) {
+                Ok(pid) => self.observe_process_start_id(pid).await,
+                Err(_) => None,
             },
         };
         // The registration's durable id is optional on the wire: a re-registering worker
@@ -496,7 +1010,7 @@ impl Supervisor {
             descriptor.pid = *pid;
             // Refresh the identity from the live registrant: a recycled pid must not keep
             // the old holder's identity; an unobservable start id keeps the previous value.
-            if let Some(start_id) = crate::protocol::process_start_id(*pid as u32) {
+            if let Some(start_id) = observed_start_id {
                 descriptor.process_start_id = Some(start_id);
             }
             descriptor.socket_path.clone_from(socket_path);
@@ -599,7 +1113,7 @@ impl Supervisor {
         self: &Arc<Self>,
         registration: &WorkerRegistration,
         token: &str,
-    ) -> Result<Arc<ResidentWorker>> {
+    ) -> Result<(Arc<ResidentWorker>, (u64, Option<String>))> {
         let descriptor_path = self
             .descriptor_dir
             .join(format!("{}.json", registration.active_session_id));
@@ -681,6 +1195,19 @@ impl Supervisor {
                 )
             ));
         }
+        let (recorded_pid, missing_start_id) = {
+            let descriptor = resident.descriptor.lock().await;
+            (descriptor.pid, descriptor.process_start_id.is_none())
+        };
+        let mut observed = self.validate_ordinary_worker_identity(&resident).await?;
+        // A legacy record has no identity to validate; one observation can
+        // initialize it, but only for the same PID that was just read.
+        if missing_start_id && recorded_pid == registration.pid {
+            observed = match u32::try_from(recorded_pid) {
+                Ok(pid) => self.observe_process_start_id(pid).await,
+                Err(_) => None,
+            };
+        }
         self.connect_worker(&resident, worker_connect_deadline())
             .await?;
         // The boot reconciliation: registration rebuilt the resident from the PERSISTED record;
@@ -708,7 +1235,7 @@ impl Supervisor {
         self.log_line(&format!(
             "adopted session worker {worker_id} via self-registration"
         ));
-        Ok(resident)
+        Ok((resident, (recorded_pid, observed)))
     }
 
     /// Record one RLM child admission: the spawn edge in the daemon-owned

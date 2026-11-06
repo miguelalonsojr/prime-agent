@@ -197,6 +197,7 @@ enum StopArm {
 
 struct ProvisionerState {
     manager: Option<ReplKernelManager>,
+    cwd: PathBuf,
     /// Shared result of the in-flight boot. Joined callers retain its manager
     /// even when a concurrent stop takes the provisioner's live owner.
     startup: Option<tokio::sync::watch::Receiver<Option<StartupResult>>>,
@@ -232,6 +233,17 @@ struct ProvisionerState {
     doomed_startups: Vec<tokio::sync::watch::Receiver<Option<StartupResult>>>,
 }
 
+/// A changed effective CWD publication target installed by the owning session engine.
+pub type KernelCwdChangedCallback = Arc<dyn Fn(PathBuf) + Send + Sync>;
+
+/// A successful current-manager CWD readback, after the change decision.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CwdObservationReceipt {
+    pub cwd: PathBuf,
+    pub changed: bool,
+}
+
 /// Owns one kernel for one session: starts it, memoizes the startup so concurrent callers join the
 /// same boot.
 ///
@@ -242,9 +254,14 @@ pub struct IpythonKernelProvisioner {
 }
 
 struct ProvisionerInner {
-    cwd: PathBuf,
     options: IpythonKernelProvisionerOptions,
     state: Mutex<ProvisionerState>,
+    cwd_mutation: tokio::sync::Mutex<()>,
+    cwd_changed_sink: Mutex<Option<KernelCwdChangedCallback>>,
+    #[cfg(any(test, feature = "test-support"))]
+    cwd_observations: tokio::sync::broadcast::Sender<CwdObservationReceipt>,
+    #[cfg(test)]
+    cwd_set_boundary: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     dispose_signal: AbortSignal,
 }
 
@@ -252,10 +269,10 @@ impl IpythonKernelProvisioner {
     pub fn new(cwd: impl Into<PathBuf>, options: IpythonKernelProvisionerOptions) -> Self {
         Self {
             inner: Arc::new(ProvisionerInner {
-                cwd: cwd.into(),
                 options,
                 state: Mutex::new(ProvisionerState {
                     manager: None,
+                    cwd: cwd.into(),
                     startup: None,
                     startup_listeners: Vec::new(),
                     last_startup_message: None,
@@ -266,6 +283,12 @@ impl IpythonKernelProvisioner {
                     pending_stop_for_startup: None,
                     doomed_startups: Vec::new(),
                 }),
+                cwd_mutation: tokio::sync::Mutex::new(()),
+                cwd_changed_sink: Mutex::new(None),
+                #[cfg(any(test, feature = "test-support"))]
+                cwd_observations: tokio::sync::broadcast::channel(8).0,
+                #[cfg(test)]
+                cwd_set_boundary: Mutex::new(None),
                 dispose_signal: AbortSignal::new(),
             }),
         }
@@ -282,6 +305,187 @@ impl IpythonKernelProvisioner {
     #[must_use]
     pub fn manager(&self) -> Option<ReplKernelManager> {
         self.lock_state().manager.clone()
+    }
+
+    /// Register the engine's session-event sink, including after a rebuild.
+    pub fn set_cwd_changed_sink(&self, sink: KernelCwdChangedCallback) {
+        *self
+            .inner
+            .cwd_changed_sink
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(sink);
+    }
+
+    /// Current requested or observed effective kernel directory.
+    #[must_use]
+    pub fn kernel_cwd(&self) -> PathBuf {
+        self.lock_state().cwd.clone()
+    }
+
+    /// Read the current kernel without starting it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the running kernel cannot answer the bounded probe.
+    pub async fn read_kernel_cwd(&self) -> anyhow::Result<Option<PathBuf>> {
+        match self.manager() {
+            Some(manager) => manager.read_kernel_cwd().await,
+            None => Ok(None),
+        }
+    }
+
+    /// Validate and apply a directory to the next boot or the current kernel.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid directory or a failed live kernel change/readback.
+    pub async fn set_kernel_cwd(&self, dir: &Path) -> anyhow::Result<PathBuf> {
+        if !dir.is_absolute() || !dir.is_dir() {
+            return Err(anyhow!(
+                "Kernel CWD must be an existing absolute directory: {}",
+                dir.display()
+            ));
+        }
+        let _mutation = self.inner.cwd_mutation.lock().await;
+        let preboot_change = {
+            let mut state = self.lock_state();
+            if state.disposed {
+                return Err(anyhow!("Kernel provisioner disposed"));
+            }
+            if state.manager.is_none() && state.startup.is_none() {
+                let changed = state.cwd != dir;
+                state.cwd = dir.to_path_buf();
+                Some(changed)
+            } else {
+                None
+            }
+        };
+        if let Some(changed) = preboot_change {
+            #[cfg(test)]
+            self.witness_cwd_set_boundary();
+            if changed {
+                self.emit_kernel_cwd_changed(dir.to_path_buf());
+            }
+            return Ok(dir.to_path_buf());
+        }
+        let manager = self.ensure(None, None).await?;
+        let effective = manager.set_kernel_cwd(dir).await?;
+        #[cfg(test)]
+        self.witness_cwd_set_boundary();
+        let mut state = self.lock_state();
+        if state.disposed
+            || !state
+                .manager
+                .as_ref()
+                .is_some_and(|owned| owned.same_kernel(&manager))
+        {
+            return Err(anyhow!("Kernel changed while setting CWD"));
+        }
+        let changed = state.cwd != effective;
+        state.cwd.clone_from(&effective);
+        drop(state);
+        if changed {
+            self.emit_kernel_cwd_changed(effective.clone());
+        }
+        Ok(effective)
+    }
+
+    fn emit_kernel_cwd_changed(&self, cwd: PathBuf) {
+        let emit = self
+            .inner
+            .cwd_changed_sink
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(emit) = emit {
+            emit(cwd);
+        }
+    }
+
+    #[cfg(test)]
+    fn witness_cwd_set_boundary(&self) {
+        let witness = self.inner.cwd_set_boundary.lock().unwrap().clone();
+        if let Some(witness) = witness {
+            witness();
+        }
+    }
+
+    /// Subscribe before a public cell to observe its successful CWD readback.
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn subscribe_cwd_observations(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<CwdObservationReceipt> {
+        self.inner.cwd_observations.subscribe()
+    }
+
+    /// The active cell holds this callback; use weak owners until its matching Done.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the previous cell remains busy or admission is cancelled.
+    pub async fn public_cell_done_callback(
+        &self,
+        manager: &ReplKernelManager,
+        signal: Option<&AbortSignal>,
+    ) -> anyhow::Result<crate::kernel::shared::PublicCellDoneCallback> {
+        let weak = Arc::downgrade(&self.inner);
+        manager
+            .public_cell_done_callback(signal, move |manager| {
+                let inner = weak.upgrade();
+                async move {
+                    if let Some(inner) = inner {
+                        Self { inner }.observe_kernel_cwd(&manager).await;
+                    }
+                }
+            })
+            .await
+    }
+
+    /// Observe a settled public cell only if this manager still belongs to us.
+    pub async fn observe_kernel_cwd(&self, captured: &ReplKernelManager) {
+        let _mutation = self.inner.cwd_mutation.lock().await;
+        if !self
+            .manager()
+            .is_some_and(|current| current.same_kernel(captured))
+        {
+            return;
+        }
+        let Ok(Some(cwd)) = captured.read_kernel_cwd().await else {
+            return;
+        };
+        let mut state = self.lock_state();
+        if !state
+            .manager
+            .as_ref()
+            .is_some_and(|current| current.same_kernel(captured))
+        {
+            return;
+        }
+        let changed = state.cwd != cwd;
+        if changed {
+            state.cwd.clone_from(&cwd);
+        }
+        drop(state);
+        if changed {
+            let emit = self
+                .inner
+                .cwd_changed_sink
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            if let Some(emit) = emit {
+                #[cfg(any(test, feature = "test-support"))]
+                emit(cwd.clone());
+                #[cfg(not(any(test, feature = "test-support")))]
+                emit(cwd);
+            }
+        }
+        #[cfg(any(test, feature = "test-support"))]
+        let _ = self
+            .inner
+            .cwd_observations
+            .send(CwdObservationReceipt { cwd, changed });
     }
 
     /// The default time limit the kernel executor arms for user cells
@@ -1028,7 +1232,6 @@ async fn start_kernel_impl(
     memo: &tokio::sync::watch::Receiver<Option<StartupResult>>,
 ) -> anyhow::Result<ReplKernelManager> {
     let options = &inner.options;
-    let cwd = inner.cwd.clone();
     let dispose_signal = inner.dispose_signal.clone();
     // The boot-permit closure moves its own clone; the bootstrap below runs
     // on the same shared signal.
@@ -1054,6 +1257,12 @@ async fn start_kernel_impl(
     if let Some(gate) = options.ready_gate.clone() {
         gate().await;
     }
+    let cwd = inner
+        .state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .cwd
+        .clone();
     let snapshot_dir = options.snapshot_dir.clone();
     // The bounded-await default keys on the bash.completed host handler:
     // one source of truth (the registry the daemon registers the notice in).
@@ -1287,6 +1496,24 @@ async fn start_kernel_impl(
     // callbacks under the state lock - the startup-progress listeners
     // already do - and they must not re-enter the provisioner), so a
     // kill() can no longer slip between the check and the notice.
+    // Restored snapshots can carry a different process directory than the
+    // requested startup path; the running kernel is authoritative.
+    if snapshot_existed {
+        if let Ok(Some(restored_cwd)) = manager.read_kernel_cwd().await {
+            let mut state = inner
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !state.disposed
+                && state
+                    .startup
+                    .as_ref()
+                    .is_some_and(|armed| armed.same_channel(memo))
+            {
+                state.cwd = restored_cwd;
+            }
+        }
+    }
     if let Some(restore) = pending_restore {
         let mut state = inner
             .state
@@ -1353,6 +1580,7 @@ mod tests {
             max_tokens_explicit: false,
         };
         let provider = Arc::new(pa_agent::scripted::ScriptedProvider::new(model.clone()));
+        provider.push_text_turn("ok");
         create_session(SessionEngineConfig {
             cwd,
             agent_dir,
@@ -1362,6 +1590,656 @@ mod tests {
             ..Default::default()
         })
         .await
+    }
+
+    fn local_python_provisioner(cwd: PathBuf) -> IpythonKernelProvisioner {
+        let runtime = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../prime-agent-runtime/src")
+            .canonicalize()
+            .unwrap();
+        IpythonKernelProvisioner::new(
+            cwd,
+            IpythonKernelProvisionerOptions {
+                python: Some("python3".into()),
+                env: HashMap::from([("PYTHONPATH".into(), runtime.display().to_string())]),
+                ..Default::default()
+            },
+        )
+    }
+
+    fn pause_next_cwd_publication(
+        provisioner: &IpythonKernelProvisioner,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let entered_tx = Mutex::new(Some(entered_tx));
+        let release_rx = Mutex::new(release_rx);
+        *provisioner.inner.cwd_set_boundary.lock().unwrap() = Some(Arc::new(move || {
+            if let Some(entered) = entered_tx.lock().unwrap().take() {
+                let _ = entered.send(());
+                release_rx.lock().unwrap().recv().unwrap();
+            }
+        }));
+        (entered_rx, release_tx)
+    }
+
+    fn boot_start_witness() -> (
+        KernelBootstrapProgressHandler,
+        tokio::sync::oneshot::Receiver<()>,
+    ) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let tx = Mutex::new(Some(tx));
+        let progress: KernelBootstrapProgressHandler = Arc::new(move |stage| {
+            if stage == "Starting Python kernel..." {
+                if let Some(tx) = tx.lock().unwrap().take() {
+                    let _ = tx.send(());
+                }
+            }
+        });
+        (progress, rx)
+    }
+
+    #[tokio::test]
+    async fn kernel_cwd_observation_finishes_before_the_next_public_cell_is_admitted() {
+        use std::future::Future;
+        use std::task::Poll;
+
+        let root = tempfile::tempdir().unwrap();
+        let first = root.path().join("first");
+        let second = root.path().join("second");
+        std::fs::create_dir(&first).unwrap();
+        std::fs::create_dir(&second).unwrap();
+        let provisioner = local_python_provisioner(root.path().to_path_buf());
+        let manager = provisioner.ensure(None, None).await.unwrap();
+        let mut observations = provisioner.subscribe_cwd_observations();
+        let observation_barrier = provisioner.inner.cwd_mutation.lock().await;
+        manager
+            .execute(
+                &format!("import os; os.chdir({})", serde_json::json!(first)),
+                ExecuteOptions {
+                    on_public_cell_done: Some(
+                        provisioner
+                            .public_cell_done_callback(&manager, None)
+                            .await
+                            .unwrap(),
+                    ),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let next_callback = async {
+            provisioner
+                .public_cell_done_callback(&manager, None)
+                .await
+                .unwrap()
+        };
+        tokio::pin!(next_callback);
+        let waiting_for_observation = std::future::poll_fn(|cx| {
+            Poll::Ready(matches!(next_callback.as_mut().poll(cx), Poll::Pending))
+        })
+        .await;
+        assert!(
+            waiting_for_observation,
+            "the next public cell must not overtake the blocked CWD observation"
+        );
+        let cancelled = AbortSignal::new();
+        cancelled.abort();
+        let cancelled_admission = provisioner.public_cell_done_callback(&manager, Some(&cancelled));
+        tokio::pin!(cancelled_admission);
+        let cancelled_result =
+            std::future::poll_fn(|cx| Poll::Ready(cancelled_admission.as_mut().poll(cx))).await;
+        assert!(matches!(cancelled_result, Poll::Ready(Err(_))));
+        drop(observation_barrier);
+        let callback = next_callback.await;
+        assert_eq!(observations.recv().await.unwrap().cwd, first);
+        manager
+            .execute(
+                &format!("os.chdir({})", serde_json::json!(second)),
+                ExecuteOptions {
+                    on_public_cell_done: Some(callback),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(observations.recv().await.unwrap().cwd, second);
+        provisioner.dispose(None).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn kernel_cwd_lifecycle_cold_set_does_not_miss_a_concurrent_boot() {
+        let root = tempfile::tempdir().unwrap();
+        let first = root.path().join("first");
+        let next = root.path().join("next");
+        std::fs::create_dir(&first).unwrap();
+        std::fs::create_dir(&next).unwrap();
+        let provisioner = local_python_provisioner(first.clone());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        provisioner.set_cwd_changed_sink(Arc::new(move |cwd| {
+            tx.send(cwd).unwrap();
+        }));
+        let (entered, release) = pause_next_cwd_publication(&provisioner);
+        let setter = tokio::spawn({
+            let provisioner = provisioner.clone();
+            let next = next.clone();
+            async move { provisioner.set_kernel_cwd(&next).await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(10), entered)
+            .await
+            .expect("setter boundary signal")
+            .unwrap();
+        let (progress, started) = boot_start_witness();
+        let boot = tokio::spawn({
+            let provisioner = provisioner.clone();
+            async move { provisioner.ensure(Some(progress), None).await }
+        });
+        let boot_started = tokio::time::timeout(std::time::Duration::from_secs(10), started).await;
+        release.send(()).unwrap();
+        boot_started.expect("boot start signal").unwrap();
+        assert_eq!(setter.await.unwrap().unwrap(), next);
+        let manager = boot.await.unwrap().unwrap();
+        assert_eq!(manager.read_kernel_cwd().await.unwrap(), Some(next.clone()));
+        assert_eq!(provisioner.kernel_cwd(), next.clone());
+        assert_eq!(rx.try_recv().unwrap(), next);
+        assert!(rx.try_recv().is_err());
+        provisioner.dispose(None).await;
+        assert!(provisioner.set_kernel_cwd(&first).await.is_err());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn kernel_cwd_lifecycle_displaced_readback_cannot_publish() {
+        let root = tempfile::tempdir().unwrap();
+        let first = root.path().join("first");
+        let next = root.path().join("next");
+        std::fs::create_dir(&first).unwrap();
+        std::fs::create_dir(&next).unwrap();
+        let provisioner = local_python_provisioner(first.clone());
+        provisioner.ensure(None, None).await.unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        provisioner.set_cwd_changed_sink(Arc::new(move |cwd| {
+            tx.send(cwd).unwrap();
+        }));
+        let (entered, release) = pause_next_cwd_publication(&provisioner);
+        let setter = tokio::spawn({
+            let provisioner = provisioner.clone();
+            async move { provisioner.set_kernel_cwd(&next).await }
+        });
+        // The old kernel has already returned successful readback.
+        tokio::time::timeout(std::time::Duration::from_secs(10), entered)
+            .await
+            .expect("setter boundary signal")
+            .unwrap();
+        provisioner.kill();
+        let (progress, started) = boot_start_witness();
+        let boot = tokio::spawn({
+            let provisioner = provisioner.clone();
+            async move { provisioner.ensure(Some(progress), None).await }
+        });
+        let boot_started = tokio::time::timeout(std::time::Duration::from_secs(10), started).await;
+        release.send(()).unwrap();
+        boot_started.expect("replacement boot signal").unwrap();
+        assert!(setter.await.unwrap().is_err());
+        let manager = boot.await.unwrap().unwrap();
+        assert_eq!(
+            manager.read_kernel_cwd().await.unwrap(),
+            Some(first.clone())
+        );
+        assert_eq!(provisioner.kernel_cwd(), first);
+        assert!(rx.try_recv().is_err());
+        provisioner.dispose(None).await;
+    }
+
+    #[tokio::test]
+    async fn kernel_cwd_rebuild_waits_final_flush_then_reconciles_restored_cwd() {
+        let root = tempfile::tempdir().unwrap();
+        let requested = root.path().join("requested");
+        let restored = root.path().join("restored");
+        let snapshots = root.path().join("snapshots");
+        let marker = root.path().join("next-boot");
+        for dir in [&requested, &restored, &snapshots] {
+            std::fs::create_dir(dir).unwrap();
+        }
+        // Python's startup hook changes the real cwd only on revival.
+        let startup = format!(
+            "import os\nif os.path.exists({}):\n    os.chdir({})\n",
+            serde_json::json!(marker.display().to_string()),
+            serde_json::json!(restored.display().to_string()),
+        );
+        std::fs::write(root.path().join("sitecustomize.py"), startup).unwrap();
+        let python = crate::kernel::bootstrap::ensure_kernel_python(
+            crate::kernel::bootstrap::EnsureKernelPythonOptions::default(),
+        )
+        .await
+        .unwrap();
+        let provisioner = IpythonKernelProvisioner::new(
+            requested.clone(),
+            IpythonKernelProvisionerOptions {
+                python: Some(python),
+                snapshot_dir: Some(snapshots.clone()),
+                env: HashMap::from([("PYTHONPATH".into(), root.path().display().to_string())]),
+                ..Default::default()
+            },
+        );
+        let first = provisioner.ensure(None, None).await.unwrap();
+        first
+            .execute("checkpoint = 42", ExecuteOptions::default())
+            .await
+            .unwrap();
+        provisioner.stop_kernel(None).await;
+        assert!(snapshot_path_in(&snapshots).is_file());
+        assert!(provisioner.manager().is_none());
+        assert_eq!(provisioner.kernel_cwd(), requested);
+        std::fs::write(&marker, "revive in restored").unwrap();
+
+        let stages = Arc::new(Mutex::new(Vec::<String>::new()));
+        let observed = Arc::clone(&stages);
+        let progress: KernelBootstrapProgressHandler = Arc::new(move |stage| {
+            observed.lock().unwrap().push(stage.to_string());
+        });
+        let revived = provisioner.ensure(Some(progress), None).await.unwrap();
+        let stages = stages.lock().unwrap().clone();
+        let index = |name| stages.iter().position(|stage| stage == name).unwrap();
+        assert!(index("Starting Python kernel...") < index("Restoring Python state..."));
+        assert!(index("Restoring Python state...") < index("Preparing Python runtime..."));
+        let live_cwd = revived.read_kernel_cwd().await.unwrap().unwrap();
+        assert_eq!(live_cwd, restored);
+        assert_eq!(
+            provisioner.kernel_cwd(),
+            restored,
+            "cached cwd follows the revived process"
+        );
+        let result = revived
+            .execute(
+                "print(checkpoint, __import__('os').getcwd())",
+                ExecuteOptions::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.status, ExecuteStatus::Ok);
+        assert!(result.stdout.contains("42"));
+        assert!(result.stdout.contains(&restored.display().to_string()));
+        provisioner.dispose(None).await;
+    }
+
+    #[tokio::test]
+    async fn kernel_cwd_preboot_cwd_is_atomic_and_boots_in_requested_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let first = root.path().join("first");
+        let next = root.path().join("next");
+        std::fs::create_dir(&first).unwrap();
+        std::fs::create_dir(&next).unwrap();
+        let provisioner = local_python_provisioner(first.clone());
+        assert_eq!(provisioner.read_kernel_cwd().await.unwrap(), None);
+        assert!(provisioner
+            .set_kernel_cwd(Path::new("relative"))
+            .await
+            .is_err());
+        assert_eq!(provisioner.kernel_cwd(), first);
+        assert_eq!(provisioner.set_kernel_cwd(&next).await.unwrap(), next);
+        assert_eq!(provisioner.kernel_cwd(), next);
+        provisioner.ensure(None, None).await.unwrap();
+        assert_eq!(provisioner.read_kernel_cwd().await.unwrap(), Some(next));
+        provisioner.dispose(None).await;
+    }
+
+    #[tokio::test]
+    async fn kernel_cwd_failed_live_change_preserves_cwd_and_queue() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().join("project");
+        std::fs::create_dir(&cwd).unwrap();
+        let provisioner = local_python_provisioner(cwd.clone());
+        provisioner.ensure(None, None).await.unwrap();
+        let file = root.path().join("file");
+        std::fs::write(&file, "not a directory").unwrap();
+        assert!(provisioner.set_kernel_cwd(&file).await.is_err());
+        assert!(provisioner
+            .set_kernel_cwd(&root.path().join("missing"))
+            .await
+            .is_err());
+        assert_eq!(provisioner.kernel_cwd(), cwd);
+        assert_eq!(provisioner.read_kernel_cwd().await.unwrap(), Some(cwd));
+        provisioner.dispose(None).await;
+    }
+
+    #[tokio::test]
+    async fn kernel_cwd_live_cwd_change_readback_before_notice() {
+        let root = tempfile::tempdir().unwrap();
+        let first = root.path().join("first");
+        let next = root.path().join("next");
+        std::fs::create_dir(&first).unwrap();
+        std::fs::create_dir(&next).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let provisioner = Arc::new(local_python_provisioner(first.clone()));
+        provisioner.set_cwd_changed_sink(Arc::new(move |cwd| {
+            tx.send(cwd).unwrap();
+        }));
+        let manager = provisioner.ensure(None, None).await.unwrap();
+        let outcome = async {
+            let binding = manager
+                .execute("os = {'saved': 42}; print = None", ExecuteOptions::default())
+                .await?;
+            anyhow::ensure!(binding.status == ExecuteStatus::Ok, "binding cell failed");
+            anyhow::ensure!(
+                provisioner.read_kernel_cwd().await? == Some(first.clone()),
+                "initial kernel CWD read failed"
+            );
+            let bindings = manager
+                .execute(
+                    "__import__('builtins').print(os == {'saved': 42}, print is None, __import__('os').getcwd())",
+                    ExecuteOptions::default(),
+                )
+                .await?;
+            anyhow::ensure!(
+                bindings.stdout.trim_end() == format!("True True {}", first.display()),
+                "initial CWD read changed user bindings: {}",
+                bindings.stdout
+            );
+            anyhow::ensure!(
+                provisioner.set_kernel_cwd(&next).await? == next,
+                "live CWD setter returned another path"
+            );
+            anyhow::ensure!(
+                provisioner.read_kernel_cwd().await? == Some(next.clone()),
+                "live kernel CWD disagrees with setter"
+            );
+            anyhow::ensure!(rx.try_recv() == Ok(next.clone()), "setter notice missing");
+            anyhow::ensure!(provisioner.kernel_cwd() == next, "setter cache disagrees");
+            let bindings = manager
+                .execute(
+                    "__import__('builtins').print(os == {'saved': 42}, print is None, __import__('os').getcwd())",
+                    ExecuteOptions::default(),
+                )
+                .await?;
+            anyhow::ensure!(
+                bindings.stdout.trim_end() == format!("True True {}", next.display()),
+                "setter changed user bindings: {}",
+                bindings.stdout
+            );
+            let tool = crate::tools::ipython::create_ipython_tool_definition(
+                "",
+                crate::session_engine::runtime_wiring::ipython_tool_options(
+                    Arc::clone(&provisioner),
+                    None,
+                ),
+            );
+            let mut observations = provisioner.subscribe_cwd_observations();
+            let result = (tool.execute)(
+                "cell-1",
+                serde_json::json!({"code": format!(
+                    "__import__('os').chdir({}); raise RuntimeError('cell error')",
+                    serde_json::json!(first.display().to_string())
+                )}),
+                None,
+                None,
+            )
+            .await?;
+            anyhow::ensure!(result.is_error, "public error flag missing");
+            anyhow::ensure!(
+                result.details.as_ref().is_some_and(|d| d["status"] == "error"),
+                "public error status missing"
+            );
+            anyhow::ensure!(result.content.iter().any(|block| block
+                .as_text()
+                .is_some_and(|text| text.contains("cell error"))), "public error text missing");
+            let receipt = tokio::time::timeout(std::time::Duration::from_secs(3), observations.recv())
+                .await??;
+            anyhow::ensure!(receipt.cwd == first && receipt.changed, "public CWD observation missing");
+            anyhow::ensure!(
+                tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv()).await?
+                    == Some(first.clone()),
+                "public CWD changed notice missing"
+            );
+            anyhow::ensure!(provisioner.kernel_cwd() == first, "public CWD cache disagrees");
+            anyhow::ensure!(
+                provisioner.read_kernel_cwd().await? == Some(first.clone()),
+                "public CWD kernel read disagrees"
+            );
+            let bindings = manager
+                .execute(
+                    "__import__('builtins').print(os == {'saved': 42}, print is None, __import__('os').getcwd())",
+                    ExecuteOptions::default(),
+                )
+                .await?;
+            anyhow::ensure!(
+                bindings.stdout.trim_end() == format!("True True {}", first.display()),
+                "public observation changed user bindings: {}",
+                bindings.stdout
+            );
+            std::fs::write(first.join("relative.txt"), "read from changed directory")?;
+            let relative = (tool.execute)(
+                "cell-2",
+                serde_json::json!({"code": "__import__('builtins').print(open('relative.txt').read())"}),
+                None,
+                None,
+            )
+            .await?;
+            anyhow::ensure!(relative.content.iter().any(|block| block
+                .as_text()
+                .is_some_and(|text| text.contains("read from changed directory"))), "relative file read missing");
+            anyhow::ensure!(rx.try_recv().is_err(), "unexpected CWD notice");
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+        provisioner.dispose(None).await;
+        outcome.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kernel_cwd_failed_observation_preserves_public_result() {
+        use std::os::unix::fs::PermissionsExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        const RUNTIME: &str = r#"#!/usr/bin/env python3
+import json
+import socket
+import sys
+
+print(json.dumps({"event": "ready", "protocol": 3, "python": "3.13.0"}), flush=True)
+for line in sys.stdin:
+    req = json.loads(line)
+    if req.get("type") == "shutdown":
+        print(json.dumps({"event": "done", "id": req["id"], "status": "ok"}), flush=True)
+        break
+    if req.get("type") != "execute":
+        continue
+    if req["code"] == "public-cell":
+        print(json.dumps({"event": "stdout", "id": req["id"], "text": "original output"}), flush=True)
+        if sys.argv[2] == "error":
+            print(json.dumps({"event": "error", "id": req["id"], "ename": "UserError", "evalue": "original error", "traceback": []}), flush=True)
+        print(json.dumps({"event": "done", "id": req["id"], "status": sys.argv[2]}), flush=True)
+    else:
+        with socket.socket(socket.AF_UNIX) as receipt:
+            receipt.connect(sys.argv[1])
+            receipt.sendall(json.dumps({"id": req["id"], "code": req["code"]}).encode())
+            receipt.recv(1)
+        print(json.dumps({"event": "done", "id": req["id"], "status": "error", "reason": "probe failed"}), flush=True)
+"#;
+        let mut failures = Vec::new();
+        for status in ["ok", "error"] {
+            let root = tempfile::tempdir().unwrap();
+            let python = root.path().join("fake-kernel");
+            std::fs::write(&python, RUNTIME).unwrap();
+            std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let socket = root.path().join("probe.sock");
+            let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+            let wrapper = root.path().join("wrapper");
+            std::fs::write(
+                &wrapper,
+                format!(
+                    "#!/bin/sh\nexec '{}' '{}' '{}' \"$@\"\n",
+                    python.display(),
+                    socket.display(),
+                    status
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let manager = ReplKernelManager::new(KernelManagerOptions {
+                python: Some(wrapper),
+                cwd: Some(root.path().to_path_buf()),
+                ..Default::default()
+            });
+            manager.start(KernelStartOptions::default()).await.unwrap();
+            let provisioner = Arc::new(IpythonKernelProvisioner::new(
+                root.path(),
+                IpythonKernelProvisionerOptions::default(),
+            ));
+            provisioner.lock_state().manager = Some(manager.clone());
+            let (changed, mut changed_rx) = tokio::sync::mpsc::unbounded_channel();
+            provisioner.set_cwd_changed_sink(Arc::new(move |cwd| {
+                let _ = changed.send(cwd);
+            }));
+            let tool = crate::tools::ipython::create_ipython_tool_definition(
+                "",
+                crate::session_engine::runtime_wiring::ipython_tool_options(
+                    Arc::clone(&provisioner),
+                    None,
+                ),
+            );
+            let mut public = tokio::spawn(async move {
+                (tool.execute)(
+                    "cell",
+                    serde_json::json!({"code": "public-cell"}),
+                    None,
+                    None,
+                )
+                .await
+            });
+            let mut public_consumed = false;
+            let outcome = async {
+                let (mut receipt, _) =
+                    tokio::time::timeout(std::time::Duration::from_secs(3), listener.accept())
+                        .await??;
+                let mut bytes = [0_u8; 512];
+                let count = tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    receipt.read(&mut bytes),
+                )
+                .await??;
+                let request: serde_json::Value = serde_json::from_slice(&bytes[..count])?;
+                anyhow::ensure!(request["id"].as_str().is_some_and(|id| !id.is_empty()));
+                anyhow::ensure!(
+                    request["code"]
+                        == "__import__(\"builtins\").print(__import__(\"os\").getcwd())",
+                    "actual probe request missing"
+                );
+                let result =
+                    tokio::time::timeout(std::time::Duration::from_secs(2), &mut public).await;
+                public_consumed = result.is_ok();
+                receipt.write_all(b"release").await?;
+                let result = result???;
+                anyhow::ensure!(
+                    result.is_error == (status == "error"),
+                    "public error flag altered: {status}"
+                );
+                anyhow::ensure!(
+                    result
+                        .details
+                        .as_ref()
+                        .is_some_and(|d| d["status"] == status),
+                    "public status altered: {status}"
+                );
+                anyhow::ensure!(
+                    result.content.iter().any(|block| block
+                        .as_text()
+                        .is_some_and(|text| text.contains("original output"))),
+                    "public output altered: {status}"
+                );
+                if status == "error" {
+                    anyhow::ensure!(
+                        result
+                            .details
+                            .as_ref()
+                            .is_some_and(|details| details["error"]["evalue"] == "original error"),
+                        "user error altered"
+                    );
+                }
+                let _settled = tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    provisioner.inner.cwd_mutation.lock(),
+                )
+                .await?;
+                anyhow::ensure!(
+                    provisioner.kernel_cwd() == root.path(),
+                    "cached cwd changed"
+                );
+                anyhow::ensure!(
+                    changed_rx.try_recv().is_err(),
+                    "failed observation emitted a callback"
+                );
+                Ok::<(), anyhow::Error>(())
+            }
+            .await;
+            drop(listener);
+            if !public_consumed {
+                public.abort();
+                let _ = public.await;
+            }
+            provisioner.dispose(None).await;
+            manager
+                .shutdown(KernelShutdownOptions::default())
+                .await
+                .unwrap();
+            if let Err(error) = outcome {
+                failures.push(format!("{status}: {error:#}"));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("; "));
+    }
+
+    #[tokio::test]
+    async fn kernel_cwd_unchanged_preboot_set_queues_hidden_next_turn_row() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().join("project");
+        let agent_dir = root.path().join("agent");
+        std::fs::create_dir(&cwd).unwrap();
+        std::fs::create_dir(&agent_dir).unwrap();
+        let engine = shell_test_session(cwd.clone(), agent_dir).await.unwrap();
+        assert_eq!(engine.session.kernel_cwd(), cwd);
+        let applied = engine.session.set_kernel_cwd(&cwd).await.unwrap();
+        assert_eq!(applied, cwd);
+        let rows = engine.session.take_next_turn_rows().await;
+        assert_eq!(rows.len(), 1);
+        let pa_agent::types::AgentMessage::Custom(row) = &rows[0] else {
+            panic!("expected a custom row");
+        };
+        assert_eq!(row.payload["customType"], "term_cwd_changed");
+        assert_eq!(row.payload["display"], false);
+        assert_eq!(row.payload["details"], serde_json::json!({ "cwd": cwd }));
+        assert_eq!(row.payload["content"], serde_json::json!(format!("Working directory changed to {} by the user via /term. Your IPython kernel now runs in this directory.", cwd.display())));
+        assert!(engine.session.take_next_turn_rows().await.is_empty());
+        let missing = root.path().join("missing");
+        assert!(engine.session.set_kernel_cwd(&missing).await.is_err());
+        assert!(engine.session.take_next_turn_rows().await.is_empty());
+        engine.session.set_kernel_cwd(&cwd).await.unwrap();
+        engine
+            .session
+            .prompt("next", crate::session_engine::PromptOptions::default())
+            .await
+            .unwrap();
+        let state = engine.session.agent().state().await;
+        let admitted: Vec<_> = state
+            .messages
+            .iter()
+            .filter_map(|message| {
+                let pa_agent::types::AgentMessage::Custom(row) = message else {
+                    return None;
+                };
+                (row.payload["customType"] == "term_cwd_changed").then_some(row)
+            })
+            .collect();
+        assert_eq!(admitted.len(), 1);
+        assert_eq!(
+            admitted[0].payload["details"],
+            serde_json::json!({"cwd": cwd})
+        );
     }
 
     #[tokio::test]

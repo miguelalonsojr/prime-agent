@@ -360,6 +360,7 @@ pub(crate) struct Inner {
     busy_notify: Notify,
     /// Serializes `execute()` calls — the runtime runs one request at a time.
     execution_queue: tokio::sync::Mutex<()>,
+    public_cell_queue: Arc<tokio::sync::Mutex<()>>,
     start_memo: Mutex<Option<Arc<MemoSlot>>>,
     shutdown_memo: Mutex<Option<Arc<MemoSlot>>>,
     rebootstrap_memo: Mutex<Option<Arc<MemoSlot>>>,
@@ -423,6 +424,60 @@ use requests::{append_truncated, describe_failure, HeadTailBuffer, Signal};
 // Public API
 
 impl ReplKernelManager {
+    /// Reserve public-cell admission through its post-Done observation.
+    /// An early abort returns independently; the active cell retains the permit until Done.
+    ///
+    /// # Errors
+    ///
+    /// Returns the existing busy-kernel error or an error if admission is cancelled.
+    pub async fn public_cell_done_callback<F>(
+        &self,
+        signal: Option<&AbortSignal>,
+        callback: impl Fn(Self) -> F + Send + Sync + 'static,
+    ) -> anyhow::Result<crate::kernel::shared::PublicCellDoneCallback>
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let admission = async {
+            // Let an executing cell return before checking reuse. After an early abort,
+            // retain the existing bounded interrupt/wait error instead of parking forever.
+            let queue = self.inner.execution_queue.lock().await;
+            self.wait_for_active_execution_to_clear_for_reuse(signal)
+                .await?;
+            // The observation needs this queue for its internal probe.
+            drop(queue);
+            Ok::<_, anyhow::Error>(self.inner.public_cell_queue.clone().lock_owned().await)
+        };
+        let permit = tokio::select! {
+            result = admission => result?,
+            () = async {
+                match signal {
+                    Some(signal) => signal.cancelled().await,
+                    None => std::future::pending().await,
+                }
+            } => return Err(anyhow!("Python execution aborted")),
+        };
+        let permit = Mutex::new(Some(permit));
+        let weak = Arc::downgrade(&self.inner);
+        Ok(Arc::new(move || {
+            if let Some(permit) = lock(&permit).take() {
+                if let Some(inner) = weak.upgrade() {
+                    let observation = callback(Self { inner });
+                    tokio::spawn(async move {
+                        let _permit = permit;
+                        observation.await;
+                    });
+                }
+            }
+        }))
+    }
+
+    /// Whether these handles refer to the same running kernel generation.
+    #[must_use]
+    pub fn same_kernel(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
     #[must_use]
     pub fn new(options: KernelManagerOptions) -> Self {
         let inner = Arc::new(Inner {
@@ -466,6 +521,7 @@ impl ReplKernelManager {
             child: Mutex::new(None),
             busy_notify: Notify::new(),
             execution_queue: tokio::sync::Mutex::new(()),
+            public_cell_queue: Arc::new(tokio::sync::Mutex::new(())),
             start_memo: Mutex::new(None),
             shutdown_memo: Mutex::new(None),
             rebootstrap_memo: Mutex::new(None),
@@ -806,7 +862,67 @@ impl ReplKernelManager {
         self.inner.mark_restored_namespace_fresh();
     }
 
-    /// Live user-defined top-level names, or `None` if the kernel isn\'t running.
+    /// Read the kernel's current directory without booting or scheduling a snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the kernel cannot answer the bounded internal probe.
+    pub async fn read_kernel_cwd(&self) -> anyhow::Result<Option<std::path::PathBuf>> {
+        if !self.is_running() {
+            return Ok(None);
+        }
+        let result = self
+            .enqueue_request(
+                Request::Execute {
+                    code: "__import__(\"builtins\").print(__import__(\"os\").getcwd())".into(),
+                },
+                ExecuteOptions {
+                    internal: true,
+                    ..Default::default()
+                },
+                Some(3_000),
+            )
+            .await?;
+        if result.result.status != ExecuteStatus::Ok {
+            return Err(anyhow!("Kernel CWD read failed"));
+        }
+        Ok(Some(std::path::PathBuf::from(
+            result.result.stdout.trim_end(),
+        )))
+    }
+
+    /// Change directory in the current kernel and read back the effective path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the internal change or readback fails.
+    pub async fn set_kernel_cwd(
+        &self,
+        dir: &std::path::Path,
+    ) -> anyhow::Result<std::path::PathBuf> {
+        let code = format!("__import__(\"os\").chdir({})", json!(dir.to_string_lossy()));
+        let result = self
+            .enqueue_request(
+                Request::Execute { code },
+                ExecuteOptions {
+                    internal: true,
+                    ..Default::default()
+                },
+                Some(3_000),
+            )
+            .await?;
+        if result.result.status != ExecuteStatus::Ok {
+            return Err(anyhow!(
+                "Kernel CWD change failed: {}",
+                requests::describe_failure(&result.result)
+            ));
+        }
+        self.read_kernel_cwd()
+            .await?
+            .ok_or_else(|| anyhow!("Kernel stopped after CWD change"))
+    }
+
+    /// Live user-defined top-level names, or `None` if the kernel isn't running.
     pub async fn list_namespace_names(&self, signal: Option<AbortSignal>) -> Option<Vec<String>> {
         if !self.is_running() {
             return None;
@@ -995,5 +1111,149 @@ impl ReplKernelManager {
         lock(&self.inner.guarded).state = KernelState::Shutdown;
         live_kernels::remove_inner(&self.inner);
         self.inner.cleanup_resources(Signal::Term);
+    }
+}
+
+#[cfg(test)]
+mod kernel_cwd_tests {
+    use super::*;
+    use crate::kernel::shared::KernelSnapshotConfig;
+    use std::sync::atomic::AtomicUsize;
+
+    #[tokio::test]
+    async fn kernel_cwd_internal_cwd_probe_never_snapshots() {
+        let root = tempfile::tempdir().unwrap();
+        let initial = root.path().join("initial");
+        let next = root.path().join("next");
+        std::fs::create_dir(&initial).unwrap();
+        std::fs::create_dir(&next).unwrap();
+        let runtime = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../prime-agent-runtime/src")
+            .canonicalize()
+            .unwrap();
+        let manager = ReplKernelManager::new(KernelManagerOptions {
+            python: Some("python3".into()),
+            cwd: Some(initial.clone()),
+            env: HashMap::from([("PYTHONPATH".into(), runtime.display().to_string())]),
+            snapshot: Some(KernelSnapshotConfig {
+                path: root.path().join("snapshot"),
+                manifest_path: root.path().join("snapshot.manifest"),
+                max_bytes: None,
+                max_variable_bytes: None,
+                debounce_ms: Some(30_000),
+            }),
+            ..Default::default()
+        });
+        manager.start(KernelStartOptions::default()).await.unwrap();
+        assert_eq!(manager.read_kernel_cwd().await.unwrap(), Some(initial));
+        assert!(lock(&manager.inner.snapshot_timer).is_none());
+        assert_eq!(manager.set_kernel_cwd(&next).await.unwrap(), next);
+        assert_eq!(manager.read_kernel_cwd().await.unwrap(), Some(next));
+        assert!(lock(&manager.inner.snapshot_timer).is_none());
+        manager
+            .shutdown(KernelShutdownOptions::default())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn kernel_cwd_admission_retains_bounded_busy_reuse_after_early_abort() {
+        let manager = ReplKernelManager::new(KernelManagerOptions::default());
+        let (tx, mut rx) = oneshot::channel();
+        let execution = Arc::new(ActiveExecution {
+            request_id: "public-cell".into(),
+            started: Instant::now(),
+            max_chars: DEFAULT_MAX_OUTPUT_CHARS,
+            opts: ExecuteOptions {
+                on_public_cell_done: Some(
+                    manager
+                        .public_cell_done_callback(None, |_| async {})
+                        .await
+                        .unwrap(),
+                ),
+                ..Default::default()
+            },
+            namespace_code: true,
+            restores_namespace: false,
+            buffers: Mutex::new(ExecBuffers {
+                status: ExecuteStatus::Ok,
+                ..Default::default()
+            }),
+            result_tx: Mutex::new(Some(tx)),
+        });
+        lock(&manager.inner.guarded).active_execution = Some(Arc::clone(&execution));
+        manager.inner.force_abort(&execution);
+        assert!(
+            rx.try_recv().is_ok(),
+            "abort returns without waiting for Done"
+        );
+        let admission = tokio::time::timeout(
+            Duration::from_millis(crate::kernel::shared::KERNEL_BUSY_REUSE_WAIT_MS + 1_000),
+            manager.public_cell_done_callback(None, |_| async {}),
+        )
+        .await;
+        assert!(
+            admission.is_ok(),
+            "public admission lost the bounded busy-reuse error"
+        );
+        let Err(error) = admission.unwrap() else {
+            panic!("busy kernel admission unexpectedly succeeded");
+        };
+        assert_eq!(
+            error.to_string(),
+            crate::kernel::shared::KERNEL_BUSY_AFTER_INTERRUPT_MESSAGE
+        );
+        manager.inner.reject_active_execution("test cleanup");
+    }
+
+    #[test]
+    fn kernel_cwd_aborted_cell_waits_matching_done_without_blocking_tool_abort() {
+        let manager = ReplKernelManager::new(KernelManagerOptions::default());
+        let count = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&count);
+        let inner = Arc::clone(&manager.inner);
+        let (tx, mut rx) = oneshot::channel();
+        let execution = Arc::new(ActiveExecution {
+            request_id: "public-cell".into(),
+            started: Instant::now(),
+            max_chars: DEFAULT_MAX_OUTPUT_CHARS,
+            opts: ExecuteOptions {
+                on_public_cell_done: Some(Arc::new(move || {
+                    assert!(lock(&inner.guarded).active_execution.is_none());
+                    observed.fetch_add(1, Ordering::SeqCst);
+                })),
+                ..Default::default()
+            },
+            namespace_code: true,
+            restores_namespace: false,
+            buffers: Mutex::new(ExecBuffers {
+                status: ExecuteStatus::Ok,
+                ..Default::default()
+            }),
+            result_tx: Mutex::new(Some(tx)),
+        });
+        lock(&manager.inner.guarded).active_execution = Some(Arc::clone(&execution));
+        manager.inner.force_abort(&execution);
+        assert!(
+            rx.try_recv().is_ok(),
+            "tool abort returned before kernel Done"
+        );
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+        manager.inner.handle_event(Event::Done {
+            id: "other-cell".into(),
+            fields: json!({"status":"ok"}),
+        });
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+        assert!(lock(&manager.inner.guarded).active_execution.is_some());
+        manager.inner.handle_event(Event::Done {
+            id: "public-cell".into(),
+            fields: json!({"status":"ok"}),
+        });
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        manager.inner.handle_event(Event::Done {
+            id: "public-cell".into(),
+            fields: json!({"status":"ok"}),
+        });
+        assert_eq!(count.load(Ordering::SeqCst), 1);
     }
 }

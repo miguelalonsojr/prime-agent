@@ -1,0 +1,1 @@
+- Added `/term` and kernel working-directory propagation with a directory/branch footer, and strengthened peer-grant and persisted-worker identity checks.

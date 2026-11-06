@@ -348,6 +348,10 @@ fn speed_command_toggles_the_footer_readout() {
         !readout_row(tail),
         "the readout is gone after /speed off:\n{tail}"
     );
+    assert!(
+        tail.lines().any(|line| line.trim() == "/tmp"),
+        "the effective CWD replaces the speed row when off: {tail}"
+    );
 }
 
 #[test]
@@ -362,4 +366,53 @@ fn speed_command_rejects_bad_args() {
         all.contains("Usage: /speed [on|off]"),
         "the usage error rendered:\n{all}"
     );
+}
+
+#[test]
+fn term_is_local_and_rejects_arguments() {
+    let frames = run_plan(vec![
+        HeadlessStep::Submit("/term extra".to_string()),
+        HeadlessStep::WaitIdle { timeout_ms: 10_000 },
+    ]);
+    let all = frames.join("\n");
+    assert!(all.contains("Usage: /term"), "{all}");
+    assert!(
+        !all.contains("all done"),
+        "a local command must not submit a prompt: {all}"
+    );
+}
+
+#[test]
+fn cwd_footer_prefers_speed_and_abbreviates_home_with_width_bound() {
+    use pa_tui::chrome::render_cwd_footer;
+    use pa_tui::theme::{ColorMode, Theme};
+    let theme = Theme::builtin("prime", ColorMode::TrueColor);
+    let line = render_cwd_footer(
+        Some("8 tok/s"),
+        "/home/me/project",
+        Some("main"),
+        Some("/home/me"),
+        &theme,
+        12,
+    );
+    assert_eq!(
+        line.iter()
+            .map(|span| span.content.as_str())
+            .collect::<String>(),
+        "8 tok/s"
+    );
+    let line = render_cwd_footer(
+        None,
+        "/home/me/project",
+        Some("main"),
+        Some("/home/me"),
+        &theme,
+        12,
+    );
+    let text = line
+        .iter()
+        .map(|span| span.content.as_str())
+        .collect::<String>();
+    assert!(text.starts_with("~/project"), "{text}");
+    assert!(unicode_width::UnicodeWidthStr::width(text.as_str()) <= 12);
 }

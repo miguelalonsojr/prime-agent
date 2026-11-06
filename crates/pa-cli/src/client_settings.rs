@@ -49,6 +49,13 @@ macro_rules! str_setting {
 }
 
 impl ClientSettings for CliClientSettings {
+    fn shell_path(&self) -> Option<PathBuf> {
+        self.manager()
+            .settings()
+            .shell_path
+            .as_deref()
+            .map(PathBuf::from)
+    }
     fn harness_refinements(&self) -> bool {
         self.manager().get_harness_refinements()
     }
@@ -315,6 +322,20 @@ mod tests {
         let agent_dir = dir.path().join("agent");
         std::fs::create_dir_all(&agent_dir).expect("agent dir");
         let settings = CliClientSettings::new(dir.path().to_path_buf(), agent_dir.clone());
+
+        assert_eq!(settings.shell_path(), None);
+        std::fs::write(
+            agent_dir.join("settings.json"),
+            r#"{"shellPath":"/bin/sh"}"#,
+        )
+        .expect("set shell path");
+        assert_eq!(settings.shell_path(), Some(PathBuf::from("/bin/sh")));
+        std::fs::write(
+            agent_dir.join("settings.json"),
+            r#"{"shellPath":"/bin/bash"}"#,
+        )
+        .expect("change shell path");
+        assert_eq!(settings.shell_path(), Some(PathBuf::from("/bin/bash")));
 
         assert!(settings.show_images());
         assert!(!settings.quiet_startup());

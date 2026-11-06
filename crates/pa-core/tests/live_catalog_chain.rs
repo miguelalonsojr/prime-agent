@@ -517,3 +517,54 @@ async fn session_model_restore_fast_path_never_fetches() {
         "the fast path never fetches"
     );
 }
+
+/// A locally defined Codex-compatible model appears through the registered kernel handler,
+/// with no account-catalog request needed to establish availability.
+#[tokio::test]
+async fn registered_find_models_shows_authenticated_manual_codex_model() {
+    use pa_core::kernel::shared::HostRequestPayload;
+    use pa_core::session::manager::SessionManager;
+    use pa_core::session_engine::runtime_wiring::{wire_session_runtime, RlmWiring};
+
+    let dir = tempfile::tempdir().unwrap();
+    let model_id = "gpt-5.1-local-manual";
+    assert!(!pa_models::transports::compiled_models()
+        .iter()
+        .any(|model| model.provider == "openai-codex" && model.id == model_id));
+    std::fs::write(
+        dir.path().join("models.json"),
+        json!({"providers":{"openai-codex":{"baseUrl":"http://127.0.0.1:9",
+            "models":[{"id":model_id,"name":"Local manual Codex",
+                "api":"openai-codex-responses","reasoning":true}]}}})
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("auth.json"),
+        json!({"openai-codex":{"type":"api_key","key":"synthetic-local-key"}}).to_string(),
+    )
+    .unwrap();
+    let wiring = wire_session_runtime(
+        SessionManager::in_memory(dir.path()),
+        dir.path(),
+        RlmWiring::default(),
+        None,
+        None,
+    );
+    let handler = wiring
+        .handlers
+        .get("rlm.find_models")
+        .expect("registered handler");
+    let result = handler(HostRequestPayload {
+        data: json!({"query": "gpt-5.1-local-manual"}),
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        result["models"],
+        json!([{
+            "provider":"openai-codex", "id":model_id, "name":"Local manual Codex",
+            "selector":"openai-codex/gpt-5.1-local-manual"
+        }])
+    );
+}

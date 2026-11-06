@@ -135,6 +135,9 @@ impl Inner {
                         }
                     }
                     self.finish_active_execution(&execution);
+                    if let Some(callback) = &execution.opts.on_public_cell_done {
+                        callback();
+                    }
                     return;
                 }
                 // A done outside the active execution settles its waiter.

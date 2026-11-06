@@ -169,6 +169,7 @@ impl ConnectionSink {
 struct SupervisorClaimRelease {
     role: Arc<std::sync::Mutex<crate::peer::ConnectionRole>>,
     claims: Arc<std::sync::atomic::AtomicUsize>,
+    generation_claim: Arc<std::sync::Mutex<Option<super::SupervisorGenerationClaim>>>,
 }
 
 /// The connection-scoped session-attach guard: its Drop releases the
@@ -187,11 +188,17 @@ impl Drop for SessionAttachGuard {
 
 impl Drop for SupervisorClaimRelease {
     fn drop(&mut self) {
-        let supervisor = matches!(
-            *self.role.lock().unwrap(),
-            crate::peer::ConnectionRole::Supervisor { .. }
-        );
-        if supervisor {
+        let mut current = self.generation_claim.lock().unwrap();
+        if let crate::peer::ConnectionRole::Supervisor { generation } = &*self.role.lock().unwrap()
+        {
+            if let Some(claim) = current.as_mut() {
+                if claim.generation == *generation {
+                    claim.connections -= 1;
+                    if claim.connections == 0 {
+                        *current = None;
+                    }
+                }
+            }
             self.claims
                 .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
         }
@@ -370,10 +377,11 @@ impl Worker {
         // fan-out task (streaming is gated on it).
         let role = Arc::new(std::sync::Mutex::new(ConnectionRole::Unauthenticated));
 
-        let _claim_release = SupervisorClaimRelease {
+        let mut claim_release = Some(SupervisorClaimRelease {
             role: Arc::clone(&role),
             claims: Arc::clone(&self.supervisor_claims),
-        };
+            generation_claim: Arc::clone(&self.supervisor_generation_claim),
+        });
 
         // Connection-closed signal. The fan-out must not outlive the
         // connection: its write half keeps the fd open, and a per-connection
@@ -443,7 +451,9 @@ impl Worker {
         loop {
             let frame: Option<crate::framing::PrivateFrame> = reader.read_frame().await?;
             let Some(frame) = frame else {
-                // Peer closed: wake the fan-out so it drops the write half.
+                // Release the supervisor claim before the fan-out closes its
+                // write half: socket EOF then proves the claim is gone.
+                drop(claim_release.take());
                 let _ = closed_tx.send(true);
                 break;
             };
@@ -631,9 +641,21 @@ impl Worker {
                     "worker_auth",
                     Some(json!({ "capabilities": capabilities })),
                 );
-                *role.lock().unwrap() = ConnectionRole::Supervisor { generation };
-                self.supervisor_claims
-                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                {
+                    let mut current = self.supervisor_generation_claim.lock().unwrap();
+                    match current.as_mut() {
+                        Some(claim) if claim.generation == generation => claim.connections += 1,
+                        _ => {
+                            *current = Some(super::SupervisorGenerationClaim {
+                                generation: generation.clone(),
+                                connections: 1,
+                            });
+                        }
+                    }
+                    *role.lock().unwrap() = ConnectionRole::Supervisor { generation };
+                    self.supervisor_claims
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
                 self.write_response_frame(sink, request_id, success).await;
                 AuthOutcome::Authenticated
             }
@@ -1067,5 +1089,51 @@ impl Worker {
         // that the client detached.
         self.work_notify.notify_one();
         response_success(None, "detach", None)
+    }
+}
+
+#[cfg(test)]
+mod generation_claim_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::Mutex;
+
+    #[test]
+    fn an_old_connection_drop_cannot_clear_or_revive_a_replacement_claim() {
+        let claims = Arc::new(AtomicUsize::new(2));
+        let generation_claim =
+            Arc::new(Mutex::new(Some(super::super::SupervisorGenerationClaim {
+                generation: "new".to_string(),
+                connections: 1,
+            })));
+        let old = SupervisorClaimRelease {
+            role: Arc::new(Mutex::new(ConnectionRole::Supervisor {
+                generation: "old".to_string(),
+            })),
+            claims: Arc::clone(&claims),
+            generation_claim: Arc::clone(&generation_claim),
+        };
+        let new = SupervisorClaimRelease {
+            role: Arc::new(Mutex::new(ConnectionRole::Supervisor {
+                generation: "new".to_string(),
+            })),
+            claims: Arc::clone(&claims),
+            generation_claim: Arc::clone(&generation_claim),
+        };
+        drop(old);
+        assert_eq!(
+            generation_claim
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|claim| (claim.generation.as_str(), claim.connections)),
+            Some(("new", 1))
+        );
+        drop(new);
+        assert!(
+            generation_claim.lock().unwrap().is_none(),
+            "the old generation must not return"
+        );
+        assert_eq!(claims.load(Ordering::SeqCst), 0);
     }
 }

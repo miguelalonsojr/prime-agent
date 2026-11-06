@@ -284,6 +284,11 @@ pub enum DaemonOutbound {
         #[serde(flatten)]
         rest: JsonMap,
     },
+    KernelCwdChanged {
+        cwd: String,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
     HeartbeatsChanged {
         #[serde(flatten)]
         rest: JsonMap,
@@ -418,6 +423,17 @@ pub enum DaemonOutbound {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn kernel_cwd_event_and_snapshot_roundtrip() {
+        rt::<DaemonOutbound>(r#"{"type":"kernel_cwd_changed","cwd":"/tmp/next"}"#);
+        rt::<DaemonSessionSnapshot>(
+            r#"{"activeSessionId":"s1","summary":{},"state":{"cwd":"/tmp","kernelCwd":"/tmp/next"},"messages":[],"lastEventSequence":0}"#,
+        );
+        rt::<DaemonSessionSnapshot>(
+            r#"{"activeSessionId":"s1","summary":{},"state":{"cwd":"/tmp"},"messages":[],"lastEventSequence":0}"#,
+        );
+    }
 
     #[test]
     fn response_and_error_info_roundtrip() {

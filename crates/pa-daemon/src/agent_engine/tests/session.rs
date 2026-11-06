@@ -694,3 +694,109 @@ fn an_unbuilt_engine_branch_summary_carries_the_request_session_id() {
     );
     assert_eq!(*seen.lock().unwrap(), [Some("durable-session".to_string())]);
 }
+
+#[test]
+fn kernel_cwd_concrete_engine_adopts_sink_across_rebuilds() {
+    let _faux = FAUX_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = tempfile::TempDir::new().unwrap();
+    let agent_dir = dir.path().join("agent");
+    std::fs::create_dir(&agent_dir).unwrap();
+    let first = dir.path().join("first");
+    let next = dir.path().join("next");
+    std::fs::create_dir(&first).unwrap();
+    std::fs::create_dir(&next).unwrap();
+    let engine = Arc::new(
+        AgentSessionEngine::new(AgentEngineConfig {
+            cwd: dir.path().to_path_buf(),
+            agent_dir,
+            provider: None,
+            model: None,
+            api_key: None,
+            thinking: None,
+            session_dir: None,
+            session_file: None,
+            faux_script: Some(
+                json!({
+                    "engine": "faux",
+                    "responses": [
+                        {"content": [{"type": "toolCall", "name": "python_repl", "id": "cwd_cell",
+                            "arguments": {"code": format!(
+                                "import os; os.chdir({}); print('cwd tool stayed intact')",
+                                serde_json::json!(first.display().to_string()),
+                            )}}]},
+                        {"text": "done"}
+                    ]
+                })
+                .to_string(),
+            ),
+            supervisor_link: None,
+            telemetry_disabled: Some(true),
+            cron_store: None,
+            queued_steering_probe: None,
+        })
+        .unwrap(),
+    );
+    engine.register_arc();
+    engine
+        .rlm_depth
+        .store(1, std::sync::atomic::Ordering::Relaxed);
+    let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = Arc::clone(&observed);
+    let (changed_tx, changed_rx) = std::sync::mpsc::channel();
+    engine.set_kernel_cwd_changed_sink(Arc::new(move |cwd| {
+        sink.lock().unwrap().push(cwd.clone());
+        let _ = changed_tx.send(cwd);
+    }));
+    engine.runtime.block_on(async {
+        assert!(engine.kernel_cwd().is_none());
+        assert_eq!(engine.set_kernel_cwd(first.clone()).await.unwrap(), first);
+        engine.retire_session_runtime().await;
+        assert_eq!(engine.set_kernel_cwd(next.clone()).await.unwrap(), next);
+        let _streaming_turn_guard = engine.session.lock().await;
+        assert_eq!(engine.kernel_cwd(), Some(next.clone()));
+    });
+    assert_eq!(changed_rx.try_recv().unwrap(), first);
+    assert_eq!(changed_rx.try_recv().unwrap(), next);
+    let mut events = Vec::new();
+    engine.run_prompt(
+        0,
+        PromptRequest {
+            batch: Vec::new(),
+            images: Vec::new(),
+            message: "change cwd in the Python cell".into(),
+            source: "user".into(),
+            agent_message_id: None,
+            custom_message: None,
+        },
+        &|| false,
+        &mut |event| {
+            events.push(event);
+            true
+        },
+    );
+    let result = events
+        .iter()
+        .find_map(|event| match event {
+            EngineEvent::ToolExecutionEnd {
+                tool_call_id,
+                result,
+                is_error,
+                ..
+            } if tool_call_id == "cwd_cell" => Some((result, *is_error)),
+            _ => None,
+        })
+        .expect("public python_repl result");
+    assert!(!result.1);
+    assert!(result.0.to_string().contains("cwd tool stayed intact"));
+    assert_eq!(
+        changed_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap(),
+        first,
+    );
+    assert_eq!(engine.kernel_cwd(), Some(first.clone()));
+    assert!(changed_rx.try_recv().is_err());
+    assert_eq!(*observed.lock().unwrap(), vec![first.clone(), next, first]);
+}

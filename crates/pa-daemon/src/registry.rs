@@ -401,6 +401,8 @@ pub(crate) struct SessionRegistry {
     workers: Mutex<HashMap<String, Arc<ResidentWorker>>>,
     registrations: Mutex<HashMap<String, RegistrationRecord>>,
     adoption_locks: Mutex<HashMap<String, Arc<AdoptionLock>>>,
+    #[cfg(test)]
+    pub(crate) adoption_wait_observer: std::sync::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 pub(crate) fn canonical_session_file_string(session_file: &str) -> String {
@@ -418,6 +420,8 @@ impl SessionRegistry {
             workers: Mutex::new(HashMap::new()),
             registrations: Mutex::new(HashMap::new()),
             adoption_locks: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            adoption_wait_observer: std::sync::Mutex::new(None),
         }
     }
 
@@ -619,6 +623,21 @@ impl SessionRegistry {
             let mut locks = self.adoption_locks.lock().await;
             Arc::clone(locks.entry(worker_id.to_string()).or_default())
         };
+        #[cfg(test)]
+        {
+            let observer = self.adoption_wait_observer.lock().unwrap().clone();
+            if let Some(observer) = observer {
+                let mut acquisition = Box::pin(Arc::clone(&lock).lock_owned());
+                return std::future::poll_fn(|cx| {
+                    let poll = std::future::Future::poll(acquisition.as_mut(), cx);
+                    if poll.is_pending() {
+                        observer();
+                    }
+                    poll
+                })
+                .await;
+            }
+        }
         lock.lock_owned().await
     }
 }

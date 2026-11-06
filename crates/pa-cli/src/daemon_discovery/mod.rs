@@ -315,6 +315,7 @@ pub(crate) struct ProbeResult {
     version: Option<String>,
     protocol_version: Option<u64>,
     schema_id: Option<String>,
+    schema_revision: Option<u64>,
     build_id: Option<String>,
     executable_path: Option<String>,
     session_count: Option<u64>,
@@ -351,6 +352,9 @@ pub(crate) fn probe_daemon(socket_path: &Path) -> ProbeResult {
             .get("schemaId")
             .and_then(serde_json::Value::as_str)
             .map(str::to_string);
+        probe.schema_revision = hello
+            .get("schemaRevision")
+            .and_then(serde_json::Value::as_u64);
         if let Some(runtime) = hello.get("runtime") {
             probe.build_id = runtime
                 .get("buildId")
@@ -407,7 +411,10 @@ const LIST_TIMEOUT_MS: u64 = 30_000;
 /// app version all match this build.
 fn classify_reachable(probe: &ProbeResult) -> DaemonStatus {
     if probe.protocol_version == Some(pa_types::daemon::DAEMON_PROTOCOL_VERSION)
-        && probe.schema_id.as_deref() == Some(pa_types::daemon::DAEMON_SCHEMA_ID)
+        && (probe.schema_id.as_deref() == Some(pa_types::daemon::DAEMON_SCHEMA_ID)
+            || probe
+                .schema_revision
+                .is_some_and(|revision| revision > pa_types::daemon::DAEMON_SCHEMA_REVISION))
         && probe.version.as_deref() == Some(config::version())
     {
         DaemonStatus::Current
@@ -730,6 +737,59 @@ mod tests {
         assert!(infos[0].is_default);
         assert_eq!(infos[0].has_tracked_workers, None);
         assert_eq!(infos[0].status, DaemonStatus::Stale);
+    }
+
+    #[test]
+    fn kernel_cwd_newer_schema_reuse_requires_matching_app_and_protocol() {
+        let current = ProbeResult {
+            version: Some(config::version().to_string()),
+            protocol_version: Some(pa_types::daemon::DAEMON_PROTOCOL_VERSION),
+            schema_id: Some(pa_types::daemon::DAEMON_SCHEMA_ID.to_string()),
+            ..ProbeResult::default()
+        };
+        assert_eq!(classify_reachable(&current), DaemonStatus::Current);
+        for revision in [Some(32), Some(31), Some(30), None] {
+            let probe = ProbeResult {
+                schema_id: Some("unknown-schema".to_string()),
+                schema_revision: revision,
+                ..ProbeResult {
+                    version: current.version.clone(),
+                    protocol_version: current.protocol_version,
+                    ..ProbeResult::default()
+                }
+            };
+            assert_eq!(
+                classify_reachable(&probe),
+                if revision == Some(32) {
+                    DaemonStatus::Current
+                } else {
+                    DaemonStatus::Stale
+                },
+                "revision {revision:?}"
+            );
+        }
+        assert_eq!(
+            classify_reachable(&ProbeResult {
+                version: Some("other".to_string()),
+                schema_revision: Some(32),
+                ..ProbeResult {
+                    protocol_version: current.protocol_version,
+                    ..ProbeResult::default()
+                }
+            }),
+            DaemonStatus::Stale
+        );
+        assert_eq!(
+            classify_reachable(&ProbeResult {
+                protocol_version: Some(6),
+                schema_revision: Some(32),
+                ..ProbeResult {
+                    version: current.version,
+                    ..ProbeResult::default()
+                }
+            }),
+            DaemonStatus::Stale
+        );
     }
 
     #[test]

@@ -59,11 +59,12 @@ impl AgentView {
             }
             lines.extend(frame);
         }
-        // The `/speed` footer (TS `footerSlot`): a dim row only while
-        // the display is on with a sample.
-        if let Some(speed) = &self.chrome.speed_text {
-            lines.push(crate::chrome::render_speed_footer(
-                speed,
+        if let Some(cwd) = &self.chrome.footer_cwd {
+            lines.push(crate::chrome::render_cwd_footer(
+                self.chrome.speed_text.as_deref(),
+                cwd,
+                self.chrome.footer_branch.as_deref(),
+                std::env::var("HOME").ok().as_deref(),
                 &self.theme,
                 width,
             ));

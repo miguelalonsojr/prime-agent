@@ -228,3 +228,125 @@ fn supervisor_kill9_restart_sessions_re_register_and_survive() {
         }
     }
 }
+
+/// A stale persisted process identity must not make the supervisor own or
+/// terminate the still-live worker. Its private socket remains usable.
+#[test]
+fn stale_descriptor_refusal_keeps_real_worker_responsive() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let socket = dir.path().join("daemon.sock");
+    let agent_dir = dir.path().join("agent");
+    let sessions_dir = agent_dir.join("sessions");
+    std::fs::create_dir_all(&sessions_dir).expect("sessions dir");
+    let mut daemon = spawn_supervisor(&socket, &agent_dir);
+    wait_socket_ready(&socket);
+    let (mut client, _) = Client::connect(&socket);
+    client.send_command(
+        "create",
+        &json!({
+            "type": "create", "config": {
+                "cwd": dir.path().to_string_lossy(),
+                "sessionDir": sessions_dir.to_string_lossy(),
+            }
+        }),
+    );
+    let created = client.read_response("create");
+    assert_eq!(created["success"], true, "create failed: {created}");
+    let worker_id = created["data"]["id"]
+        .as_str()
+        .or_else(|| created["data"]["sessionId"].as_str())
+        .expect("worker id")
+        .to_owned();
+    let worker = load_worker_descriptor(&agent_dir, &socket, &worker_id);
+    daemon.child.kill().expect("stop original supervisor");
+    daemon.child.wait().expect("reap supervisor");
+    let descriptor_path = pa_daemon::descriptor::descriptor_dir(&agent_dir, &socket)
+        .join(format!("{worker_id}.json"));
+    let mut persisted: Value =
+        serde_json::from_slice(&std::fs::read(&descriptor_path).unwrap()).unwrap();
+    persisted["processStartId"] = json!("deliberately-stale-process-start");
+    std::fs::write(
+        &descriptor_path,
+        serde_json::to_vec_pretty(&persisted).unwrap(),
+    )
+    .unwrap();
+
+    for restart in 1..=2 {
+        let mut restarted = spawn_supervisor(&socket, &agent_dir);
+        wait_socket_ready(&socket);
+        let (mut client, _) = Client::connect(&socket);
+        client.send_command(
+            "register",
+            &json!({
+                "type": "worker_register", "activeSessionId": worker_id,
+                "socketPath": worker.socket_path.to_string_lossy(),
+                "token": worker.token, "pid": worker.pid,
+                "workerInstanceId": "",
+            }),
+        );
+        let refused = client.read_response("register");
+        assert_eq!(
+            refused["success"],
+            false,
+            "restart {restart} adopted stale worker: {refused}; descriptor: {}; log: {}",
+            std::fs::read_to_string(&descriptor_path).unwrap_or_default(),
+            std::fs::read_to_string(pa_daemon::paths::daemon_log_path(&socket, &agent_dir))
+                .unwrap_or_default()
+        );
+        assert!(!refused["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Unknown session worker"));
+        let failed: Value =
+            serde_json::from_slice(&std::fs::read(&descriptor_path).unwrap()).unwrap();
+        assert_eq!(failed["lifecycle"], "failed");
+        for field in [
+            "pid",
+            "processStartId",
+            "authenticationToken",
+            "socketPath",
+            "createCommand",
+        ] {
+            assert_eq!(
+                failed[field], persisted[field],
+                "restart {restart}: {field} changed"
+            );
+        }
+        assert!(failed["lastFailureAt"].as_str().is_some());
+        assert!(failed["lastError"].as_str().is_some());
+        assert!(
+            process_alive(worker.pid),
+            "restart {restart} stopped the original worker"
+        );
+        let (mut direct, _) = WorkerClient::connect(&worker.socket_path);
+        let auth = direct.request(
+            "worker_auth",
+            &json!({
+                "token": worker.token, "supervisorGeneration": "sup:direct",
+                "supervisorPid": 1, "supervisorSocketPath": socket.to_string_lossy(),
+            }),
+        );
+        assert_eq!(
+            auth["success"], true,
+            "restart {restart} direct auth failed: {auth}"
+        );
+        let health = direct.request("get_state", &json!({}));
+        assert_eq!(
+            health["success"], true,
+            "restart {restart} worker health failed: {health}"
+        );
+        eprintln!(
+            "restart {restart} original worker pid {} health: {health}",
+            worker.pid
+        );
+        if restart == 2 {
+            let stopped = direct.request("shutdown", &json!({}));
+            assert_eq!(
+                stopped["success"], true,
+                "owned worker shutdown failed: {stopped}"
+            );
+        }
+        restarted.child.kill().expect("stop replacement supervisor");
+        restarted.child.wait().expect("reap replacement supervisor");
+    }
+}

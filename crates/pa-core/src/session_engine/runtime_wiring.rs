@@ -354,6 +354,7 @@ impl IpythonKernelProvisioner for KernelProvisioner {
             let cell_timeout_ms = this.cell_timeout_ms();
             Ok(Box::new(KernelManagerExecutor {
                 manager,
+                provisioner: this,
                 cell_timeout_ms,
             }) as Box<dyn KernelExecutor>)
         })
@@ -370,6 +371,7 @@ impl IpythonKernelProvisioner for KernelProvisioner {
 /// Adapts the kernel manager to the ipython tool's executor contract.
 struct KernelManagerExecutor {
     manager: crate::kernel::manager::ReplKernelManager,
+    provisioner: KernelProvisioner,
     /// The session's default cell time limit (`None`: never armed; `0`: disabled).
     cell_timeout_ms: Option<u64>,
 }
@@ -386,6 +388,7 @@ impl KernelExecutor for KernelManagerExecutor {
         >,
     > {
         let manager = self.manager.clone();
+        let provisioner = self.provisioner.clone();
         let code = code.to_string();
         let signal = options.signal;
         let on_late_sent_agent_message = options.on_late_sent_agent_message;
@@ -396,12 +399,18 @@ impl KernelExecutor for KernelManagerExecutor {
             .filter(|ms| *ms > 0)
             .map(|default_ms| options.timeout_ms.unwrap_or(default_ms));
         Box::pin(async move {
+            let signal = signal.map(crate::kernel::cancellation::AbortSignal::from_token);
+            let on_public_cell_done = provisioner
+                .public_cell_done_callback(&manager, signal.as_ref())
+                .await
+                .map_err(KernelExecError::Other)?;
             let result = manager
                 .execute(
                     &code,
                     crate::kernel::shared::ExecuteOptions {
-                        signal: signal.map(crate::kernel::cancellation::AbortSignal::from_token),
+                        signal,
                         on_late_sent_agent_message,
+                        on_public_cell_done: Some(on_public_cell_done),
                         cell_timeout_ms,
                         ..Default::default()
                     },

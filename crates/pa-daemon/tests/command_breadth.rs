@@ -5,8 +5,9 @@
 
 use pa_daemon::protocol::command_active_session_id;
 use pa_daemon::protocol::command_type_name;
-use pa_daemon::protocol::parse_daemon_command_line;
 use pa_daemon::protocol::KNOWN_COMMAND_TYPES;
+use pa_daemon::protocol::{parse_daemon_command_line, parse_supervisor_command_line};
+use pa_types::daemon::{command_plane, is_daemon_mutating_command, DaemonCommandPlane};
 
 /// TS `DAEMON_COMMAND_TYPES`, verbatim and in declaration order
 /// (modes/daemon/daemon-supervisor.ts).
@@ -78,6 +79,7 @@ const TS_DAEMON_COMMAND_TYPES: &[&str] = &[
     "heartbeat_set",
     "heartbeat_update",
     "set_model",
+    "set_kernel_cwd",
     "cycle_model",
     "set_scoped_models",
     "set_thinking_level",
@@ -349,12 +351,16 @@ const WIRE_FIXTURES: &[(&str, &str)] = &[
         r#"{"type": "set_model", "activeSessionId": "sess", "provider": "prov", "modelId": "m"}"#,
     ),
     (
+        "set_kernel_cwd",
+        r#"{"type": "set_kernel_cwd", "activeSessionId": "sess", "dir": "/tmp"}"#,
+    ),
+    (
         "cycle_model",
         r#"{"type": "cycle_model", "activeSessionId": "sess"}"#,
     ),
     (
         "set_scoped_models",
-        r#"{"type": "set_scoped_models", "activeSessionId": "sess", "scopedModels": [ ]}"#,
+        r#"{"type": "set_scoped_models", "activeSessionId": "sess", "scopedModels": [{"provider":"prov-scoped","modelId":"m-scoped","thinkingLevel":"low"}]}"#,
     ),
     (
         "set_thinking_level",
@@ -583,8 +589,8 @@ fn every_command_type_parses_and_routes() {
             .to_string()
             + wire
             + "}";
-        let envelope = parse_daemon_command_line(&line)
-            .unwrap_or_else(|e| panic!("{type_name} must parse: {e}"));
+        let envelope = parse_supervisor_command_line(&line)
+            .unwrap_or_else(|e| panic!("{type_name} must parse in the supervisor: {e}"));
         assert_eq!(
             command_type_name(&envelope.command),
             *type_name,
@@ -598,6 +604,23 @@ fn every_command_type_parses_and_routes() {
             "{type_name}: session selector mismatch"
         );
         assert_eq!(selector, wire_has_selector.then_some("sess"));
+        if matches!(
+            *type_name,
+            "set_model" | "set_thinking_level" | "set_scoped_models"
+        ) {
+            assert_eq!(
+                command_plane(type_name),
+                DaemonCommandPlane::Session,
+                "{type_name}"
+            );
+            assert!(is_daemon_mutating_command(type_name), "{type_name}");
+            let parsed = serde_json::to_value(&envelope.command).unwrap();
+            let fixture: serde_json::Value = serde_json::from_str(wire).unwrap();
+            assert_eq!(
+                parsed, fixture,
+                "{type_name}: setter fields must survive parsing"
+            );
+        }
     }
 }
 

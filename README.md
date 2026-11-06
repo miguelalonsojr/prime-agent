@@ -54,6 +54,14 @@ irm https://app.primeintellect.ai/prime-agent/install.ps1 | iex
 
 The Windows installer downloads the latest stable Windows x64 build and verifies its checksum before installation.
 
+To build and install this Rust checkout locally on Linux or macOS, run the checkout's installer from any directory:
+
+```bash
+/path/to/prime-agent/scripts/install-local.sh
+```
+
+The script builds `pa-cli` in release mode with the locked dependencies and installs `prime-agent` to `$HOME/.local/bin`. It refuses an existing file or symlink unless invoked with `--force`; it never replaces a directory. A failed build leaves the existing command in place. The installed launcher uses absolute paths to this checkout and its release binary, so keep the checkout and binary available. It preserves the caller's working directory and arguments; it does not switch into the checkout when launching the agent. The checkout supplies the local Python kernel runtime sources. On first use, Prime Agent sets up its Python environment and default packages; this setup can require network access.
+
 ## Why Prime Agent
 
 Prime Agent combines a persistent Python control environment with durable harness state, so useful working context and reusable operating patterns can outlive a single chat window.

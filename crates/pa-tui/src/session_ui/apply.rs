@@ -214,8 +214,17 @@ impl SessionUi {
                 // The run's stash keys the LATEST sequence the worker has reported: a turn during
                 // this run advances it, so the re-entry matches the post-turn value the next attach
                 // reports. Monotonic max: a replayed event never lowers it.
-                if meta_sequence > self.last_event_sequence {
+                let newer_than_current = meta_sequence > self.last_event_sequence;
+                if newer_than_current {
                     self.last_event_sequence = meta_sequence;
+                }
+                if newer_than_current
+                    && event.get("type").and_then(Value::as_str) == Some("kernel_cwd_changed")
+                {
+                    if let Some(cwd) = event.get("cwd").and_then(Value::as_str) {
+                        self.kernel_cwd = cwd.into();
+                        self.dirty = true;
+                    }
                 }
                 if let Some(update) = event_to_update(&event) {
                     self.apply_update(update, view);

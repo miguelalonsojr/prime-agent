@@ -69,6 +69,38 @@ fn empty_prompt_input() -> pa_types::daemon::PromptInput {
 }
 
 #[tokio::test]
+async fn kernel_cwd_capability_requires_all_three_hello_gates() {
+    for (version, revision, capabilities, allowed) in [
+        (7, 31, vec!["kernel_cwd_propagation"], true),
+        (7, 32, vec!["kernel_cwd_propagation"], true),
+        (7, 30, vec!["kernel_cwd_propagation"], false),
+        (7, 31, vec![], false),
+        (6, 32, vec!["kernel_cwd_propagation"], false),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("d.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let hello = json!({"type":"daemon_hello","protocol":{"name":"prime-agent.daemon","version":version},
+                "schemaRevision":revision,"clientId":"srv","serverCapabilities":capabilities});
+            stream
+                .write_all(format!("{hello}\n").as_bytes())
+                .await
+                .unwrap();
+        });
+        let (client, _events) = DaemonClient::connect(&socket).await.unwrap();
+        assert_eq!(
+            client.supports_kernel_cwd_propagation(),
+            allowed,
+            "version {version}, revision {revision}"
+        );
+        client.close();
+        server.await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn handshake_and_request_round_trip() {
     let dir = tempfile::TempDir::new().unwrap();
     let socket = dir.path().join("d.sock");
@@ -264,6 +296,37 @@ fn model_catalog_changed_parses_to_the_refresh_event() {
     ));
 }
 
+#[test]
+fn kernel_cwd_legacy_parser_tolerates_optional_state_and_event() {
+    let frame = json!({
+        "type":"session_event", "activeSessionId":"s1",
+        "event":{"type":"kernel_cwd_changed","cwd":"/effective"},
+        "meta":{"sequence":4}
+    });
+    let Some(DaemonClientEvent::SessionEvent {
+        event,
+        meta_sequence,
+        ..
+    }) = client_event_from_value(&frame)
+    else {
+        panic!("legacy client lost the event frame")
+    };
+    assert_eq!(meta_sequence, 4);
+    assert_eq!(event["cwd"], "/effective");
+    assert!(matches!(
+        crate::snapshot::event_to_update(&event),
+        None | Some(crate::snapshot::TurnUpdate::StatusUpdate)
+    ));
+
+    let state = json!({"activeSessionId":"s1", "snapshot":{
+        "state":{"sessionId":"saved","cwd":"/session","kernelCwd":"/effective"},
+        "messages":[], "lastEventSequence":4
+    }});
+    let data = crate::snapshot::attach_data_from_response(state).unwrap();
+    assert_eq!(data.snapshot["state"]["kernelCwd"], "/effective");
+    assert_eq!(crate::snapshot::reconstruct(&data).session_id, "saved");
+}
+
 /// The layout handoff keys the stash on the LATEST sequence the worker
 /// reported, so `meta.sequence` must ride the parsed session event.
 #[test]
@@ -403,7 +466,7 @@ fn fail_pending_resolves_a_transport_failure_not_a_refusal() {
 
 /// A scripted worker socket for the direct-link tests: hello frame,
 /// `peer_auth` acceptance, one attach response, then one streamed event.
-async fn spawn_mock_worker(listener: tokio::net::UnixListener) {
+async fn spawn_mock_worker(listener: tokio::net::UnixListener, seen: mpsc::UnboundedSender<Value>) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let (stream, _) = listener.accept().await.expect("worker accept");
@@ -432,6 +495,10 @@ async fn spawn_mock_worker(listener: tokio::net::UnixListener) {
         pending.clear();
         for frame in frames {
             let command_type = frame.header["commandType"].as_str().unwrap_or_default();
+            if command_type == "set_kernel_cwd" {
+                seen.send(serde_json::from_slice(&frame.payload).unwrap())
+                    .unwrap();
+            }
             let request_id = frame.header["requestId"].as_str().unwrap_or_default();
             let (success, data) = match command_type {
                 "peer_auth" => (
@@ -456,6 +523,7 @@ async fn spawn_mock_worker(listener: tokio::net::UnixListener) {
                     true,
                     Some(serde_json::json!({ "id": "s1", "activity": "idle" })),
                 ),
+                "set_kernel_cwd" => (true, None),
                 _ => (false, None),
             };
             let response = serde_json::json!({
@@ -501,13 +569,14 @@ async fn spawn_mock_worker(listener: tokio::net::UnixListener) {
 }
 
 #[tokio::test]
-async fn direct_upgrade_routes_attach_and_streams_events() {
+async fn kernel_cwd_direct_upgrade_routes_attach_and_streams_events() {
     let dir = tempfile::TempDir::new().unwrap();
     let socket = dir.path().join("d.sock");
     let worker_socket = dir.path().join("w.sock");
     let listener = tokio::net::UnixListener::bind(&socket).unwrap();
     let worker_listener = tokio::net::UnixListener::bind(&worker_socket).unwrap();
-    tokio::spawn(async move { spawn_mock_worker(worker_listener).await });
+    let (seen_tx, mut seen_rx) = mpsc::unbounded_channel();
+    let worker = tokio::spawn(async move { spawn_mock_worker(worker_listener, seen_tx).await });
 
     // Scripted supervisor: advertises direct_peer_transport, answers the
     // ticket request with a ticket for the mock worker socket.
@@ -520,7 +589,8 @@ async fn direct_upgrade_routes_attach_and_streams_events() {
         let hello = serde_json::json!({
             "type": "daemon_hello",
             "protocol": { "name": "prime-agent.daemon", "version": 7 },
-            "serverCapabilities": ["direct_peer_transport"],
+            "schemaRevision": 31,
+            "serverCapabilities": ["direct_peer_transport", "kernel_cwd_propagation"],
         });
         writer
             .write_all(format!("{hello}\n").as_bytes())
@@ -528,7 +598,7 @@ async fn direct_upgrade_routes_attach_and_streams_events() {
             .unwrap();
         loop {
             line.clear();
-            if reader.read_line(&mut line).await.unwrap() == 0 {
+            if reader.read_line(&mut line).await.unwrap() == 0 || line.trim().is_empty() {
                 break;
             }
             let envelope: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
@@ -601,6 +671,23 @@ async fn direct_upgrade_routes_attach_and_streams_events() {
         .await
         .unwrap();
     assert_eq!(state["id"], "s1");
+    assert!(client.supports_kernel_cwd_propagation());
+    client
+        .request_ok(DaemonCommand::SetKernelCwd {
+            id: None,
+            active_session_id: "s1".to_string(),
+            dir: "/next".to_string(),
+            rest: Map::default(),
+        })
+        .await
+        .unwrap();
+    let received = seen_rx.recv().await.unwrap();
+    assert_eq!(received["type"], "set_kernel_cwd");
+    assert_eq!(received["activeSessionId"], "s1");
+    assert_eq!(received["dir"], "/next");
+    assert!(received["clientId"]
+        .as_str()
+        .is_some_and(|id| !id.is_empty()));
     let event = tokio::time::timeout(Duration::from_secs(5), events.recv())
         .await
         .unwrap()
@@ -613,7 +700,10 @@ async fn direct_upgrade_routes_attach_and_streams_events() {
         "unexpected event: {event:?}"
     );
     client.close();
-    let _ = supervisor.await;
+    supervisor
+        .await
+        .expect("mock supervisor must shut down cleanly");
+    worker.await.expect("mock worker must shut down cleanly");
 }
 
 #[tokio::test]
@@ -680,4 +770,245 @@ async fn without_capability_upgrade_is_a_no_op() {
     assert!(!client.upgrade_direct("s1").await.unwrap());
     assert_eq!(client.direct_session_id(), None);
     client.close();
+}
+
+/// Observe routed setters at the real socket receiver, not at a mock response.
+#[tokio::test]
+async fn routed_setters_preserve_payload_budget_and_do_not_replay_sent_timeouts() {
+    use pa_types::daemon::framing::{
+        encode_private_frame, PrivateFrameReader, DEFAULT_PRIVATE_FRAME_LIMITS,
+    };
+
+    let commands = [
+        (
+            DaemonCommand::SetModel {
+                id: None,
+                active_session_id: "s1".into(),
+                provider: "provider-olive".into(),
+                model_id: "model-violet".into(),
+                rest: Map::default(),
+            },
+            json!({"type":"set_model","activeSessionId":"s1","provider":"provider-olive","modelId":"model-violet"}),
+        ),
+        (
+            DaemonCommand::SetThinkingLevel {
+                id: None,
+                active_session_id: "s1".into(),
+                level: "high".into(),
+                rest: Map::default(),
+            },
+            json!({"type":"set_thinking_level","activeSessionId":"s1","level":"high"}),
+        ),
+        (
+            DaemonCommand::SetScopedModels {
+                id: None,
+                active_session_id: "s1".into(),
+                scoped_models: json!([{"provider":"provider-cyan","modelId":"model-gold","thinkingLevel":"low"}]),
+                rest: Map::default(),
+            },
+            json!({"type":"set_scoped_models","activeSessionId":"s1","scopedModels":[{"provider":"provider-cyan","modelId":"model-gold","thinkingLevel":"low"}]}),
+        ),
+    ];
+    for (index, (command, expected)) in commands.into_iter().enumerate() {
+        for fallback in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let socket = dir.path().join("d.sock");
+            let worker_socket = dir.path().join("w.sock");
+            let supervisor_listener = UnixListener::bind(&socket).unwrap();
+            let worker_listener = UnixListener::bind(&worker_socket).unwrap();
+            let (worker_seen_tx, mut worker_seen_rx) = mpsc::unbounded_channel::<Value>();
+            let (supervisor_seen_tx, mut supervisor_seen_rx) = mpsc::unbounded_channel::<Value>();
+            let (close_worker_tx, close_worker_rx) = oneshot::channel::<()>();
+            let (late_reply_tx, late_reply_rx) = oneshot::channel::<()>();
+            let worker = tokio::spawn(async move {
+                let (stream, _) = worker_listener.accept().await.unwrap();
+                let (reader, mut writer) = stream.into_split();
+                let mut reader = PrivateFrameReader::new(reader, DEFAULT_PRIVATE_FRAME_LIMITS);
+                let hello = encode_private_frame(
+                    &json!({"kind":"outbound","outboundType":"daemon_hello"}),
+                    br#"{"type":"daemon_hello","protocol":{"name":"prime-agent.daemon","version":7}}"#,
+                    DEFAULT_PRIVATE_FRAME_LIMITS,
+                ).unwrap();
+                writer.write_all(&hello).await.unwrap();
+                let auth = reader.read_frame().await.unwrap().expect("peer auth frame");
+                assert_eq!(auth.header["commandType"], "peer_auth");
+                let auth_id = auth.header["requestId"].as_str().unwrap();
+                let response = json!({"type":"response","id":auth_id,"command":"peer_auth","success":true,
+                    "data":{"workerInstanceId":"inst-1","activeSessionId":"s1","purpose":"session_client"}});
+                writer.write_all(&encode_private_frame(
+                    &json!({"kind":"outbound","outboundType":"response","requestId":auth_id}),
+                    &serde_json::to_vec(&response).unwrap(), DEFAULT_PRIVATE_FRAME_LIMITS,
+                ).unwrap()).await.unwrap();
+                if fallback {
+                    close_worker_rx.await.expect("release worker link");
+                    return;
+                }
+                let selected = reader.read_frame().await.unwrap().expect("setter frame");
+                assert_eq!(selected.header["kind"], "command");
+                assert_eq!(
+                    selected.header["commandType"],
+                    serde_json::from_slice::<Value>(&selected.payload).unwrap()["type"]
+                );
+                worker_seen_tx
+                    .send(serde_json::from_slice(&selected.payload).unwrap())
+                    .unwrap();
+                late_reply_rx.await.expect("release late worker reply");
+                let request_id = selected.header["requestId"].as_str().unwrap();
+                let response = json!({"type":"response","id":request_id,"command":selected.header["commandType"],"success":true});
+                writer.write_all(&encode_private_frame(
+                    &json!({"kind":"outbound","outboundType":"response","requestId":request_id}),
+                    &serde_json::to_vec(&response).unwrap(), DEFAULT_PRIVATE_FRAME_LIMITS,
+                ).unwrap()).await.unwrap();
+                assert!(
+                    reader.read_frame().await.unwrap().is_none(),
+                    "no duplicate worker frame"
+                );
+            });
+            let ticket_socket = worker_socket.clone();
+            let supervisor = tokio::spawn(async move {
+                let (stream, _) = supervisor_listener.accept().await.unwrap();
+                let (reader, mut writer) = stream.into_split();
+                let mut reader = BufReader::new(reader);
+                writer.write_all(b"{\"type\":\"daemon_hello\",\"protocol\":{\"name\":\"prime-agent.daemon\",\"version\":7},\"schemaRevision\":31,\"clientId\":\"srv\",\"serverCapabilities\":[\"direct_peer_transport\"]}\n").await.unwrap();
+                let mut seen = Vec::new();
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).await.unwrap() == 0 || line.trim().is_empty() {
+                        break;
+                    }
+                    let envelope: Value = serde_json::from_str(&line).unwrap();
+                    let kind = envelope["command"]["type"].as_str().expect("command type");
+                    let response = if kind == "get_direct_worker_transport" {
+                        let identity = pa_types::platform::socket_identity(&ticket_socket).unwrap();
+                        json!({"type":"response","id":envelope["id"],"command":kind,"success":true,
+                            "data":{"purpose":"session_client","socketPath":ticket_socket.to_string_lossy(),
+                            "socketIdentity":{"dev":identity.dev,"ino":identity.ino},"workerInstanceId":"inst-1",
+                            "activeSessionId":"s1","grantId":"g1","token":"t","expiresAt":"2999-01-01T00:00:00.000Z"}})
+                    } else if kind == "list" {
+                        assert_eq!(
+                            seen.len(),
+                            usize::from(fallback),
+                            "replay preceded FIFO marker"
+                        );
+                        json!({"type":"response","id":envelope["id"],"command":kind,"success":true})
+                    } else {
+                        seen.push(envelope["command"].clone());
+                        supervisor_seen_tx.send(envelope).unwrap();
+                        continue;
+                    };
+                    writer
+                        .write_all(format!("{response}\n").as_bytes())
+                        .await
+                        .unwrap();
+                }
+                assert_eq!(
+                    seen.len(),
+                    usize::from(fallback),
+                    "unexpected supervisor replay"
+                );
+            });
+            let (client, mut events) = DaemonClient::connect(&socket).await.unwrap();
+            assert!(client.upgrade_direct("s1").await.unwrap());
+            if fallback {
+                close_worker_tx.send(()).unwrap();
+                let event = tokio::time::timeout(Duration::from_secs(3), events.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(
+                    matches!(event, DaemonClientEvent::DirectLinkLost { active_session_id } if active_session_id == "s1")
+                );
+            }
+            let budget_ms = 110 + (index as u64 * 23) + u64::from(fallback) * 11;
+            let start = std::time::Instant::now();
+            let request = tokio::spawn({
+                let client = client.clone();
+                let command = command.clone();
+                async move { client.request_with_timeout(command, budget_ms).await }
+            });
+            let received = tokio::time::timeout(Duration::from_secs(3), async {
+                if fallback {
+                    supervisor_seen_rx.recv().await
+                } else {
+                    worker_seen_rx.recv().await
+                }
+            })
+            .await
+            .unwrap()
+            .expect("selected receiver got command");
+            let payload = if fallback {
+                &received["command"]
+            } else {
+                &received
+            };
+            let client_id = &received["clientId"];
+            assert_eq!(
+                client_id.as_str(),
+                Some(format!("daemon-tui:{}", std::process::id()).as_str())
+            );
+            let mut body = payload.clone();
+            if let Some(fields) = body.as_object_mut() {
+                fields.remove("clientId");
+            }
+            assert_eq!(body, expected, "route fallback={fallback}, setter={index}");
+            let error = tokio::time::timeout(Duration::from_secs(3), request)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap_err();
+            assert!(
+                start.elapsed() >= Duration::from_millis(budget_ms / 2),
+                "premature timeout: {error}"
+            );
+            let endpoint = if fallback { &socket } else { &worker_socket };
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("Timed out after {budget_ms}ms")),
+                "{error}"
+            );
+            assert!(
+                error.to_string().contains(&endpoint.display().to_string()),
+                "{error}"
+            );
+            assert!(
+                error.to_string().contains(if fallback {
+                    "daemon response"
+                } else {
+                    "session response"
+                }),
+                "{error}"
+            );
+            if !fallback {
+                assert!(
+                    supervisor_seen_rx.try_recv().is_err(),
+                    "direct command reached supervisor"
+                );
+            }
+            // The successful control response is a FIFO boundary after terminal timeout.
+            client
+                .request_ok(DaemonCommand::List {
+                    id: None,
+                    all: None,
+                    cwd: None,
+                    session_dir: None,
+                    include_client_owned: None,
+                    rest: Map::default(),
+                })
+                .await
+                .unwrap();
+            if !fallback {
+                late_reply_tx.send(()).unwrap();
+            }
+            client.close();
+            tokio::time::timeout(Duration::from_secs(3), worker)
+                .await
+                .unwrap()
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(3), supervisor)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+    }
 }

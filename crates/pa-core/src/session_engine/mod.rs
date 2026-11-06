@@ -151,6 +151,9 @@ pub struct AgentSession {
     /// TS `_pendingNextTurnMessages`: custom rows the NEXT admitted
     /// turn carries ahead of its own prompt row.
     pending_next_turn_rows: std::sync::Arc<std::sync::Mutex<Vec<pa_types::session::CustomMessage>>>,
+    kernel_cwd_provisioner:
+        Option<std::sync::Weak<crate::kernel::provisioner::IpythonKernelProvisioner>>,
+    kernel_cwd_fallback: std::path::PathBuf,
     /// The skill inventory `/skill:<name>` submissions expand against.
     skills: Vec<crate::skills::Skill>,
     /// The telemetry handle for the `skill_use_count` counter the prompt
@@ -193,6 +196,58 @@ pub struct AgentSession {
 }
 
 impl AgentSession {
+    /// Attach the session's kernel owner without forming a strong ownership cycle.
+    pub fn bind_kernel_cwd(
+        &mut self,
+        provisioner: &std::sync::Arc<crate::kernel::provisioner::IpythonKernelProvisioner>,
+    ) {
+        self.kernel_cwd_provisioner = Some(std::sync::Arc::downgrade(provisioner));
+    }
+
+    /// The effective Python-kernel working directory.
+    #[must_use]
+    pub fn kernel_cwd(&self) -> std::path::PathBuf {
+        self.kernel_cwd_provisioner
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+            .map_or_else(
+                || self.kernel_cwd_fallback.clone(),
+                |owner| owner.kernel_cwd(),
+            )
+    }
+
+    /// Apply a directory and queue one hidden row for the next admitted turn.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no kernel owner exists or the directory change fails.
+    pub async fn set_kernel_cwd(
+        &self,
+        dir: &std::path::Path,
+    ) -> anyhow::Result<std::path::PathBuf> {
+        let owner = self
+            .kernel_cwd_provisioner
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+            .ok_or_else(|| anyhow::anyhow!("Kernel provisioner unavailable"))?;
+        let cwd = owner.set_kernel_cwd(dir).await?;
+        self.queue_next_turn_row(pa_types::session::CustomMessage {
+            custom_type: "term_cwd_changed".into(),
+            content: pa_types::ai::UserContent::Text(format!(
+                "Working directory changed to {} by the user via /term. Your IPython kernel now runs in this directory.",
+                cwd.display()
+            )),
+            display: false,
+            details: Some(serde_json::json!({"cwd": cwd})),
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+            rest: serde_json::Map::default(),
+        });
+        Ok(cwd)
+    }
+
     /// Build a session around a running agent loop.
     ///
     /// # Errors
@@ -237,6 +292,7 @@ impl AgentSession {
                 })
             })
             .await;
+        let kernel_cwd_fallback = session.lock().await.get_cwd().to_path_buf();
         let this = Self {
             agent,
             session,
@@ -252,6 +308,8 @@ impl AgentSession {
             compact_auto_refine: std::sync::Mutex::default(),
             kernel_state: None,
             pending_next_turn_rows: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            kernel_cwd_provisioner: None,
+            kernel_cwd_fallback,
             skills: Vec::new(),
             skill_telemetry: None,
             image_model_router: None,

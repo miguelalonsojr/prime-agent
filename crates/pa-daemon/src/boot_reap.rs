@@ -570,17 +570,21 @@ fn protected_worker_pids(agent_dir: &Path, socket_path: &Path) -> HashSet<u32> {
             else {
                 continue;
             };
-            if descriptor.version != 2 || descriptor.pid == 0 {
+            if descriptor.version != 2 {
+                continue;
+            }
+            let Ok(pid) = u32::try_from(descriptor.pid) else {
+                continue;
+            };
+            if pid == 0 {
                 continue;
             }
             // A RELATIVE spelling resolves against the WORKER's own cwd
             // (/proc/<pid>/cwd), exactly as discovery resolves the inherited env value.
-            let spelling =
-                match socket_spelling_of(descriptor.pid as u32, &descriptor.supervisor_socket_path)
-                {
-                    spelling if spelling.is_empty() => continue,
-                    spelling => spelling,
-                };
+            let spelling = match socket_spelling_of(pid, &descriptor.supervisor_socket_path) {
+                spelling if spelling.is_empty() => continue,
+                spelling => spelling,
+            };
             if spelling != ours {
                 continue;
             }
@@ -589,13 +593,23 @@ fn protected_worker_pids(agent_dir: &Path, socket_path: &Path) -> HashSet<u32> {
             if descriptor.stop_requested_at.is_some() {
                 continue;
             }
-            let identity_holds = match &descriptor.process_start_id {
-                Some(expected) => crate::lease::get_process_start_id(descriptor.pid as u32)
-                    .is_none_or(|observed| observed == expected.as_str()),
-                None => true,
-            };
-            if identity_holds {
-                protected.insert(descriptor.pid as u32);
+            let observed = crate::lease::get_process_start_id(pid);
+            let mismatched = descriptor
+                .process_start_id
+                .as_ref()
+                .zip(observed.as_ref())
+                .is_some_and(|(expected, observed)| expected != observed);
+            let disputed_ordinary = matches!(
+                descriptor.lifecycle,
+                crate::descriptor::WorkerLifecycle::Starting
+                    | crate::descriptor::WorkerLifecycle::Ready
+                    | crate::descriptor::WorkerLifecycle::Recovering
+            ) || (descriptor.lifecycle
+                == crate::descriptor::WorkerLifecycle::Failed
+                && descriptor.last_error.as_deref()
+                    == Some(crate::supervisor::ORDINARY_WORKER_IDENTITY_REFUSAL));
+            if !mismatched || disputed_ordinary {
+                protected.insert(pid);
             }
         }
     }
@@ -692,6 +706,82 @@ fn read_proc_argv(pid: u32) -> Option<Vec<String>> {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    use serde_json::json;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mismatched_active_descriptor_protects_only_ordinary_worker_claims() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let agent_dir = dir.path().join("agent");
+        let socket = dir.path().join("daemon.sock");
+        let descriptor_dir = crate::descriptor::descriptor_dir(&agent_dir, &socket);
+        std::fs::create_dir_all(&descriptor_dir).expect("descriptor dir");
+        let pid = std::process::id();
+        let observed = crate::lease::get_process_start_id(pid).expect("observable test pid");
+        let path = descriptor_dir.join("worker.json");
+        let cases = [
+            ("starting", Some("stale"), None, None, true),
+            ("ready", Some("stale"), None, None, true),
+            ("recovering", Some("stale"), None, None, true),
+            (
+                "failed",
+                Some("stale"),
+                Some(crate::supervisor::ORDINARY_WORKER_IDENTITY_REFUSAL),
+                None,
+                true,
+            ),
+            (
+                "failed",
+                Some("stale"),
+                Some("old crash give-up"),
+                None,
+                false,
+            ),
+            ("stopping", Some("stale"), None, None, false),
+            ("ready", Some("stale"), None, Some("2026-01-01"), false),
+            ("ready", Some(observed.as_str()), None, None, true),
+            ("ready", None, None, None, true),
+        ];
+        for (lifecycle, expected, error, stopped, protected) in cases {
+            let descriptor = json!({
+                "version": 2, "workerId": "worker", "pid": pid,
+                "processStartId": expected,
+                "socketPath": dir.path().join("worker.sock").to_string_lossy(),
+                "supervisorSocketPath": socket.to_string_lossy(),
+                "recoveryJournalPath": dir.path().join("recovery.jsonl").to_string_lossy(),
+                "authenticationToken": "token", "rootActiveSessionId": "worker",
+                "createdAt": "t", "updatedAt": "t", "lifecycle": lifecycle,
+                "createCommand": {}, "consecutiveFailures": 0,
+                "lastError": error, "stopRequestedAt": stopped,
+            });
+            std::fs::write(&path, serde_json::to_vec(&descriptor).unwrap()).unwrap();
+            assert_eq!(
+                protected_worker_pids(&agent_dir, &socket).contains(&pid),
+                protected,
+                "lifecycle={lifecycle} expected={expected:?} error={error:?} stop={stopped:?}"
+            );
+        }
+        for (version, pid_value, foreign) in [
+            (1, json!(pid), false),
+            (2, json!(0), false),
+            (2, json!(u64::from(u32::MAX) + u64::from(pid) + 1), false),
+            (2, json!(pid), true),
+        ] {
+            let descriptor = json!({
+                "version": version, "workerId": "worker", "pid": pid_value,
+                "processStartId": "stale", "socketPath": "/tmp/worker.sock",
+                "supervisorSocketPath": if foreign { "/tmp/foreign.sock".into() } else { socket.to_string_lossy().to_string() },
+                "recoveryJournalPath": "/tmp/recovery.jsonl", "authenticationToken": "token",
+                "rootActiveSessionId": "worker", "createdAt": "t", "updatedAt": "t",
+                "lifecycle": "ready", "createCommand": {}, "consecutiveFailures": 0,
+            });
+            std::fs::write(&path, serde_json::to_vec(&descriptor).unwrap()).unwrap();
+            assert!(!protected_worker_pids(&agent_dir, &socket).contains(&pid));
+        }
+        std::fs::write(&path, "invalid json").unwrap();
+        assert!(!protected_worker_pids(&agent_dir, &socket).contains(&pid));
+    }
 
     fn target(pid: u32) -> ReapTarget {
         ReapTarget {

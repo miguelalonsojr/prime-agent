@@ -92,6 +92,7 @@ impl Worker {
             is_compacting: core.compacting,
             active_session_id: Some(core.active_session_id.clone()),
             cwd: core.cwd.clone(),
+            kernel_cwd: inputs.kernel_cwd,
             model: inputs.model,
             thinking_level: inputs.thinking_level,
             // The ACTIVE tier: the preference clamped to the model's tier support.
@@ -477,6 +478,7 @@ impl SummaryInputs {
 /// core state; registry-derived values resolve before the lock.
 pub(crate) struct ConnectionStateInputs {
     model: Option<Value>,
+    kernel_cwd: Option<String>,
     thinking_level: String,
     available_thinking_levels: Vec<String>,
     is_bash_running: bool,
@@ -510,6 +512,9 @@ impl ConnectionStateInputs {
     ) -> Self {
         Self {
             model: details.model,
+            kernel_cwd: engine
+                .kernel_cwd()
+                .map(|cwd| cwd.to_string_lossy().into_owned()),
             thinking_level: engine
                 .effective_thinking_level()
                 .unwrap_or_else(|| "default".to_string()),

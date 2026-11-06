@@ -102,6 +102,7 @@ pub mod session;
 pub mod session_open_error;
 pub mod session_ui;
 pub mod settings_menu;
+mod shell_session;
 pub mod side_question;
 pub mod snapshot;
 pub mod subagents;

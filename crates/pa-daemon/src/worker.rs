@@ -97,6 +97,11 @@ use crate::session_store::{session_file_name, SessionFile};
 
 use crate::types::{AgentConnectionState, SessionActionSnapshot};
 
+pub(crate) struct SupervisorGenerationClaim {
+    pub(crate) generation: String,
+    pub(crate) connections: usize,
+}
+
 pub struct Worker {
     pub(crate) config: WorkerConfig,
     /// The bind-time filesystem identity of this worker's own socket file
@@ -124,6 +129,9 @@ pub struct Worker {
     /// Live connections authenticated as the supervisor role; a non-zero
     /// count disarms the supervisor-lost exit monitor.
     pub(crate) supervisor_claims: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Current generation and its live connection count; unlike the orphan
+    /// monitor's total count, this fences peer grants after replacement.
+    pub(crate) supervisor_generation_claim: Arc<Mutex<Option<SupervisorGenerationClaim>>>,
     pub(crate) core: Arc<Mutex<SessionCore>>,
     pub(crate) engine: std::sync::Arc<dyn SessionEngine>,
     /// The concrete agent engine behind `engine` for the create command's
@@ -665,6 +673,19 @@ impl Worker {
                         );
                     });
                 concrete.set_progress_note_emit(note_emit);
+                let cwd_core = Arc::clone(&core);
+                let cwd_events = events.clone();
+                let cwd_session_id = config.active_session_id.clone();
+                concrete.set_kernel_cwd_changed_sink(Arc::new(move |cwd| {
+                    let mut core = cwd_core.lock().unwrap();
+                    if core.created && core.active_session_id == cwd_session_id {
+                        crate::worker::summary::emit_worker_event_locked(
+                            &mut core,
+                            &cwd_events,
+                            json!({ "type": "kernel_cwd_changed", "cwd": cwd }),
+                        );
+                    }
+                }));
             }
             // The live roster activity feed (TS `observeRosterEvent`): busy
             // flips and trigger events coalesce into `worker_roster_delta`
@@ -758,6 +779,7 @@ impl Worker {
             listener_closed: tokio::sync::Notify::new(),
             registration,
             supervisor_claims,
+            supervisor_generation_claim: Arc::new(Mutex::new(None)),
             core,
             engine,
             agent_engine,
