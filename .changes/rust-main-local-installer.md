@@ -1,0 +1,1 @@
+- Added a local-source installer that builds Prime Agent and safely publishes a checkout-bound launcher.
