@@ -1012,3 +1012,110 @@ async fn routed_setters_preserve_payload_budget_and_do_not_replay_sent_timeouts(
         }
     }
 }
+
+#[tokio::test]
+async fn retry_wait_cancellation_removes_registration_without_waiting_for_the_server() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("cancel.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let (seen_tx, seen_rx) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let (reader, mut writer) = stream.into_split();
+        writer.write_all(b"{\"type\":\"daemon_hello\",\"protocol\":{\"name\":\"prime-agent.daemon\",\"version\":7}}\n").await.unwrap();
+        let mut reader = BufReader::new(reader);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        seen_tx.send(()).unwrap();
+        std::future::pending::<()>().await;
+    });
+    let (client, _events) = DaemonClient::connect(&socket).await.unwrap();
+    let request_client = client.clone();
+    let task = tokio::spawn(async move {
+        request_client
+            .request_ok(DaemonCommand::WaitForIdle {
+                id: None,
+                active_session_id: "s1".into(),
+                wait_for_rlm_quiescence: None,
+                rest: Map::default(),
+            })
+            .await
+    });
+    seen_rx.await.unwrap();
+    assert_eq!(client.shared.pending.lock().unwrap().len(), 1);
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    assert!(client.shared.pending.lock().unwrap().is_empty());
+    client.close();
+    server.abort();
+}
+
+#[tokio::test]
+async fn retry_route_rejects_a_replaced_direct_owner_without_supervisor_fallback() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("supervisor.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let server = tokio::spawn(spawn_mock_daemon(listener));
+    let (client, _events) = DaemonClient::connect(&socket).await.unwrap();
+    let supervisor_route = client.retry_route();
+    for index in 0..2 {
+        let socket = dir.path().join(format!("worker-{index}.sock"));
+        let listener = UnixListener::bind(&socket).unwrap();
+        let (seen, _seen_rx) = mpsc::unbounded_channel();
+        tokio::spawn(spawn_mock_worker(listener, seen));
+        let ticket = pa_types::daemon::DaemonPeerTransportTicket {
+            purpose: "session_client".into(),
+            socket_path: socket.to_string_lossy().into(),
+            socket_identity: pa_types::platform::socket_identity(&socket).unwrap(),
+            worker_instance_id: "inst-1".into(),
+            active_session_id: "s1".into(),
+            grant_id: "g1".into(),
+            token: "t".into(),
+            expires_at: "2999-01-01T00:00:00.000Z".into(),
+        };
+        let pinned = client.retry_route();
+        let link = connect_direct(
+            &ticket,
+            Arc::clone(&client.shared),
+            client.direct.event_sender().unwrap(),
+        )
+        .await
+        .unwrap();
+        client.direct.set_link(link);
+        let before = client.next_request_id.load(Ordering::SeqCst);
+        let outcome = pinned
+            .request(
+                &client,
+                "s1",
+                DaemonCommand::GetState {
+                    id: None,
+                    active_session_id: "s1".into(),
+                    rest: Map::default(),
+                },
+            )
+            .await;
+        assert!(outcome.is_err());
+        assert_eq!(
+            client.next_request_id.load(Ordering::SeqCst),
+            before,
+            "replaced route must not send on either socket"
+        );
+        assert!(!supervisor_route.is_current(&client, "s1"));
+    }
+    let pinned = client.retry_route();
+    client.direct.drop_link();
+    assert!(pinned
+        .request(
+            &client,
+            "s1",
+            DaemonCommand::GetState {
+                id: None,
+                active_session_id: "s1".into(),
+                rest: Map::default(),
+            }
+        )
+        .await
+        .is_err());
+    client.close();
+    server.abort();
+}

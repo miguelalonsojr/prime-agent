@@ -78,7 +78,16 @@ fn input_live_open_child_mode() {
         .enable_all()
         .build()
         .expect("tokio runtime");
-    let _ = runtime.block_on(run_interactive(options, UiMode::Terminal));
+    let ui = if std::env::var_os("PA_HERDR_HEADLESS").is_some() {
+        UiMode::Headless(pa_tui::interactive::HeadlessPlan {
+            steps: vec![],
+            width: 80,
+            height: 24,
+        })
+    } else {
+        UiMode::Terminal
+    };
+    let _ = runtime.block_on(run_interactive(options, ui));
 }
 
 /// The pty harnesses serialize: each drives a raw pty; concurrent
@@ -697,6 +706,8 @@ fn spawn_cli_child(
         .env("LANG", "C.UTF-8")
         .env("TERM", "xterm-256color")
         .env("PS1", "PA_TERM_READY>")
+        .env("HC_TERMINAL_ID", "isolated-osc-test")
+        .env("HC_TERMINAL_SOCKET", "/tmp/unused-osc-test.sock")
         .env("SHELL", fallback_shell)
         .stdin(slave_as_stdio(slave))
         .stdout(slave_as_stdio(slave))
@@ -765,6 +776,9 @@ struct MockSupervisor {
     cwd_capable: bool,
     cli_cwd: Option<PathBuf>,
     cli_shutdown: Option<Arc<std::sync::atomic::AtomicBool>>,
+    osc_events: Option<std::sync::mpsc::Sender<std::os::unix::net::UnixStream>>,
+    attach_busy: bool,
+    osc_requests: Option<std::sync::mpsc::Sender<(String, String)>>,
 }
 
 impl MockSupervisor {
@@ -775,6 +789,9 @@ impl MockSupervisor {
             cwd_capable,
             cli_cwd: None,
             cli_shutdown: None,
+            osc_events: None,
+            attach_busy: false,
+            osc_requests: None,
         }
     }
 
@@ -818,6 +835,10 @@ impl MockSupervisor {
             return;
         }
         let write_stream = stream.try_clone().expect("clone mock socket");
+        if let Some(tx) = &self.osc_events {
+            tx.send(write_stream.try_clone().expect("OSC event stream"))
+                .expect("OSC controller");
+        }
         let mut writer = write_stream;
         let mut reader = BufReader::new(stream);
 
@@ -844,6 +865,7 @@ impl MockSupervisor {
         }
 
         let mut line = String::new();
+        let mut osc_wait_seen = false;
         loop {
             line.clear();
             match reader.read_line(&mut line) {
@@ -865,6 +887,21 @@ impl MockSupervisor {
                 .expect("commands")
                 .push(format!("{command_type}: {command}"));
             match command_type.as_str() {
+                "wait_for_idle" if self.osc_requests.is_some() => {
+                    osc_wait_seen = true;
+                    self.osc_requests
+                        .as_ref()
+                        .unwrap()
+                        .send((id.to_string(), command_type))
+                        .unwrap();
+                }
+                "get_state" if osc_wait_seen => {
+                    self.osc_requests
+                        .as_ref()
+                        .unwrap()
+                        .send((id.to_string(), command_type))
+                        .unwrap();
+                }
                 "create" => {
                     write_json(
                         &mut writer,
@@ -883,6 +920,7 @@ impl MockSupervisor {
                         std::thread::sleep(Duration::from_millis(OPEN_STALL_MS));
                     }
                     let mut attached = attach_data(id);
+                    attached["data"]["snapshot"]["state"]["isStreaming"] = json!(self.attach_busy);
                     if let Some(cwd) = &self.cli_cwd {
                         let cwd = cwd.display().to_string();
                         attached["data"]["snapshot"]["summary"]["cwd"] = json!(cwd);
@@ -1367,3 +1405,6 @@ fn task4_term_panic_reaps_shell_descendant_for_both_constructors() {
     ];
     assert_eq!(results, [("reexecuted", Ok(())), ("real CLI", Ok(()))]);
 }
+
+#[path = "support/herdr_app_osc.rs"]
+mod herdr_app_osc;

@@ -1,0 +1,1 @@
+- Show interactive Prime Agent sessions in Herdr App’s Agents panel with working, idle, and blocked status; clear the report on exit.

@@ -249,6 +249,8 @@ fn spawn_watchdog(state: &Arc<GuardState>) {
 /// process with code 0 (the exit is deliberate, not a crash).
 fn force_quit() -> ! {
     crate::exit_restore::restore_terminal();
+    // process::exit skips the interactive process guard's destructor.
+    drop(crate::herdr_app::HerdrAppTerminal::detect());
     eprintln!("Prime Agent: shutdown stalled; forced exit.");
     std::process::exit(0)
 }

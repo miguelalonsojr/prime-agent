@@ -37,6 +37,7 @@ mod tests;
 
 /// Run the interactive TUI attached to the daemon. Returns the exit code.
 pub fn run_interactive_mode(options: &RunOptions) -> Result<i32> {
+    let herdr_app = pa_tui::herdr_app::HerdrAppTerminal::detect();
     let socket_path = resolve_socket_path(options.daemon_socket.as_deref());
     let configuration_load_started = std::time::Instant::now();
     let (tui_options, pending_onboarding_stages) = build_tui_options(
@@ -87,6 +88,12 @@ pub fn run_interactive_mode(options: &RunOptions) -> Result<i32> {
             }
         }
         if let Some(client) = startup_telemetry.as_ref() {
+            if herdr_app.enabled() {
+                client.track(
+                    "herdr app integration enabled",
+                    pa_telemetry::Properties::new(),
+                );
+            }
             pa_telemetry::AgentStartupStage {
                 stage: "configuration_load",
                 outcome: "completed",

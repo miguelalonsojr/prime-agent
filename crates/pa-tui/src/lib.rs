@@ -66,6 +66,7 @@ pub mod factory_view;
 pub mod fuzzy;
 pub mod goal_surface;
 pub mod heartbeats_picker;
+pub mod herdr_app;
 pub mod hotkeys;
 pub mod hyperlinks;
 mod image_component;

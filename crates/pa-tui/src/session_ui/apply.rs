@@ -215,6 +215,20 @@ impl SessionUi {
                 // this run advances it, so the re-entry matches the post-turn value the next attach
                 // reports. Monotonic max: a replayed event never lowers it.
                 let newer_than_current = meta_sequence > self.last_event_sequence;
+                if newer_than_current || meta_sequence == 0 {
+                    self.herdr_app.event(
+                        &event,
+                        !view.queued.is_empty(),
+                        std::time::Instant::now(),
+                    );
+                    if matches!(
+                        event["type"].as_str(),
+                        Some("auto_retry_start" | "agent_start" | "turn_start")
+                    ) {
+                        self.herdr_app
+                            .watch_retry(&self.client, &self.active_session_id);
+                    }
+                }
                 if newer_than_current {
                     self.last_event_sequence = meta_sequence;
                 }
@@ -243,6 +257,7 @@ impl SessionUi {
                 reason,
             } => {
                 if active_session_id == self.active_session_id {
+                    self.herdr_app.idle_for_handoff();
                     self.turn_active = false;
                     view.working = None;
                     self.bash_list_epoch += 1;
@@ -274,6 +289,11 @@ impl SessionUi {
                 // A direct-transport loss is never itself a session loss — the loop re-attaches
                 // through the supervisor; only the active session arms it.
                 if active_session_id == self.active_session_id {
+                    self.herdr_app.transport_lost(
+                        &self.client,
+                        &self.active_session_id,
+                        Some(&active_session_id),
+                    );
                     self.transport_lost = Some(active_session_id);
                 }
             }

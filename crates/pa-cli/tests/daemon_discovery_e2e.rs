@@ -380,6 +380,45 @@ fn doctor_lists_and_then_reaps_an_idle_root_owned_daemon() {
 }
 
 #[test]
+fn shutdown_discovers_a_daemon_on_the_product_default_socket() {
+    let fixture = tempfile::Builder::new()
+        .prefix("pa-")
+        .tempdir_in("/tmp")
+        .expect("short fixture path");
+    let agent_dir = fixture.path().join("agent");
+    // SAFETY: getuid is a pure identity query.
+    let default_socket = fixture
+        .path()
+        .join(format!("prime-agent-{}", unsafe { libc::getuid() }))
+        .join("daemon.sock");
+    std::os::unix::net::SocketAddr::from_pathname(
+        default_socket.with_file_name("worker-000000000000-000000000000.sock"),
+    )
+    .expect("TMPDIR is short enough to avoid the macOS default-socket fallback");
+    assert!(default_socket.starts_with(fixture.path()));
+    let mut daemon = spawn_daemon(&default_socket, &agent_dir, fixture.path());
+
+    let status = run_cli(fixture.path(), &["status", "--json"]);
+    assert_eq!(status.status.code(), Some(0), "{}", stderr(&status));
+    let services: Value = serde_json::from_str(&stdout(&status)).expect("status json");
+    assert_eq!(services.as_array().expect("services").len(), 1);
+    assert_eq!(
+        services[0]["socketPath"],
+        default_socket.to_string_lossy().as_ref()
+    );
+    assert_eq!(services[0]["isDefault"], true);
+
+    let shutdown = run_cli(fixture.path(), &["shutdown", "--force", "--json"]);
+    assert_eq!(shutdown.status.code(), Some(0), "{}", stderr(&shutdown));
+    let report: Value = serde_json::from_str(&stdout(&shutdown)).expect("shutdown json");
+    assert_eq!(
+        reported_socket_paths(&report),
+        vec![default_socket.to_string_lossy().to_string()]
+    );
+    wait_until_stopped(&default_socket, &mut daemon);
+}
+
+#[test]
 fn shutdown_without_force_requires_confirmation_and_harms_nothing() {
     let fixture = tempfile::tempdir().expect("fixture");
     let agent_dir = fixture.path().join("agent");

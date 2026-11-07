@@ -62,6 +62,7 @@ fn slow_drain_child_mode() {
     let Ok(socket) = std::env::var(CHILD_SOCKET_ENV) else {
         return;
     };
+    let _herdr = pa_tui::herdr_app::HerdrAppTerminal::detect();
     let options = child_options(PathBuf::from(socket));
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -193,6 +194,10 @@ fn a_stalled_drain_still_fires_the_force_quit() {
     );
     harness.settle();
     let output2 = harness.output();
+    assert!(
+        find_subsequence(&output2, b"\x1b]7501;state=clear:app=prime-agent\x1b\\").is_some(),
+        "forced exit clears Herdr root status"
+    );
     // The fire is asserted structurally: the forced restore writes its own
     // alt-screen leave (a clean leg leaves exactly once), and the flush
     // never reaches the transcript tail.
@@ -430,6 +435,13 @@ fn spawn_child(socket: &Path, slave: &OwnedFd) -> Child {
         .arg("--exact")
         .arg("slow_drain_child_mode")
         .env(CHILD_SOCKET_ENV, socket)
+        .env("HC_TERMINAL_ID", "forced-exit-test")
+        .env("HC_TERMINAL_SOCKET", "unused")
+        .env("TERM", "xterm-256color")
+        .env_remove("TERM_PROGRAM")
+        .env_remove("GHOSTTY_RESOURCES_DIR")
+        .env_remove("KITTY_WINDOW_ID")
+        .env_remove("WEZTERM_PANE")
         .env_remove("TMUX")
         .stdin(slave_as_stdio(slave))
         .stdout(slave_as_stdio(slave))

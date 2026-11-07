@@ -921,6 +921,7 @@ pub(super) enum Renderer {
     Terminal {
         term: ratatui::Terminal<crate::hyperlinks::LinkBackend>,
         show_hardware_cursor: bool,
+        herdr_app: Box<crate::herdr_app::HerdrAppStatus>,
     },
     Headless {
         width: u16,
@@ -1018,9 +1019,12 @@ impl Renderer {
                     crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
                     crossterm::cursor::Hide
                 )?;
+                let mut herdr_app = crate::herdr_app::HerdrAppStatus::terminal();
+                herdr_app.session_open(false);
                 Ok(Renderer::Terminal {
                     term: terminal,
                     show_hardware_cursor,
+                    herdr_app: Box::new(herdr_app),
                 })
             }
             AgentsViewUiMode::Headless(plan) => {
@@ -1102,6 +1106,7 @@ impl Renderer {
             Renderer::Terminal {
                 term,
                 show_hardware_cursor,
+                herdr_app,
             } => {
                 let area = term.size().expect("terminal size");
                 let (lines, cursor) = mode.render_frame(area.width as usize, area.height as usize);
@@ -1125,6 +1130,7 @@ impl Renderer {
                     }
                 })
                 .expect("draw frame");
+                herdr_app.drain_after_paint();
                 if !show {
                     if let Some((row, col)) = cursor {
                         if row < area.height as usize && col < area.width as usize {

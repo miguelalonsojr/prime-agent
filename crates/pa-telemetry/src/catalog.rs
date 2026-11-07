@@ -1235,6 +1235,12 @@ const UPDATE_EVENTS: &[EventRule] = &[
     },
 ];
 
+const HERDR_APP_ENABLED: EventRule = EventRule {
+    name: "herdr app integration enabled",
+    since: 2,
+    properties: &[],
+};
+
 const HARNESS_REFINEMENTS_CHANGED: EventRule = EventRule {
     name: "harness refinements changed",
     since: 2,
@@ -1246,6 +1252,7 @@ const HARNESS_REFINEMENTS_CHANGED: EventRule = EventRule {
 pub fn catalog() -> Vec<&'static EventRule> {
     let mut all: Vec<&'static EventRule> = vec![
         &HARNESS_REFINEMENTS_CHANGED,
+        &HERDR_APP_ENABLED,
         &AGENT_STARTED,
         &AGENT_RUN_COMPLETED,
         &AGENT_SESSION_ENDED,
@@ -1375,6 +1382,19 @@ fn cap_string(value: &str, max: usize) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn herdr_adoption_drops_content_properties() {
+        let mut properties = Properties::new();
+        properties.set("prompt", json!("private prompt"));
+        properties.set("session", json!("private session"));
+        properties.set("file", json!("private file"));
+        assert_eq!(
+            sanitize("herdr app integration enabled", &mut properties),
+            3
+        );
+        assert_eq!(properties, Properties::new());
+    }
 
     #[test]
     fn the_catalog_is_the_low_frequency_set() {

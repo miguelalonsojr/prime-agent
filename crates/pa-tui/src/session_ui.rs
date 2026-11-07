@@ -147,6 +147,7 @@ pub(crate) fn last_assistant_text_of(chat: &[ChatEntry]) -> Option<String> {
 }
 
 pub(crate) struct SessionUi {
+    pub(crate) herdr_app: crate::herdr_app::HerdrAppStatus,
     pub(crate) client: DaemonClient,
     pub(crate) active_session_id: String,
     pub(crate) session_id: String,

@@ -54,6 +54,7 @@ impl SessionUi {
         let (orders_tx, orders_rx) = mpsc::unbounded_channel::<PromptOrder>();
         tokio::spawn(Self::prompt_submit_worker(orders_rx, prompt_notes.clone()));
         let mut session = SessionUi {
+            herdr_app: crate::herdr_app::HerdrAppStatus::default(),
             client,
             active_session_id: String::new(),
             session_id: String::new(),
@@ -509,6 +510,7 @@ impl SessionUi {
                 .any(|flag| state.get(flag).and_then(Value::as_bool).unwrap_or(false))
         });
         self.turn_active = streaming;
+        self.herdr_app.session_open(streaming);
         self.streaming_index = None;
         // The turn-end watermark restarts only when the mounted session CHANGES: an end owed by the
         // detached session's stream must not pin the watermark (without the reset a later prompt's

@@ -232,6 +232,81 @@ struct PendingRequest {
     direct_owner: Option<Arc<()>>,
 }
 
+/// A cancelled local request must release its reply registration even if the server keeps waiting.
+struct PendingRegistration<'a> {
+    shared: &'a Shared,
+    id: &'a str,
+}
+
+impl Drop for PendingRegistration<'_> {
+    fn drop(&mut self) {
+        self.shared.pending.lock().unwrap().remove(self.id);
+    }
+}
+
+/// A retry confirmation may use only the reader that carried its session events.
+#[derive(Clone)]
+pub(crate) struct RetryRoute {
+    shared: Arc<Shared>,
+    direct: Option<DirectLink>,
+}
+
+impl RetryRoute {
+    pub(crate) fn is_current(&self, client: &DaemonClient, session: &str) -> bool {
+        if !Arc::ptr_eq(&self.shared, &client.shared) {
+            return false;
+        }
+        match (&self.direct, client.direct.live_link()) {
+            (None, None) => true,
+            (Some(pinned), Some(live)) => {
+                pinned.active_session_id == session
+                    && live.active_session_id == session
+                    && Arc::ptr_eq(&pinned.owner, &live.owner)
+            }
+            (None, Some(_)) | (Some(_), None) => false,
+        }
+    }
+
+    pub(crate) async fn request(
+        &self,
+        client: &DaemonClient,
+        session: &str,
+        command: DaemonCommand,
+    ) -> Result<Value> {
+        anyhow::ensure!(
+            self.is_current(client, session),
+            "retry confirmation transport changed"
+        );
+        let name = command_type_debug(&command);
+        let timeout_ms = if matches!(command, DaemonCommand::WaitForIdle { .. }) {
+            LONG_RUNNING_REQUEST_TIMEOUT_MS
+        } else {
+            DEFAULT_REQUEST_TIMEOUT_MS
+        };
+        let response = match &self.direct {
+            Some(link) => {
+                let id = format!(
+                    "direct_{}",
+                    client.next_request_id.fetch_add(1, Ordering::SeqCst) + 1
+                );
+                match client.request_direct(link, &command, &id, timeout_ms).await {
+                    Ok(response) => response,
+                    Err(DirectRequestError::NotSent) => {
+                        anyhow::bail!("retry confirmation transport closed")
+                    }
+                    Err(DirectRequestError::Wait(error)) => return Err(error),
+                }
+            }
+            None => client.request_supervisor(command, timeout_ms).await?,
+        };
+        anyhow::ensure!(
+            self.is_current(client, session),
+            "retry confirmation transport changed"
+        );
+        response_data_or_error(&name, response)
+    }
+}
+
 /// Connection state shared between the request side and the reader task.
 #[derive(Default)]
 pub(crate) struct Shared {
@@ -549,6 +624,13 @@ impl DaemonClient {
         &self.hello
     }
 
+    pub(crate) fn retry_route(&self) -> RetryRoute {
+        RetryRoute {
+            shared: Arc::clone(&self.shared),
+            direct: self.direct.live_link(),
+        }
+    }
+
     /// Send one command envelope and wait for the matching response, using
     /// the TS default timeout for the command class.
     ///
@@ -671,6 +753,10 @@ impl DaemonClient {
         let line = serde_json::to_string(&envelope)?;
         let (tx, rx) = oneshot::channel::<Result<DaemonResponse>>();
         self.shared.register_pending(id.clone(), tx, None);
+        let _registration = PendingRegistration {
+            shared: &self.shared,
+            id: &id,
+        };
         // The reader runs on another worker: it can die (and run its failure
         // sweep) between the entry check and this registration. Re-check after
         // inserting — a death it missed is caught here.
@@ -752,6 +838,10 @@ impl DaemonClient {
         let (reply_tx, reply_rx) = oneshot::channel::<Result<DaemonResponse>>();
         self.shared
             .register_pending(id.to_string(), reply_tx, Some(Arc::clone(&link.owner)));
+        let _registration = PendingRegistration {
+            shared: &self.shared,
+            id,
+        };
         if !link.send(frame) {
             self.shared.pending.lock().unwrap().remove(id);
             return Err(DirectRequestError::NotSent);

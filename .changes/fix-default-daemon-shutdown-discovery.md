@@ -1,0 +1,1 @@
+- Fixed shutdown and status missing the default background service on common Linux user IDs.

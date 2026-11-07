@@ -676,6 +676,10 @@ async fn run_interactive_surface(
         }
     };
     session.exit_guard = exit_guard.clone();
+    if !headless {
+        session.herdr_app = crate::herdr_app::HerdrAppStatus::terminal();
+        session.herdr_app.session_open(session.turn_active);
+    }
     // The supervisor reader's death watch: the event channel stays open across a supervisor socket
     // loss, so this watch is the signal the reconnect driver arms on. Taken from the LIVE session
     // client after the open (a wait retry may have reconnected).
@@ -801,6 +805,7 @@ async fn run_interactive_surface(
     if !pending.is_empty() && session.dirty {
         if let Some(renderer) = renderer.is_terminal_mut() {
             crate::app::draw(renderer, &mut view)?;
+            session.herdr_app.drain_after_paint();
         } else {
             renderer.render_headless(&mut session, &mut view);
         }
@@ -1310,6 +1315,7 @@ async fn run_interactive_surface(
                         // otherwise never show the armed hint.
                         view.chrome.tray_override = session.tray_override(&view);
                         crate::app::draw(renderer, &mut view)?;
+                        session.herdr_app.drain_after_paint();
                         // The 16ms gate measures its interval from this frame.
                         last_render_at = Some(Instant::now());
                         last_pulse_phase = view.pulse_frame;
@@ -1430,6 +1436,7 @@ async fn run_interactive_surface(
             }
         }
         let was_active = session.turn_active;
+        let herdr_deadline = session.herdr_app.deadline();
         // The quiet tick's arming state, snapshotted before the select: the arm future reads these
         // locals instead of borrowing the surface.
         let autocomplete_pending = view.editor.has_pending_autocomplete();
@@ -1470,7 +1477,16 @@ async fn run_interactive_surface(
                 && view.chrome.footer_branch.is_none(),
         );
         tokio::select! {
-            maybe_event = async {
+            () = async {
+                match herdr_deadline {
+                    Some(at) => tokio::time::sleep_until(at.into()).await,
+                    None => std::future::pending().await,
+                }
+            } => session.herdr_app.settle(Instant::now()),
+            (maybe_event, confirmation) = async {
+                tokio::select! {
+                    Some(settled) = session.herdr_app.retry_settled() => (None, Some(settled)),
+                    event = async {
                 // A closed channel's recv() resolves None instantly and forever; while the
                 // reconnect driver owns the run (§10.2) that always-ready arm would hot-spin the
                 // loop and starve the tokio timers. Park the arm instead: the tick drives the
@@ -1479,11 +1495,15 @@ async fn run_interactive_surface(
                     std::future::pending::<()>().await;
                 }
                 events.recv().await
+                    } => (event, None),
+                }
             } => {
                 #[cfg(test)]
                 select_observer::handling("event");
-                                if let Some(event) = maybe_event {
-                    session.apply_client_event(event, &mut view);
+                if maybe_event.is_some() || confirmation.is_some() {
+                    if let Some(event) = maybe_event {
+                        session.apply_client_event(event, &mut view);
+                    }
                     // Batch the rest of the queued frames: a stream burst applies as one
                     // transcript pass instead of one full re-layout per frame.
                     while let Ok(event) = events.try_recv() {
@@ -1570,8 +1590,17 @@ async fn run_interactive_surface(
                             session.dirty = true;
                         }
                     }
+                    if let Some((settled, route)) = confirmation {
+                        let route = if route.is_current(&session.client, &session.active_session_id) {
+                            crate::herdr_app::RetryRouteState::Current
+                        } else { crate::herdr_app::RetryRouteState::Changed };
+                        if session.herdr_app.apply_retry_settled(&settled, &session.active_session_id, route, Instant::now()) {
+                            session.herdr_app.watch_retry(&session.client, &session.active_session_id);
+                        }
+                    }
                 } else {
                     events_closed = true;
+                    session.herdr_app.idle_for_handoff();
                     if let Some(update) = session.reconnect.take() {
                         // §10: an update restart closed the daemon; the UI stays mounted and
                         // reconnects.
@@ -1626,6 +1655,7 @@ async fn run_interactive_surface(
                     while let Ok(event) = events.try_recv() {
                         session.apply_client_event(event, &mut view);
                     }
+                    session.herdr_app.transport_lost(&session.client, &session.active_session_id, /*lost_direct*/ None);
                     if session.reconnect.is_some() {
                         session.dirty = true;
                     } else if arm_shutdown_recovery(
@@ -2198,12 +2228,13 @@ async fn run_interactive_surface(
         // the window coalesces into the next frame (a stream burst renders at most one frame per
         // tick), and a dirty state waits for the deadline arm above instead of burning a render
         // now.
-        if session.dirty {
+        if session.dirty || session.herdr_app.has_pending() {
             if let Some(renderer) = renderer.is_terminal_mut() {
                 let interval_elapsed =
                     last_render_at.is_none_or(|at| at.elapsed() >= MIN_RENDER_INTERVAL);
                 if interval_elapsed {
                     crate::app::draw(renderer, &mut view)?;
+                    session.herdr_app.drain_after_paint();
                     session.dirty = false;
                     last_render_at = Some(Instant::now());
                     last_pulse_phase = view.pulse_frame;
@@ -2316,12 +2347,15 @@ async fn run_interactive_surface(
     // Agents-back and `/resume` hand the pane to the agents view; the alternate screen stays in
     // place for it (TS `stop({ preserveAltScreen: true })`).
     let preserve_alt_screen = session.open_agents_view;
+    let frames = renderer.finish(&mut view, preserve_alt_screen);
+    session.herdr_app.idle_for_handoff();
+    session.herdr_app.drain_after_paint();
     let outcome = InteractiveOutcome {
         active_session_id: session.active_session_id.clone(),
         session_id: session.session_id.clone(),
         resume_hint,
         last_assistant_text: session.last_assistant_text.clone(),
-        frames: renderer.finish(&mut view, preserve_alt_screen),
+        frames,
         // The headless OSC 52 capture (terminal runs wrote the sequences to stdout as they
         // happened).
         clipboard_emissions: session.take_osc_emissions(),
